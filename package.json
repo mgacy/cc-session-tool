@@ -2,7 +2,9 @@
   "name": "cc-session-tool",
   "module": "index.ts",
   "type": "module",
-  "private": true,
+  "bin": {
+    "cc-session-tool": "./index.ts"
+  },
   "scripts": {
     "dev": "bun run index.ts",
     "build": "bun build --compile index.ts --outfile cc-session-tool"

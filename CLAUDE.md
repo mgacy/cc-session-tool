@@ -35,9 +35,11 @@ Single-file CLI (`index.ts`) using `citty` for command parsing. All types, helpe
 | `list` | Index all sessions with metadata (branch, timestamp, slug) |
 | `shape` | Turn-by-turn skeleton with summary stats (tool counts, duration, first edit) |
 | `tools` | Tool call log with condensed input summaries and outcomes |
+| `files` | Files touched in a session, grouped by path or turn |
 | `tokens` | Per-turn token usage timeline (optional cumulative mode) |
 | `messages` | Filtered, truncated message content by role/type/turn |
 | `slice` | Raw entries for a turn range |
+| `search` | Find sessions matching structured queries (tool, file, text, bash filters) |
 
 All session-scoped commands accept a positional session identifier (UUID, UUID prefix, or slug) and an optional `--project` flag (defaults to CWD).
 
@@ -49,7 +51,7 @@ Sessions are resolved in order: exact UUID filename match, UUID prefix match, th
 
 1. All output uses a `{ ok, data, _meta }` / `{ ok, error }` JSON envelope
 2. Distinct exit codes: 0=success, 1=format/terminated, 2=invalid args/ID, 3=not found
-3. Errors are thrown as `Object.assign(new Error(msg), { errorCode })` and caught at the command handler level
+3. Errors are thrown via `cliError(code, msg)` and caught at the command handler level
 4. Content truncation uses `"...[truncated, N chars]"` suffix
 
 ### Testing

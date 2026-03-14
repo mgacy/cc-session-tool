@@ -5,7 +5,8 @@ import { tmpdir } from 'os';
 import {
   ERROR_CODES, success, failure,
   parseTurnRange, truncateContent, inputSummary, determineOutcome, parseIntArg,
-  resolveClaudeProjectDir,
+  extractFilePath, parseSince,
+  resolveClaudeProjectDir, resolveSessionFile, parseSessionLines, userAssistantEntries,
 } from './index.ts';
 
 // ============================================================================
@@ -216,6 +217,68 @@ describe('parseIntArg', () => {
 });
 
 // ============================================================================
+// parseSince
+// ============================================================================
+
+describe('parseSince', () => {
+  test('parses days', () => {
+    const result = parseSince('1d');
+    const diff = Date.now() - new Date(result).getTime();
+    expect(diff).toBeGreaterThan(86_400_000 - 1000);
+    expect(diff).toBeLessThan(86_400_000 + 1000);
+  });
+
+  test('parses hours', () => {
+    const result = parseSince('2h');
+    const diff = Date.now() - new Date(result).getTime();
+    expect(diff).toBeGreaterThan(7_200_000 - 1000);
+    expect(diff).toBeLessThan(7_200_000 + 1000);
+  });
+
+  test('parses minutes', () => {
+    const result = parseSince('30m');
+    const diff = Date.now() - new Date(result).getTime();
+    expect(diff).toBeGreaterThan(1_800_000 - 1000);
+    expect(diff).toBeLessThan(1_800_000 + 1000);
+  });
+
+  test('parses weeks', () => {
+    const result = parseSince('1w');
+    const diff = Date.now() - new Date(result).getTime();
+    expect(diff).toBeGreaterThan(604_800_000 - 1000);
+    expect(diff).toBeLessThan(604_800_000 + 1000);
+  });
+
+  test('parses seconds', () => {
+    const result = parseSince('10s');
+    const diff = Date.now() - new Date(result).getTime();
+    expect(diff).toBeGreaterThan(10_000 - 1000);
+    expect(diff).toBeLessThan(10_000 + 1000);
+  });
+
+  test('returns valid ISO string', () => {
+    const result = parseSince('1d');
+    expect(new Date(result).toISOString()).toBe(result);
+  });
+
+  test('throws on invalid format', () => {
+    expect(() => parseSince('abc')).toThrow('Invalid --since duration');
+  });
+
+  test('throws on zero amount', () => {
+    expect(() => parseSince('0d')).toThrow('amount must be positive');
+  });
+
+  test('throws on invalid unit', () => {
+    expect(() => parseSince('1x')).toThrow('Invalid --since duration');
+  });
+
+  test('throws on negative (no match)', () => {
+    expect(() => parseSince('-1h')).toThrow('Invalid --since duration');
+  });
+});
+
+// ============================================================================
 // resolveClaudeProjectDir (string logic only)
 // ============================================================================
 
@@ -255,6 +318,9 @@ const CLAUDE_DIR = join(
 );
 
 const SESSION_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+const SESSION_ID_2 = 'bbbbbbbb-1111-2222-3333-444444444444';
+const SESSION_ID_3 = 'cccccccc-1111-2222-3333-444444444444';
+const SESSION_ID_4 = 'dddddddd-1111-2222-3333-444444444444';
 
 function makeFixtureLines(): string[] {
   const ts1 = '2026-03-01T10:00:00.000Z';
@@ -340,6 +406,76 @@ beforeAll(() => {
   mkdirSync(CLAUDE_DIR, { recursive: true });
   const lines = makeFixtureLines();
   writeFileSync(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`), lines.join('\n') + '\n');
+  // Second fixture with same slug for ambiguous slug tests
+  const lines2 = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: SESSION_ID_2,
+      timestamp: '2026-03-02T10:00:00.000Z',
+      gitBranch: 'feature',
+      version: '2.1.0',
+      slug: 'test-slug-fixture',
+      message: { role: 'user', content: 'Second session' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-02T10:01:00.000Z',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Response from second session' }],
+        usage: { input_tokens: 50, output_tokens: 25 },
+      },
+    }),
+  ];
+  writeFileSync(join(CLAUDE_DIR, `${SESSION_ID_2}.jsonl`), lines2.join('\n') + '\n');
+  // Third fixture: multi-block assistant turn (thinking + text, no tool_use)
+  const lines3 = [
+    JSON.stringify({
+      type: 'user', sessionId: SESSION_ID_3, timestamp: '2026-03-03T10:00:00.000Z',
+      gitBranch: 'main', version: '2.1.0', slug: 'multi-block-test',
+      message: { role: 'user', content: 'Test multi-block' },
+    }),
+    JSON.stringify({
+      type: 'assistant', timestamp: '2026-03-03T10:01:00.000Z',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'Considering the approach...' },
+          { type: 'text', text: 'Here is my answer.' },
+        ],
+        usage: { input_tokens: 50, output_tokens: 25 },
+      },
+    }),
+  ];
+  writeFileSync(join(CLAUDE_DIR, `${SESSION_ID_3}.jsonl`), lines3.join('\n') + '\n');
+  // Fourth fixture: session with Bash tool_use for --bash testing
+  const lines4 = [
+    JSON.stringify({
+      type: 'user', sessionId: SESSION_ID_4, timestamp: '2026-03-04T10:00:00.000Z',
+      gitBranch: 'main', version: '2.1.0', slug: 'bash-test-session',
+      message: { role: 'user', content: 'Install express' },
+    }),
+    JSON.stringify({
+      type: 'assistant', timestamp: '2026-03-04T10:01:00.000Z',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Bash', id: 'tool_bash_1', input: { command: 'npm install express' } },
+        ],
+        usage: { input_tokens: 60, output_tokens: 15 },
+      },
+    }),
+    JSON.stringify({
+      type: 'user', timestamp: '2026-03-04T10:02:00.000Z',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'tool_bash_1', is_error: false, content: 'added 57 packages' },
+        ],
+      },
+    }),
+  ];
+  writeFileSync(join(CLAUDE_DIR, `${SESSION_ID_4}.jsonl`), lines4.join('\n') + '\n');
 });
 
 afterAll(() => {
@@ -362,7 +498,8 @@ function runCli(args: string[]): Promise<{ exitCode: number; stdout: string; std
 }
 
 function parseOutput(stdout: string) {
-  return JSON.parse(stdout);
+  try { return JSON.parse(stdout); }
+  catch (e) { throw new Error(`Failed to parse CLI output: ${stdout.slice(0, 500)}\n${e}`); }
 }
 
 describe('list integration', () => {
@@ -371,10 +508,11 @@ describe('list integration', () => {
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
-    expect(result.data.length).toBe(1);
-    expect(result.data[0].session_id).toBe(SESSION_ID);
-    expect(result.data[0].branch).toBe('main');
-    expect(result.data[0].slug).toBe('test-slug-fixture');
+    expect(result.data.length).toBe(4);
+    const session1 = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(session1).toBeDefined();
+    expect(session1.branch).toBe('main');
+    expect(session1.slug).toBe('test-slug-fixture');
   });
 
   test('filters by branch', async () => {
@@ -396,6 +534,56 @@ describe('list integration', () => {
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result.data.length).toBe(0);
+  });
+
+  test('--last 1 returns only the newest session', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--project', FAKE_PROJECT, '--last', '1']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.length).toBe(1);
+    expect(result.data[0].session_id).toBe(SESSION_ID_4); // newest (2026-03-04)
+    expect(result._meta.total).toBe(4);
+    expect(result._meta.returned).toBe(1);
+    expect(result._meta.hasMore).toBe(true);
+  });
+
+  test('--last 2 returns two newest sessions', async () => {
+    const { stdout } = await runCli(['list', '--project', FAKE_PROJECT, '--last', '2']);
+    const result = parseOutput(stdout);
+    expect(result.data.length).toBe(2);
+  });
+
+  test('--last larger than total returns all', async () => {
+    const { stdout } = await runCli(['list', '--project', FAKE_PROJECT, '--last', '100']);
+    const result = parseOutput(stdout);
+    expect(result.data.length).toBe(4);
+    expect(result._meta.hasMore).toBe(false);
+  });
+
+  test('--last 0 returns error', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--project', FAKE_PROJECT, '--last', '0']);
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+  });
+
+  test('--since with large duration returns all sessions', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--project', FAKE_PROJECT, '--since', '999d']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.length).toBe(4);
+  });
+
+  test('--since and --after together returns error', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--project', FAKE_PROJECT, '--since', '1d', '--after', '2026-03-01']);
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+    expect(result.error.message).toContain('mutually exclusive');
   });
 });
 
@@ -422,11 +610,13 @@ describe('shape integration', () => {
     expect(result.data.session_id).toBe(SESSION_ID);
   });
 
-  test('resolves session by slug', async () => {
+  test('ambiguous slug returns error', async () => {
     const { exitCode, stdout } = await runCli(['shape', 'test-slug-fixture', '--project', FAKE_PROJECT]);
-    expect(exitCode).toBe(0);
+    expect(exitCode).toBe(2);
     const result = parseOutput(stdout);
-    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ID');
+    expect(result.error.message).toContain('Ambiguous slug');
   });
 });
 
@@ -547,10 +737,290 @@ describe('slice integration', () => {
   });
 });
 
+// ============================================================================
+// userAssistantEntries
+// ============================================================================
+
+describe('userAssistantEntries', () => {
+  test('filters to user and assistant only', () => {
+    const entries = [
+      { type: 'system' as const },
+      { type: 'user' as const, message: { role: 'user', content: 'hi' } },
+      { type: 'summary' as const },
+      { type: 'assistant' as const, message: { role: 'assistant', content: [] } },
+    ];
+    const result = userAssistantEntries(entries);
+    expect(result.length).toBe(2);
+    expect(result[0]!.type).toBe('user');
+    expect(result[1]!.type).toBe('assistant');
+  });
+});
+
+// ============================================================================
+// parseSessionLines
+// ============================================================================
+
+describe('parseSessionLines', () => {
+  test('skips malformed lines and returns valid ones', async () => {
+    const filePath = join(CLAUDE_DIR, 'parse-test-1.jsonl');
+    writeFileSync(filePath, [
+      'not valid json',
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'hi' } }),
+      '{ broken',
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [] } }),
+    ].join('\n') + '\n');
+    const entries = await parseSessionLines(filePath);
+    expect(entries.length).toBe(2);
+    expect(entries[0]!.type).toBe('user');
+    expect(entries[1]!.type).toBe('assistant');
+  });
+
+  test('skips empty lines', async () => {
+    const filePath = join(CLAUDE_DIR, 'parse-test-2.jsonl');
+    writeFileSync(filePath, [
+      '',
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'hi' } }),
+      '  ',
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [] } }),
+      '',
+    ].join('\n'));
+    const entries = await parseSessionLines(filePath);
+    expect(entries.length).toBe(2);
+  });
+
+  test('throws FORMAT_ERROR when all lines are invalid', async () => {
+    const filePath = join(CLAUDE_DIR, 'parse-test-3.jsonl');
+    writeFileSync(filePath, 'not json\nalso not json\n');
+    try {
+      await parseSessionLines(filePath);
+      expect(true).toBe(false); // should not reach here
+    } catch (err: any) {
+      expect(err.errorCode).toBe('FORMAT_ERROR');
+      expect(err.message).toContain('no valid entries');
+    }
+  });
+
+  test('rejects objects without type field', async () => {
+    const filePath = join(CLAUDE_DIR, 'parse-test-4.jsonl');
+    writeFileSync(filePath, [
+      JSON.stringify({ noType: true }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'hi' } }),
+    ].join('\n') + '\n');
+    const entries = await parseSessionLines(filePath);
+    expect(entries.length).toBe(1);
+    expect(entries[0]!.type).toBe('user');
+  });
+});
+
+// ============================================================================
+// resolveSessionFile
+// ============================================================================
+
+describe('resolveSessionFile', () => {
+  test('empty input throws INVALID_ARGS', async () => {
+    try {
+      await resolveSessionFile(CLAUDE_DIR, '');
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('INVALID_ARGS');
+    }
+  });
+
+  test('invalid characters throws INVALID_ID', async () => {
+    try {
+      await resolveSessionFile(CLAUDE_DIR, '../etc/passwd');
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('INVALID_ID');
+    }
+  });
+
+  test('exact UUID match resolves', async () => {
+    const result = await resolveSessionFile(CLAUDE_DIR, SESSION_ID);
+    expect(result).toBe(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`));
+  });
+
+  test('non-existent session throws NOT_FOUND', async () => {
+    try {
+      await resolveSessionFile(CLAUDE_DIR, 'zzzzzzzz-0000-0000-0000-000000000000');
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('NOT_FOUND');
+    }
+  });
+
+  test('ambiguous slug throws INVALID_ID', async () => {
+    try {
+      await resolveSessionFile(CLAUDE_DIR, 'test-slug-fixture');
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('INVALID_ID');
+      expect(err.message).toContain('Ambiguous slug');
+    }
+  });
+});
+
+// ============================================================================
+// extractFilePath
+// ============================================================================
+
+describe('extractFilePath', () => {
+  test('Read extracts file_path as read', () => {
+    expect(extractFilePath('Read', { file_path: '/a/b/c.ts' }))
+      .toEqual({ path: '/a/b/c.ts', operation: 'read' });
+  });
+
+  test('Edit extracts file_path as edit', () => {
+    expect(extractFilePath('Edit', { file_path: '/a/b/c.ts', old_string: 'x', new_string: 'y' }))
+      .toEqual({ path: '/a/b/c.ts', operation: 'edit' });
+  });
+
+  test('Write extracts file_path as write', () => {
+    expect(extractFilePath('Write', { file_path: '/x/y.txt', content: 'hello' }))
+      .toEqual({ path: '/x/y.txt', operation: 'write' });
+  });
+
+  test('Grep extracts path as grep', () => {
+    expect(extractFilePath('Grep', { pattern: 'foo', path: 'src/' }))
+      .toEqual({ path: 'src/', operation: 'grep' });
+  });
+
+  test('Grep without path returns null', () => {
+    expect(extractFilePath('Grep', { pattern: 'foo' })).toBeNull();
+  });
+
+  test('Glob extracts path as glob', () => {
+    expect(extractFilePath('Glob', { pattern: '*.ts', path: 'lib/' }))
+      .toEqual({ path: 'lib/', operation: 'glob' });
+  });
+
+  test('Glob without path returns null', () => {
+    expect(extractFilePath('Glob', { pattern: '*.ts' })).toBeNull();
+  });
+
+  test('Bash returns null', () => {
+    expect(extractFilePath('Bash', { command: 'ls' })).toBeNull();
+  });
+
+  test('unknown tool returns null', () => {
+    expect(extractFilePath('WebSearch', { query: 'test' })).toBeNull();
+  });
+});
+
+// ============================================================================
+// shape block_index
+// ============================================================================
+
+describe('shape block_index', () => {
+  test('all rows include block_index', async () => {
+    const { stdout } = await runCli(['shape', SESSION_ID, '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    for (const row of result.data.turns) {
+      expect(typeof row.block_index).toBe('number');
+      expect(row.block_index).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  test('single-block and collapsed turns have block_index 0', async () => {
+    const { stdout } = await runCli(['shape', SESSION_ID, '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.data.turns.every((r: any) => r.block_index === 0)).toBe(true);
+  });
+
+  test('multi-block assistant turns without tool_use get incrementing block_index', async () => {
+    const { exitCode, stdout } = await runCli(['shape', SESSION_ID_3, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    const turns = result.data.turns;
+    // Turn 1: user string -> block_index: 0
+    expect(turns[0].block_index).toBe(0);
+    // Turn 2: assistant [thinking, text] -> two rows with block_index 0 and 1
+    expect(turns[1].type).toBe('thinking');
+    expect(turns[1].block_index).toBe(0);
+    expect(turns[2].type).toBe('text');
+    expect(turns[2].block_index).toBe(1);
+  });
+});
+
+// ============================================================================
+// files integration
+// ============================================================================
+
+describe('files integration', () => {
+  test('returns files grouped by file (default)', async () => {
+    const { exitCode, stdout } = await runCli(['files', SESSION_ID, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.group_by).toBe('file');
+    expect(result.data.files.length).toBe(2);
+
+    const grepFile = result.data.files.find((f: any) => f.path === 'src/');
+    expect(grepFile).toBeDefined();
+    expect(grepFile.operations).toEqual(['grep']);
+    expect(grepFile.turns).toEqual([2]);
+    expect(grepFile.errored).toBe(false);
+
+    const editFile = result.data.files.find((f: any) => f.path === '/a/b/hello.ts');
+    expect(editFile).toBeDefined();
+    expect(editFile.operations).toEqual(['edit']);
+    expect(editFile.turns).toEqual([4]);
+    expect(editFile.errored).toBe(true);
+  });
+
+  test('returns file accesses grouped by turn', async () => {
+    const { exitCode, stdout } = await runCli(['files', SESSION_ID, '--project', FAKE_PROJECT, '--group-by', 'turn']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.data.group_by).toBe('turn');
+    expect(result.data.accesses.length).toBe(2);
+    expect(result.data.accesses[0].turn).toBe(2);
+    expect(result.data.accesses[0].path).toBe('src/');
+    expect(result.data.accesses[0].operation).toBe('grep');
+    expect(result.data.accesses[1].turn).toBe(4);
+    expect(result.data.accesses[1].path).toBe('/a/b/hello.ts');
+    expect(result.data.accesses[1].operation).toBe('edit');
+    expect(result.data.accesses[1].errored).toBe(true);
+  });
+
+  test('filters by turn range', async () => {
+    const { stdout } = await runCli(['files', SESSION_ID, '--project', FAKE_PROJECT, '--turn', '1-3']);
+    const result = parseOutput(stdout);
+    expect(result.data.files.length).toBe(1);
+    expect(result.data.files[0].path).toBe('src/');
+  });
+
+  test('filters by operation', async () => {
+    const { stdout } = await runCli(['files', SESSION_ID, '--project', FAKE_PROJECT, '--operation', 'edit']);
+    const result = parseOutput(stdout);
+    expect(result.data.files.length).toBe(1);
+    expect(result.data.files[0].path).toBe('/a/b/hello.ts');
+  });
+
+  test('invalid group-by returns error', async () => {
+    const { exitCode, stdout } = await runCli(['files', SESSION_ID, '--project', FAKE_PROJECT, '--group-by', 'invalid']);
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+  });
+
+  test('session with no file tools returns empty', async () => {
+    const { stdout } = await runCli(['files', SESSION_ID_2, '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.files.length).toBe(0);
+  });
+});
+
+// ============================================================================
+// Error Cases (CLI)
+// ============================================================================
+
 describe('error cases', () => {
   test('invalid session ID characters', async () => {
     const { exitCode, stdout } = await runCli(['shape', '../etc/passwd', '--project', FAKE_PROJECT]);
-    expect(exitCode).not.toBe(0);
+    expect(exitCode).toBe(2);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(false);
     expect(result.error.code).toBe('INVALID_ID');
@@ -558,7 +1028,7 @@ describe('error cases', () => {
 
   test('non-existent session', async () => {
     const { exitCode, stdout } = await runCli(['shape', 'nonexistent-session-id', '--project', FAKE_PROJECT]);
-    expect(exitCode).not.toBe(0);
+    expect(exitCode).toBe(3);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(false);
     expect(result.error.code).toBe('NOT_FOUND');
@@ -566,9 +1036,150 @@ describe('error cases', () => {
 
   test('non-existent project dir', async () => {
     const { exitCode, stdout } = await runCli(['list', '--project', '/tmp/nonexistent-project-12345']);
-    expect(exitCode).not.toBe(0);
+    expect(exitCode).toBe(3);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(false);
     expect(result.error.code).toBe('NOT_FOUND');
+  });
+});
+
+// ============================================================================
+// Search Integration
+// ============================================================================
+
+describe('search integration', () => {
+  test('--tool Grep finds session with Grep tool', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'Grep', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.length).toBeGreaterThanOrEqual(1);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(match).toBeDefined();
+    expect(match.matches.tools).toContain('Grep');
+  });
+
+  test('--tool Edit finds session with Edit tool', async () => {
+    const { stdout } = await runCli(['search', '--tool', 'Edit', '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(match).toBeDefined();
+    expect(match.matches.tools).toContain('Edit');
+  });
+
+  test('--tool grep is case-insensitive', async () => {
+    const { stdout } = await runCli(['search', '--tool', 'grep', '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(match).toBeDefined();
+    expect(match.matches.tools).toContain('Grep');
+  });
+
+  test('--file hello.ts finds session', async () => {
+    const { stdout } = await runCli(['search', '--file', 'hello.ts', '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(match).toBeDefined();
+    expect(match.matches.files.some((f: string) => f.includes('hello.ts'))).toBe(true);
+  });
+
+  test('--text "different approach" finds session (matches assistant text block)', async () => {
+    const { stdout } = await runCli(['search', '--text', 'different approach', '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(match).toBeDefined();
+    expect(match.matches.turns.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('--text "think about this carefully" finds session (matches thinking block)', async () => {
+    const { stdout } = await runCli(['search', '--text', 'think about this carefully', '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(match).toBeDefined();
+    expect(match.matches.turns.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('--bash "npm install" finds Bash fixture session', async () => {
+    const { stdout } = await runCli(['search', '--bash', 'npm install', '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID_4);
+    expect(match).toBeDefined();
+    expect(match.matches.turns.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('--tool Grep --branch main combines content + metadata filters', async () => {
+    const { stdout } = await runCli(['search', '--tool', 'Grep', '--branch', 'main', '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(match).toBeDefined();
+    expect(match.branch).toBe('main');
+  });
+
+  test('--tool Grep --branch feature returns no results (Grep only in main branch)', async () => {
+    const { stdout } = await runCli(['search', '--tool', 'Grep', '--branch', 'feature', '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.length).toBe(0);
+  });
+
+  test('--tool Grep --file hello.ts both match same session (multi-content AND)', async () => {
+    const { stdout } = await runCli(['search', '--tool', 'Grep', '--file', 'hello.ts', '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(match).toBeDefined();
+    expect(match.matches.tools).toContain('Grep');
+    expect(match.matches.files.some((f: string) => f.includes('hello.ts'))).toBe(true);
+  });
+
+  test('--tool Grep --text "nonexistent" returns no results (AND semantics)', async () => {
+    const { stdout } = await runCli(['search', '--tool', 'Grep', '--text', 'nonexistent', '--project', FAKE_PROJECT]);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.length).toBe(0);
+  });
+
+  test('no search filters returns INVALID_ARGS error', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+  });
+
+  test('non-existent project returns NOT_FOUND error', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'Grep', '--project', '/tmp/nonexistent-project-12345']);
+    expect(exitCode).toBe(3);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('NOT_FOUND');
+  });
+
+  test('no matches returns empty data array with ok true', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'NonExistentTool', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.length).toBe(0);
+  });
+
+  test('--last 1 limits results and _meta reflects total', async () => {
+    // --text "e" is broad enough to match multiple sessions (session 1 has "different approach",
+    // session 2 has "Response from second session", session 3 has "Here is my answer.")
+    const { exitCode, stdout } = await runCli(['search', '--text', 'e', '--project', FAKE_PROJECT, '--last', '1']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.length).toBe(1);
+    expect(result._meta.total).toBeGreaterThan(result._meta.returned);
+    expect(result._meta.returned).toBe(1);
+    expect(result._meta.hasMore).toBe(true);
   });
 });

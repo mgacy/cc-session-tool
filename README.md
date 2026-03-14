@@ -33,7 +33,7 @@ All commands except `list` require a `<session>` argument. Three forms are accep
 
 All session commands accept `--project <path>` to specify the project directory (defaults to CWD).
 
-**Input validation:** Only `[a-zA-Z0-9-]` characters are accepted. Any input containing `/`, `..`, or glob metacharacters is rejected with exit code 2.
+**Input validation:** Only `[a-zA-Z0-9-]` characters are accepted; all other inputs are rejected with exit code 2.
 
 ### Turn Numbering
 
@@ -41,8 +41,8 @@ All commands use consistent turn numbering:
 
 - Each JSONL entry of type `user` or `assistant` gets the next sequential integer, starting at 1.
 - Other entry types (`system`, `progress`, etc.) are excluded from numbering.
-- When an assistant entry contains multiple content blocks (e.g., thinking + tool_use), they share the same turn number.
-- Turn numbers are consistent across all commands: turn 5 in `shape` is the same entry as turn 5 in `tools`, `tokens`, `messages`, and `slice`.
+- When an assistant entry contains multiple content blocks (e.g., thinking + tool_use), they share the same turn number. The `block_index` field (0-indexed) disambiguates blocks within a turn.
+- Turn numbers are consistent across all commands: turn 5 in `shape` is the same entry as turn 5 in `tools`, `tokens`, `messages`, `slice`, and `files`.
 
 ## Commands
 
@@ -51,10 +51,19 @@ All commands use consistent turn numbering:
 Index all sessions by reading metadata from the first few lines of each file.
 
 ```bash
-cc-session-tool list [--project <path>] [--branch <name>] [--after <date>] [--before <date>] [--min-lines <n>]
+cc-session-tool list [--project <path>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>] [--min-lines <n>]
 ```
 
-**Output:** Sessions sorted by timestamp (newest first). Fields may be `null` for sessions with missing metadata.
+| Option        | Default | Description                                                    |
+| ------------- | ------- | -------------------------------------------------------------- |
+| `--branch`    | all     | Filter by git branch name                                      |
+| `--after`     | —       | Sessions after ISO 8601 date (mutually exclusive with `--since`) |
+| `--before`    | —       | Sessions before ISO 8601 date                                  |
+| `--since`     | —       | Sessions from the last duration: `30m`, `2h`, `1d`, `1w` (mutually exclusive with `--after`) |
+| `--last`      | all     | Return only the N most recent sessions                         |
+| `--min-lines` | 0       | Sessions with at least N lines                                 |
+
+**Output:** Sessions sorted by timestamp (newest first). Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated.
 
 ```json
 {
@@ -91,10 +100,11 @@ cc-session-tool shape <session> [--project <path>]
   "data": {
     "session_id": "DA2738E3-...",
     "turns": [
-      { "n": 1, "role": "user", "type": "user" },
-      { "n": 2, "role": "assistant", "type": "tool_use", "tools": ["Grep"] },
-      { "n": 3, "role": "user", "type": "tool_result" },
-      { "n": 4, "role": "assistant", "type": "text" }
+      { "n": 1, "role": "user", "type": "user", "block_index": 0 },
+      { "n": 2, "role": "assistant", "type": "tool_use", "block_index": 0, "tools": ["Grep"] },
+      { "n": 3, "role": "user", "type": "tool_result", "block_index": 0 },
+      { "n": 4, "role": "assistant", "type": "thinking", "block_index": 0 },
+      { "n": 4, "role": "assistant", "type": "text", "block_index": 1 }
     ],
     "summary": {
       "total_turns": 42,
@@ -104,7 +114,7 @@ cc-session-tool shape <session> [--project <path>]
       "duration_minutes": 38.2
     }
   },
-  "_meta": { "total": 4, "returned": 4, "hasMore": false }
+  "_meta": { "total": 5, "returned": 5, "hasMore": false }
 }
 ```
 
@@ -118,6 +128,8 @@ cc-session-tool shape <session> [--project <path>]
 | `assistant` | `text`        | Assistant text response                  |
 | `assistant` | `thinking`    | Thinking/reasoning block                 |
 | `assistant` | `tool_use`    | Tool invocation (includes `tools` array) |
+
+**`block_index`:** 0-indexed position within the turn's content blocks. When an assistant turn has multiple non-tool blocks (e.g., thinking + text), each gets a separate row with incrementing `block_index`. Assistant turns with `tool_use` blocks are collapsed into a single row with `block_index: 0`.
 
 **Summary fields:**
 
@@ -193,6 +205,73 @@ cc-session-tool tools <session> [--project <path>] [--name <tool>] [--failed] [-
 | `no_result`         | No matching `tool_result` found (interrupted session) |
 
 **`duration_ms`:** Milliseconds between assistant entry and corresponding tool_result. `null` if timestamps are missing.
+
+---
+
+### `files <session>`
+
+Files touched in a session, grouped by file path or chronologically by turn.
+
+```bash
+cc-session-tool files <session> [--project <path>] [--group-by <file|turn>] [--turn <N|N-M>] [--operation <op>]
+```
+
+| Option        | Default | Description                                        |
+| ------------- | ------- | -------------------------------------------------- |
+| `--group-by`  | `file`  | `file` (one entry per unique path) or `turn` (chronological) |
+| `--turn`      | all     | Turn number `N` or range `N-M`                     |
+| `--operation` | all     | Filter by operation: `read`, `edit`, `write`, `grep`, `glob` |
+
+**Output (group-by=file, default):**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "session_id": "DA2738E3-...",
+    "group_by": "file",
+    "files": [
+      {
+        "path": "/Users/me/project/src/auth.ts",
+        "operations": ["read", "edit"],
+        "turns": [6, 8, 12, 18],
+        "errored": false
+      },
+      {
+        "path": "/Users/me/project/src/auth.test.ts",
+        "operations": ["read", "write"],
+        "turns": [10, 22],
+        "errored": false
+      }
+    ]
+  },
+  "_meta": { "total": 2, "returned": 2, "hasMore": false }
+}
+```
+
+**Output (group-by=turn):**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "session_id": "DA2738E3-...",
+    "group_by": "turn",
+    "accesses": [
+      { "path": "/Users/me/project/src/auth.ts", "operation": "read", "turn": 6, "errored": false },
+      { "path": "/Users/me/project/src/auth.ts", "operation": "edit", "turn": 8, "errored": true }
+    ]
+  },
+  "_meta": { "total": 2, "returned": 2, "hasMore": false }
+}
+```
+
+**Notes:**
+
+- Extracts full file paths from tool inputs (`Read`, `Edit`, `Write` use `file_path`; `Grep`, `Glob` use `path`).
+- `Grep`/`Glob` calls without a `path` argument are excluded (they search CWD implicitly).
+- `Bash` calls are excluded — file references in shell commands are not parsed.
+- Files are sorted by first turn accessed. `errored` is `true` if any operation on that file errored.
 
 ---
 
@@ -322,6 +401,19 @@ cc-session-tool slice <session> --turn <N|N-M> [--project <path>] [--max-content
 
 ## Composition Examples
 
+### Quick access to recent sessions
+
+```bash
+# Last 5 sessions
+cc-session-tool list --last 5
+
+# Sessions from the last day
+cc-session-tool list --since 1d
+
+# Last 3 sessions on a specific branch
+cc-session-tool list --branch feature/auth --last 3
+```
+
 ### Navigation analysis before first edit
 
 ```bash
@@ -349,6 +441,19 @@ cc-session-tool slice DA2738E3 --turn 14-16
 
 # Just the assistant's reasoning
 cc-session-tool messages DA2738E3 --role assistant --type thinking --turn 14-16
+```
+
+### What files did a session touch?
+
+```bash
+# All files, grouped by path
+cc-session-tool files DA2738E3
+
+# Just edits
+cc-session-tool files DA2738E3 --operation edit
+
+# Chronological log of all file accesses
+cc-session-tool files DA2738E3 --group-by turn
 ```
 
 ### Token consumption comparison

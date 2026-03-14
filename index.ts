@@ -1,8 +1,8 @@
+#!/usr/bin/env bun
 import { defineCommand, runMain } from 'citty';
 import { homedir } from 'os';
 import { join, basename } from 'path';
-import { readdirSync, existsSync, statSync } from 'fs';
-import { readdir } from 'fs/promises';
+import { readdirSync, existsSync } from 'fs';
 
 // ============================================================================
 // Types
@@ -25,7 +25,7 @@ export type ResponseMeta = {
 
 /** A parsed JSONL entry from a Claude session transcript. */
 export type SessionEntry = {
-  type: string;
+  type: 'user' | 'assistant' | 'system' | 'summary' | (string & {});
   sessionId?: string;
   timestamp?: string;
   gitBranch?: string;
@@ -40,12 +40,12 @@ export type SessionEntry = {
 };
 
 export type ContentBlock = {
-  type: string;
+  type: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'image' | 'document' | (string & {});
   text?: string;
   thinking?: string;
   name?: string;
   id?: string;
-  input?: Record<string, any>;
+  input?: Record<string, unknown>;
   tool_use_id?: string;
   is_error?: boolean;
   content?: string | ContentBlock[];
@@ -69,8 +69,9 @@ export type ListSession = {
 
 export type ShapeRow = {
   n: number;
-  role: string;
+  role: 'user' | 'assistant';
   type: string;
+  block_index: number;
   tools?: string[];
 };
 
@@ -120,8 +121,41 @@ export type TokensResult = {
 
 export type MessageEntry = {
   n: number;
-  role: string;
+  role: 'user' | 'assistant';
   content: ContentBlock[];
+};
+
+export type FileAccess = {
+  path: string;
+  operation: 'read' | 'edit' | 'write' | 'grep' | 'glob';
+  turn: number;
+  errored: boolean;
+};
+
+export type FileEntry = {
+  path: string;
+  operations: string[];
+  turns: number[];
+  errored: boolean;
+};
+
+export type FilesResult = {
+  session_id: string;
+  group_by: 'file' | 'turn';
+  files?: FileEntry[];
+  accesses?: FileAccess[];
+};
+
+export type SearchMatch = {
+  session_id: string;
+  branch: string | null;
+  timestamp: string | null;
+  slug: string | null;
+  matches: {
+    tools: string[];      // distinct tool names that matched --tool
+    files: string[];      // distinct file paths that matched --file
+    turns: number[];      // union of all turn numbers where any filter matched
+  };
 };
 
 // ============================================================================
@@ -162,6 +196,10 @@ function meta(total: number, returned: number): ResponseMeta {
   return { total, returned, hasMore: returned < total };
 }
 
+function cliError(code: ErrorCode, message: string): Error & { errorCode: ErrorCode } {
+  return Object.assign(new Error(message), { errorCode: code });
+}
+
 // ============================================================================
 // Signal Handling
 // ============================================================================
@@ -185,7 +223,7 @@ export function resolveClaudeProjectDir(projectPath: string): string {
   const dirName = '-' + stripped.replace(/\//g, '-');
   const claudeDir = join(homedir(), '.claude', 'projects', dirName);
   if (!existsSync(claudeDir)) {
-    throw Object.assign(new Error(`Claude project directory not found: ${claudeDir}`), { errorCode: 'NOT_FOUND' as ErrorCode });
+    throw cliError('NOT_FOUND', `Claude project directory not found: ${claudeDir}`);
   }
   return claudeDir;
 }
@@ -196,17 +234,17 @@ export function resolveClaudeProjectDir(projectPath: string): string {
  */
 export async function resolveSessionFile(claudeDir: string, input: string): Promise<string> {
   if (!input) {
-    throw Object.assign(new Error('Session ID is required'), { errorCode: 'INVALID_ARGS' as ErrorCode });
+    throw cliError('INVALID_ARGS', 'Session ID is required');
   }
   if (!/^[a-zA-Z0-9-]+$/.test(input)) {
-    throw Object.assign(new Error('Invalid session ID -- only alphanumeric characters and hyphens allowed'), { errorCode: 'INVALID_ID' as ErrorCode });
+    throw cliError('INVALID_ID', 'Invalid session ID -- only alphanumeric characters and hyphens allowed');
   }
 
   // Try UUID/prefix match
   const files = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl') && f.startsWith(input));
-  if (files.length === 1) return join(claudeDir, files[0]);
+  if (files.length === 1) return join(claudeDir, files[0]!);
   if (files.length > 1) {
-    throw Object.assign(new Error(`Ambiguous session ID prefix '${input}' -- matches ${files.length} sessions`), { errorCode: 'INVALID_ID' as ErrorCode });
+    throw cliError('INVALID_ID', `Ambiguous session ID prefix '${input}' -- matches ${files.length} sessions`);
   }
 
   // Try slug match - search for "slug":"<input>" in all jsonl files
@@ -214,44 +252,49 @@ export async function resolveSessionFile(claudeDir: string, input: string): Prom
   const slugPattern = `"slug":"${input}"`;
   const slugMatches: string[] = [];
   for (const f of allFiles) {
-    const filePath = join(claudeDir, f);
-    const file = Bun.file(filePath);
-    // Read first 8KB to find slug (it's near the top)
-    const buf = new Uint8Array(8192);
-    const reader = file.stream().getReader();
-    const { value } = await reader.read();
-    reader.releaseLock();
-    if (value) {
-      const chunk = new TextDecoder().decode(value);
+    try {
+      const filePath = join(claudeDir, f);
+      const chunk = await Bun.file(filePath).slice(0, 8192).text();
       if (chunk.includes(slugPattern)) {
         slugMatches.push(filePath);
       }
+    } catch {
+      // skip unreadable files during slug search
     }
   }
-  if (slugMatches.length === 1) return slugMatches[0];
+  if (slugMatches.length === 1) return slugMatches[0]!;
   if (slugMatches.length > 1) {
-    throw Object.assign(new Error(`Ambiguous slug '${input}' -- matches ${slugMatches.length} sessions`), { errorCode: 'INVALID_ID' as ErrorCode });
+    throw cliError('INVALID_ID', `Ambiguous slug '${input}' -- matches ${slugMatches.length} sessions`);
   }
 
-  throw Object.assign(new Error(`No session found matching '${input}'`), { errorCode: 'NOT_FOUND' as ErrorCode });
+  throw cliError('NOT_FOUND', `No session found matching '${input}'`);
 }
 
 /** Parse a JSONL session file into an array of entries. Skips malformed lines. */
 export async function parseSessionLines(filePath: string): Promise<SessionEntry[]> {
   const text = await Bun.file(filePath).text();
   const entries: SessionEntry[] = [];
+  let nonEmptyCount = 0;
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
+    nonEmptyCount++;
     try {
-      entries.push(JSON.parse(line));
+      const parsed: unknown = JSON.parse(line);
+      if (typeof parsed === 'object' && parsed !== null && 'type' in parsed &&
+          typeof (parsed as Record<string, unknown>).type === 'string') {
+        entries.push(parsed as SessionEntry);
+      }
     } catch {
       // skip malformed lines
     }
   }
+  if (nonEmptyCount > 0 && entries.length === 0) {
+    throw cliError('FORMAT_ERROR', 'Session file contains no valid entries');
+  }
   return entries;
 }
 
-/** Filter to user/assistant entries only (same turn numbering as POC). */
+/** Filter to user/assistant entries only. */
 export function userAssistantEntries(entries: SessionEntry[]): SessionEntry[] {
   return entries.filter(e => e.type === 'user' || e.type === 'assistant');
 }
@@ -260,19 +303,19 @@ export function userAssistantEntries(entries: SessionEntry[]): SessionEntry[] {
 export function parseTurnRange(input: string): { start: number; end: number } {
   const rangeMatch = input.match(/^(\d+)-(\d+)$/);
   if (rangeMatch) {
-    const start = parseInt(rangeMatch[1], 10);
-    const end = parseInt(rangeMatch[2], 10);
+    const start = parseInt(rangeMatch[1]!, 10);
+    const end = parseInt(rangeMatch[2]!, 10);
     if (start > end) {
-      throw Object.assign(new Error(`Invalid turn range -- start (${start}) is greater than end (${end})`), { errorCode: 'INVALID_ARGS' as ErrorCode });
+      throw cliError('INVALID_ARGS', `Invalid turn range -- start (${start}) is greater than end (${end})`);
     }
     return { start, end };
   }
   const singleMatch = input.match(/^(\d+)$/);
   if (singleMatch) {
-    const n = parseInt(singleMatch[1], 10);
+    const n = parseInt(singleMatch[1]!, 10);
     return { start: n, end: n };
   }
-  throw Object.assign(new Error(`Invalid turn range '${input}' -- expected N or N-M`), { errorCode: 'INVALID_ARGS' as ErrorCode });
+  throw cliError('INVALID_ARGS', `Invalid turn range '${input}' -- expected N or N-M`);
 }
 
 /** Truncate text with "...[truncated, N chars]" suffix. */
@@ -282,29 +325,30 @@ export function truncateContent(text: string, maxLen: number): string {
 }
 
 /** Condensed tool input summary per tool type. */
-export function inputSummary(name: string, input: Record<string, any>): string {
+export function inputSummary(name: string, input: Record<string, unknown>): string {
+  const inp = input as Record<string, any>;
   switch (name) {
     case 'Grep':
-      return `pattern='${input.pattern ?? ''}' ${input.path ? `path='${input.path}'` : ''}`.trim();
+      return `pattern='${inp.pattern ?? ''}' ${inp.path ? `path='${inp.path}'` : ''}`.trim();
     case 'Read':
-      return `file='${basename(input.file_path ?? '')}' ${input.offset != null ? `offset=${input.offset}` : ''} ${input.limit != null ? `limit=${input.limit}` : ''}`.trim().replace(/\s+/g, ' ');
+      return `file='${basename(inp.file_path ?? '')}' ${inp.offset != null ? `offset=${inp.offset}` : ''} ${inp.limit != null ? `limit=${inp.limit}` : ''}`.trim().replace(/\s+/g, ' ');
     case 'Edit':
-      return `file='${basename(input.file_path ?? '')}' old=(${(input.old_string ?? '').length} chars) new=(${(input.new_string ?? '').length} chars)`;
+      return `file='${basename(inp.file_path ?? '')}' old=(${(inp.old_string ?? '').length} chars) new=(${(inp.new_string ?? '').length} chars)`;
     case 'Write':
-      return `file='${basename(input.file_path ?? '')}' (${(input.content ?? '').length} chars)`;
+      return `file='${basename(inp.file_path ?? '')}' (${(inp.content ?? '').length} chars)`;
     case 'Bash':
-      return (input.command ?? '').slice(0, 80);
+      return (inp.command ?? '').slice(0, 80);
     case 'Glob':
-      return `pattern='${input.pattern ?? ''}' ${input.path ? `path='${input.path}'` : ''}`.trim();
+      return `pattern='${inp.pattern ?? ''}' ${inp.path ? `path='${inp.path}'` : ''}`.trim();
     case 'Agent':
     case 'Task':
-      return `prompt='${(input.prompt ?? input.description ?? '').slice(0, 80)}'`;
+      return `prompt='${(inp.prompt ?? inp.description ?? '').slice(0, 80)}'`;
     case 'WebFetch':
-      return `url='${input.url ?? ''}'`;
+      return `url='${inp.url ?? ''}'`;
     case 'WebSearch':
-      return `query='${input.query ?? ''}'`;
+      return `query='${inp.query ?? ''}'`;
     default:
-      return JSON.stringify(input).slice(0, 80);
+      return JSON.stringify(inp).slice(0, 80);
   }
 }
 
@@ -336,12 +380,47 @@ export function determineOutcome(resultInfo: { is_error?: boolean; content?: str
   return 'success';
 }
 
+/** Extract the file path from a tool_use block's input, if applicable. */
+export function extractFilePath(toolName: string, input: Record<string, unknown>): { path: string; operation: string } | null {
+  const inp = input as Record<string, any>;
+  switch (toolName) {
+    case 'Read':
+      return inp.file_path ? { path: inp.file_path, operation: 'read' } : null;
+    case 'Edit':
+      return inp.file_path ? { path: inp.file_path, operation: 'edit' } : null;
+    case 'Write':
+      return inp.file_path ? { path: inp.file_path, operation: 'write' } : null;
+    case 'Grep':
+      return inp.path ? { path: inp.path, operation: 'grep' } : null;
+    case 'Glob':
+      return inp.path ? { path: inp.path, operation: 'glob' } : null;
+    default:
+      return null;
+  }
+}
+
+/** Parse a relative duration string (e.g. "1d", "2h", "30m") into an ISO 8601 cutoff timestamp. */
+export function parseSince(input: string): string {
+  const match = input.match(/^(\d+)([smhdw])$/);
+  if (!match) {
+    throw cliError('INVALID_ARGS', `Invalid --since duration '${input}' -- expected format like 1d, 2h, 30m, 1w`);
+  }
+  const amount = parseInt(match[1]!, 10);
+  if (amount <= 0) {
+    throw cliError('INVALID_ARGS', `Invalid --since duration '${input}' -- amount must be positive`);
+  }
+  const unit = match[2]!;
+  const multipliers: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
+  const ms = amount * multipliers[unit]!;
+  return new Date(Date.now() - ms).toISOString();
+}
+
 /** Validate a numeric string arg. Returns the number or undefined. */
 export function parseIntArg(value: string | undefined, name: string): number | undefined {
   if (value == null) return undefined;
   const n = parseInt(value, 10);
   if (isNaN(n) || n < 0) {
-    throw Object.assign(new Error(`${name} must be a non-negative integer`), { errorCode: 'INVALID_ARGS' as ErrorCode });
+    throw cliError('INVALID_ARGS', `${name} must be a non-negative integer`);
   }
   return n;
 }
@@ -367,6 +446,8 @@ const listCommand = defineCommand({
     branch: { type: 'string', description: 'Filter by git branch' },
     after: { type: 'string', description: 'Sessions after DATE (ISO 8601)' },
     before: { type: 'string', description: 'Sessions before DATE (ISO 8601)' },
+    since: { type: 'string', description: 'Sessions from the last duration (e.g. 1d, 2h, 1w)' },
+    last: { type: 'string', description: 'Return only the last N sessions' },
     'min-lines': { type: 'string', description: 'Sessions with at least N lines' },
   },
   async run({ args }) {
@@ -374,6 +455,16 @@ const listCommand = defineCommand({
       const projectPath = args.project || process.cwd();
       const claudeDir = resolveClaudeProjectDir(projectPath);
       const minLines = parseIntArg(args['min-lines'], '--min-lines') ?? 0;
+
+      if (args.since && args.after) {
+        throw cliError('INVALID_ARGS', '--since and --after are mutually exclusive');
+      }
+      const afterCutoff = args.since ? parseSince(args.since) : args.after ?? null;
+
+      const lastN = parseIntArg(args.last, '--last');
+      if (lastN != null && lastN <= 0) {
+        throw cliError('INVALID_ARGS', '--last must be a positive integer');
+      }
 
       const files = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl'));
       const sessions: ListSession[] = [];
@@ -383,47 +474,52 @@ const listCommand = defineCommand({
       for (let i = 0; i < files.length; i += BATCH_SIZE) {
         const batch = files.slice(i, i + BATCH_SIZE);
         const results = await Promise.all(batch.map(async (f) => {
-          const filePath = join(claudeDir, f);
-          const sessionId = f.replace('.jsonl', '');
-          const text = await Bun.file(filePath).text();
-          const lineCount = text.split('\n').filter(l => l.trim()).length;
+          try {
+            const filePath = join(claudeDir, f);
+            const sessionId = f.replace('.jsonl', '');
+            const text = await Bun.file(filePath).text();
+            const lineCount = text.split('\n').filter(l => l.trim()).length;
 
-          if (minLines > 0 && lineCount < minLines) return null;
+            if (minLines > 0 && lineCount < minLines) return null;
 
-          // Extract metadata from first few lines
-          let branch: string | null = null;
-          let timestamp: string | null = null;
-          let version: string | null = null;
-          let slug: string | null = null;
+            // Extract metadata from first few lines
+            let branch: string | null = null;
+            let timestamp: string | null = null;
+            let version: string | null = null;
+            let slug: string | null = null;
 
-          const lines = text.split('\n');
-          for (let j = 0; j < Math.min(5, lines.length); j++) {
-            if (!lines[j].trim()) continue;
-            try {
-              const entry = JSON.parse(lines[j]);
-              if (entry.sessionId) {
-                branch = entry.gitBranch ?? null;
-                version = entry.version ?? null;
-                timestamp = entry.timestamp ?? null;
-                break;
-              }
-            } catch { /* skip */ }
+            const lines = text.split('\n');
+            for (let j = 0; j < Math.min(5, lines.length); j++) {
+              const rawLine = lines[j];
+              if (!rawLine?.trim()) continue;
+              try {
+                const entry = JSON.parse(rawLine);
+                if (entry.sessionId) {
+                  branch = entry.gitBranch ?? null;
+                  version = entry.version ?? null;
+                  timestamp = entry.timestamp ?? null;
+                  break;
+                }
+              } catch { /* skip */ }
+            }
+
+            // Find slug via string search (fast, no full parse)
+            const slugMatch = text.match(/"slug":"([a-zA-Z0-9][a-zA-Z0-9-]*)"/);
+            if (slugMatch) slug = slugMatch[1] ?? null;
+
+            // Apply filters
+            if (args.branch && branch !== args.branch) return null;
+            if (afterCutoff) {
+              if (!timestamp || timestamp < afterCutoff) return null;
+            }
+            if (args.before) {
+              if (!timestamp || timestamp > args.before) return null;
+            }
+
+            return { session_id: sessionId, branch, timestamp, version, lines: lineCount, slug } as ListSession;
+          } catch {
+            return null; // skip unreadable files
           }
-
-          // Find slug via string search (fast, no full parse)
-          const slugMatch = text.match(/"slug":"([a-z][a-z0-9-]*)"/);
-          if (slugMatch) slug = slugMatch[1];
-
-          // Apply filters
-          if (args.branch && branch !== args.branch) return null;
-          if (args.after) {
-            if (!timestamp || timestamp < args.after) return null;
-          }
-          if (args.before) {
-            if (!timestamp || timestamp > args.before) return null;
-          }
-
-          return { session_id: sessionId, branch, timestamp, version, lines: lineCount, slug } as ListSession;
         }));
         sessions.push(...results.filter((r): r is ListSession => r !== null));
       }
@@ -436,7 +532,10 @@ const listCommand = defineCommand({
         return b.timestamp.localeCompare(a.timestamp);
       });
 
-      output(success(sessions, meta(sessions.length, sessions.length)));
+      // Apply --last limit after sorting
+      const total = sessions.length;
+      const returned = lastN != null ? sessions.slice(0, lastN) : sessions;
+      output(success(returned, meta(total, returned.length)));
     } catch (err: any) {
       output(failure(err.errorCode ?? 'FORMAT_ERROR', err.message));
     }
@@ -540,27 +639,28 @@ const shapeCommand = defineCommand({
           userCount++;
           const content = entry.message?.content;
           if (typeof content === 'string') {
-            rows.push({ n: turnNum, role: 'user', type: 'user' });
+            rows.push({ n: turnNum, role: 'user', type: 'user', block_index: 0 });
           } else if (Array.isArray(content)) {
-            for (const block of content) {
+            for (let bi = 0; bi < content.length; bi++) {
+              const block = content[bi]!;
               if (block.type === 'tool_result') {
-                rows.push({ n: turnNum, role: 'user', type: 'tool_result' });
+                rows.push({ n: turnNum, role: 'user', type: 'tool_result', block_index: bi });
               } else if (block.type === 'text') {
-                rows.push({ n: turnNum, role: 'user', type: 'user' });
+                rows.push({ n: turnNum, role: 'user', type: 'user', block_index: bi });
               } else if (block.type === 'image') {
-                rows.push({ n: turnNum, role: 'user', type: 'image' });
+                rows.push({ n: turnNum, role: 'user', type: 'image', block_index: bi });
               } else {
-                rows.push({ n: turnNum, role: 'user', type: block.type ?? 'unknown' });
+                rows.push({ n: turnNum, role: 'user', type: block.type ?? 'unknown', block_index: bi });
               }
             }
           } else {
-            rows.push({ n: turnNum, role: 'user', type: 'user' });
+            rows.push({ n: turnNum, role: 'user', type: 'user', block_index: 0 });
           }
         } else if (entry.type === 'assistant') {
           const blocks = (entry.message?.content ?? []) as ContentBlock[];
           const tools = blocks.filter(b => b.type === 'tool_use').map(b => b.name!);
           if (tools.length > 0) {
-            rows.push({ n: turnNum, role: 'assistant', type: 'tool_use', tools });
+            rows.push({ n: turnNum, role: 'assistant', type: 'tool_use', block_index: 0, tools });
             for (const tool of tools) {
               toolCounts[tool] = (toolCounts[tool] ?? 0) + 1;
               if (firstEditTurn == null && (tool === 'Edit' || tool === 'Write')) {
@@ -568,13 +668,14 @@ const shapeCommand = defineCommand({
               }
             }
           } else {
-            for (const block of blocks) {
+            for (let bi = 0; bi < blocks.length; bi++) {
+              const block = blocks[bi]!;
               if (block.type === 'text') {
-                rows.push({ n: turnNum, role: 'assistant', type: 'text' });
+                rows.push({ n: turnNum, role: 'assistant', type: 'text', block_index: bi });
               } else if (block.type === 'thinking') {
-                rows.push({ n: turnNum, role: 'assistant', type: 'thinking' });
+                rows.push({ n: turnNum, role: 'assistant', type: 'thinking', block_index: bi });
               } else {
-                rows.push({ n: turnNum, role: 'assistant', type: block.type ?? 'unknown' });
+                rows.push({ n: turnNum, role: 'assistant', type: block.type ?? 'unknown', block_index: bi });
               }
             }
           }
@@ -689,6 +790,106 @@ const toolsCommand = defineCommand({
 });
 
 // ============================================================================
+// Files Command
+// ============================================================================
+
+const filesCommand = defineCommand({
+  meta: { name: 'files', description: 'Files touched in a session, grouped by operation' },
+  args: {
+    session: { type: 'positional', description: 'Session ID (UUID, prefix, or slug)', required: true },
+    project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    'group-by': { type: 'string', description: "Group by 'file' (default) or 'turn'" },
+    turn: { type: 'string', description: 'Filter by turn N or N-M' },
+    operation: { type: 'string', description: 'Filter by operation (read/edit/write/grep/glob)' },
+  },
+  async run({ args }) {
+    try {
+      const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
+      const sessionFile = await resolveSessionFile(claudeDir, args.session);
+      const sessionId = basename(sessionFile, '.jsonl');
+      const allEntries = await parseSessionLines(sessionFile);
+      const entries = userAssistantEntries(allEntries);
+
+      const groupBy = args['group-by'] ?? 'file';
+      if (groupBy !== 'file' && groupBy !== 'turn') {
+        throw cliError('INVALID_ARGS', "--group-by must be 'file' or 'turn'");
+      }
+      const turnRange = args.turn ? parseTurnRange(args.turn) : null;
+      const opFilter = args.operation ?? null;
+      if (opFilter && !['read', 'edit', 'write', 'grep', 'glob'].includes(opFilter)) {
+        throw cliError('INVALID_ARGS', '--operation must be one of: read, edit, write, grep, glob');
+      }
+
+      // Pass 1: Build tool_use_id -> error status lookup
+      const resultLookup = new Map<string, { is_error: boolean }>();
+      for (const entry of entries) {
+        if (entry.type === 'user' && Array.isArray(entry.message?.content)) {
+          for (const block of entry.message!.content as ContentBlock[]) {
+            if (block.type === 'tool_result' && block.tool_use_id) {
+              resultLookup.set(block.tool_use_id, { is_error: block.is_error ?? false });
+            }
+          }
+        }
+      }
+
+      // Pass 2: Extract file accesses from tool_use blocks
+      let accesses: FileAccess[] = [];
+      let turnNum = 0;
+      for (const entry of entries) {
+        turnNum++;
+        if (entry.type === 'assistant' && Array.isArray(entry.message?.content)) {
+          for (const block of entry.message!.content as ContentBlock[]) {
+            if (block.type === 'tool_use' && block.name) {
+              const fileInfo = extractFilePath(block.name, block.input ?? {});
+              if (fileInfo) {
+                const resultInfo = resultLookup.get(block.id ?? '');
+                accesses.push({
+                  path: fileInfo.path,
+                  operation: fileInfo.operation as FileAccess['operation'],
+                  turn: turnNum,
+                  errored: resultInfo?.is_error ?? false,
+                });
+              }
+            }
+          }
+        }
+      }
+
+      // Apply filters
+      if (turnRange) accesses = accesses.filter(a => a.turn >= turnRange.start && a.turn <= turnRange.end);
+      if (opFilter) accesses = accesses.filter(a => a.operation === opFilter);
+
+      if (groupBy === 'turn') {
+        const result: FilesResult = { session_id: sessionId, group_by: 'turn', accesses };
+        output(success(result, meta(accesses.length, accesses.length)));
+      } else {
+        const fileMap = new Map<string, FileEntry>();
+        for (const access of accesses) {
+          let entry = fileMap.get(access.path);
+          if (!entry) {
+            entry = { path: access.path, operations: [], turns: [], errored: false };
+            fileMap.set(access.path, entry);
+          }
+          if (!entry.operations.includes(access.operation)) {
+            entry.operations.push(access.operation);
+          }
+          if (!entry.turns.includes(access.turn)) {
+            entry.turns.push(access.turn);
+          }
+          if (access.errored) entry.errored = true;
+        }
+        const files = Array.from(fileMap.values());
+        files.sort((a, b) => (a.turns[0] ?? 0) - (b.turns[0] ?? 0));
+        const result: FilesResult = { session_id: sessionId, group_by: 'file', files };
+        output(success(result, meta(files.length, files.length)));
+      }
+    } catch (err: any) {
+      output(failure(err.errorCode ?? 'FORMAT_ERROR', err.message));
+    }
+  },
+});
+
+// ============================================================================
 // Messages Command
 // ============================================================================
 
@@ -712,7 +913,7 @@ const messagesCommand = defineCommand({
       const maxContent = parseIntArg(args['max-content'], '--max-content') ?? 200;
       const turnRange = args.turn ? parseTurnRange(args.turn) : null;
       if (args.role && args.role !== 'user' && args.role !== 'assistant') {
-        throw Object.assign(new Error("--role must be 'user' or 'assistant'"), { errorCode: 'INVALID_ARGS' as ErrorCode });
+        throw cliError('INVALID_ARGS', "--role must be 'user' or 'assistant'");
       }
 
       const messages: MessageEntry[] = [];
@@ -771,7 +972,7 @@ const messagesCommand = defineCommand({
           }
         });
 
-        messages.push({ n: turnNum, role: entry.type, content: processed as ContentBlock[] });
+        messages.push({ n: turnNum, role: entry.type as 'user' | 'assistant', content: processed as ContentBlock[] });
       }
 
       output(success(messages, meta(messages.length, messages.length)));
@@ -854,6 +1055,198 @@ function truncateEntryContent(entry: SessionEntry, maxLen: number): void {
 }
 
 // ============================================================================
+// Search Command
+// ============================================================================
+
+const searchCommand = defineCommand({
+  meta: { name: 'search', description: 'Find sessions matching structured queries' },
+  args: {
+    project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    tool: { type: 'string', description: 'Sessions using a specific tool (case-insensitive substring)' },
+    file: { type: 'string', description: 'Sessions that touched a file (substring match on path)' },
+    text: { type: 'string', description: 'Search in assistant text and thinking content (case-insensitive substring)' },
+    bash: { type: 'string', description: 'Search in Bash command inputs (case-insensitive substring)' },
+    branch: { type: 'string', description: 'Filter by git branch' },
+    after: { type: 'string', description: 'Sessions after DATE (ISO 8601)' },
+    before: { type: 'string', description: 'Sessions before DATE (ISO 8601)' },
+    since: { type: 'string', description: 'Sessions from the last duration (e.g. 1d, 2h, 1w)' },
+    last: { type: 'string', description: 'Return only the last N matches' },
+  },
+  async run({ args }) {
+    try {
+      // Validate at least one search filter is provided
+      if (!args.tool && !args.file && !args.text && !args.bash) {
+        throw cliError('INVALID_ARGS', 'At least one search filter is required (--tool, --file, --text, or --bash)');
+      }
+
+      // Validate --since and --after mutual exclusivity
+      if (args.since && args.after) {
+        throw cliError('INVALID_ARGS', '--since and --after are mutually exclusive');
+      }
+
+      const projectPath = args.project || process.cwd();
+      const claudeDir = resolveClaudeProjectDir(projectPath);
+      const afterCutoff = args.since ? parseSince(args.since) : args.after ?? null;
+      const lastN = parseIntArg(args.last, '--last');
+      if (lastN != null && lastN <= 0) {
+        throw cliError('INVALID_ARGS', '--last must be a positive integer');
+      }
+
+      // WU-2: Session scanning with metadata filters
+      const files = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl'));
+      const results: SearchMatch[] = [];
+
+      const BATCH_SIZE = 50;
+      for (let i = 0; i < files.length; i += BATCH_SIZE) {
+        const batch = files.slice(i, i + BATCH_SIZE);
+        const batchResults = await Promise.all(batch.map(async (f) => {
+          try {
+            const filePath = join(claudeDir, f);
+            const sessionId = f.replace('.jsonl', '');
+            const text = await Bun.file(filePath).text();
+
+            // Extract metadata from first few lines
+            let branch: string | null = null;
+            let timestamp: string | null = null;
+            let slug: string | null = null;
+
+            const lines = text.split('\n');
+            for (let j = 0; j < Math.min(5, lines.length); j++) {
+              const rawLine = lines[j];
+              if (!rawLine?.trim()) continue;
+              try {
+                const entry = JSON.parse(rawLine);
+                if (entry.sessionId) {
+                  branch = entry.gitBranch ?? null;
+                  timestamp = entry.timestamp ?? null;
+                  break;
+                }
+              } catch { /* skip */ }
+            }
+
+            // Find slug via string search (fast, no full parse)
+            const slugMatch = text.match(/"slug":"([a-zA-Z0-9][a-zA-Z0-9-]*)"/);
+            if (slugMatch) slug = slugMatch[1] ?? null;
+
+            // Apply metadata filters to skip non-matching sessions early
+            if (args.branch && branch !== args.branch) return null;
+            if (afterCutoff) {
+              if (!timestamp || timestamp < afterCutoff) return null;
+            }
+            if (args.before) {
+              if (!timestamp || timestamp > args.before) return null;
+            }
+
+            // Parse full session for content filtering
+            const entries = await parseSessionLines(filePath);
+            const uaEntries = userAssistantEntries(entries);
+
+            // WU-3: Content search filters with AND semantics
+            const matchedTools = new Set<string>();
+            const matchedFiles = new Set<string>();
+            const matchedTurns = new Set<number>();
+
+            const toolQuery = args.tool?.toLowerCase();
+            const fileQuery = args.file?.toLowerCase();
+            const textQuery = args.text?.toLowerCase();
+            const bashQuery = args.bash?.toLowerCase();
+
+            // Per-filter hit booleans for AND semantics
+            // A filter that wasn't provided is considered satisfied (true)
+            let toolHit = !toolQuery;
+            let fileHit = !fileQuery;
+            let textHit = !textQuery;
+            let bashHit = !bashQuery;
+
+            for (let ei = 0; ei < uaEntries.length; ei++) {
+              const entry = uaEntries[ei]!;
+              const turnNum = ei + 1;
+              const content = entry.message?.content;
+              if (!Array.isArray(content)) continue;
+
+              for (const block of content as ContentBlock[]) {
+                // --tool: match tool_use block names (case-insensitive substring)
+                if (toolQuery && block.type === 'tool_use' && block.name) {
+                  if (block.name.toLowerCase().includes(toolQuery)) {
+                    matchedTools.add(block.name);
+                    matchedTurns.add(turnNum);
+                    toolHit = true;
+                  }
+                }
+
+                // --file: match file paths from extractFilePath on tool_use blocks
+                if (fileQuery && block.type === 'tool_use' && block.name) {
+                  const fileInfo = extractFilePath(block.name, block.input ?? {});
+                  if (fileInfo && fileInfo.path.toLowerCase().includes(fileQuery)) {
+                    matchedFiles.add(fileInfo.path);
+                    matchedTurns.add(turnNum);
+                    fileHit = true;
+                  }
+                }
+
+                // --text: match text and thinking blocks in assistant entries only
+                if (textQuery && entry.type === 'assistant') {
+                  if (block.type === 'text' && block.text && block.text.toLowerCase().includes(textQuery)) {
+                    matchedTurns.add(turnNum);
+                    textHit = true;
+                  }
+                  if (block.type === 'thinking' && block.thinking && block.thinking.toLowerCase().includes(textQuery)) {
+                    matchedTurns.add(turnNum);
+                    textHit = true;
+                  }
+                }
+
+                // --bash: match Bash tool_use block command inputs
+                if (bashQuery && block.type === 'tool_use' && block.name === 'Bash') {
+                  const command = (block.input as Record<string, any>)?.command;
+                  if (typeof command === 'string' && command.toLowerCase().includes(bashQuery)) {
+                    matchedTurns.add(turnNum);
+                    bashHit = true;
+                  }
+                }
+              }
+            }
+
+            // AND semantics: session matches only if ALL provided filters have hits
+            if (!toolHit || !fileHit || !textHit || !bashHit) return null;
+
+            return {
+              session_id: sessionId,
+              branch,
+              timestamp,
+              slug,
+              matches: {
+                tools: Array.from(matchedTools),
+                files: Array.from(matchedFiles),
+                turns: Array.from(matchedTurns).sort((a, b) => a - b),
+              },
+            } satisfies SearchMatch;
+          } catch {
+            return null; // skip unreadable files
+          }
+        }));
+        results.push(...batchResults.filter((r): r is SearchMatch => r !== null));
+      }
+
+      // Sort newest first; null timestamps sort to end
+      results.sort((a, b) => {
+        if (!a.timestamp && !b.timestamp) return 0;
+        if (!a.timestamp) return 1;
+        if (!b.timestamp) return -1;
+        return b.timestamp.localeCompare(a.timestamp);
+      });
+
+      // Apply --last limit after sorting
+      const total = results.length;
+      const returned = lastN != null ? results.slice(0, lastN) : results;
+      output(success(returned, meta(total, returned.length)));
+    } catch (err: any) {
+      output(failure(err.errorCode ?? 'FORMAT_ERROR', err.message));
+    }
+  },
+});
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -869,6 +1262,8 @@ const main = defineCommand({
     tools: toolsCommand,
     tokens: tokensCommand,
     slice: sliceCommand,
+    files: filesCommand,
+    search: searchCommand,
   },
 });
 
