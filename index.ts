@@ -196,8 +196,30 @@ function meta(total: number, returned: number): ResponseMeta {
   return { total, returned, hasMore: returned < total };
 }
 
-function cliError(code: ErrorCode, message: string): Error & { errorCode: ErrorCode } {
-  return Object.assign(new Error(message), { errorCode: code });
+export class CliError extends Error {
+  readonly errorCode: ErrorCode;
+  constructor(code: ErrorCode, message: string) {
+    super(message);
+    this.errorCode = code;
+    this.name = 'CliError';
+  }
+}
+
+function cliError(code: ErrorCode, message: string): CliError {
+  return new CliError(code, message);
+}
+
+export function isCliError(err: unknown): err is CliError {
+  return err instanceof CliError;
+}
+
+function handleCommandError(err: unknown): void {
+  if (isCliError(err)) {
+    output(failure(err.errorCode, err.message));
+  } else {
+    const message = err instanceof Error ? err.message : String(err);
+    output(failure('FORMAT_ERROR', `Internal error: ${message}`));
+  }
 }
 
 // ============================================================================
@@ -297,6 +319,21 @@ export async function parseSessionLines(filePath: string): Promise<SessionEntry[
 /** Filter to user/assistant entries only. */
 export function userAssistantEntries(entries: SessionEntry[]): SessionEntry[] {
   return entries.filter(e => e.type === 'user' || e.type === 'assistant');
+}
+
+/** Resolve a session from CLI args, returning the session ID and filtered entries. */
+export type ResolvedSession = {
+  sessionId: string;
+  entries: SessionEntry[];
+};
+
+export async function resolveSession(args: { session: string; project?: string }): Promise<ResolvedSession> {
+  const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
+  const sessionFile = await resolveSessionFile(claudeDir, args.session);
+  const sessionId = basename(sessionFile, '.jsonl');
+  const allEntries = await parseSessionLines(sessionFile);
+  const entries = userAssistantEntries(allEntries);
+  return { sessionId, entries };
 }
 
 /** Parse turn range "N" or "N-M". Returns {start, end}. */
@@ -435,6 +472,67 @@ function extractContentText(content: string | ContentBlock[] | undefined): strin
   return '';
 }
 
+/** Extract session metadata (branch, timestamp, version, slug) from raw JSONL text. */
+export type SessionMetadata = {
+  branch: string | null;
+  timestamp: string | null;
+  version: string | null;
+  slug: string | null;
+};
+
+export function extractSessionMetadata(text: string): SessionMetadata {
+  let branch: string | null = null;
+  let timestamp: string | null = null;
+  let version: string | null = null;
+  let slug: string | null = null;
+
+  const lines = text.split('\n');
+  for (let j = 0; j < Math.min(5, lines.length); j++) {
+    const rawLine = lines[j];
+    if (!rawLine?.trim()) continue;
+    try {
+      const entry = JSON.parse(rawLine);
+      if (entry.sessionId) {
+        branch = entry.gitBranch ?? null;
+        version = entry.version ?? null;
+        timestamp = entry.timestamp ?? null;
+        break;
+      }
+    } catch { /* skip */ }
+  }
+
+  const slugMatch = text.match(/"slug":"([a-zA-Z0-9][a-zA-Z0-9-]*)"/);
+  if (slugMatch) slug = slugMatch[1] ?? null;
+
+  return { branch, timestamp, version, slug };
+}
+
+/** Result info for a tool_use_id, extracted from tool_result blocks. */
+export type ToolResultInfo = {
+  is_error: boolean;
+  content: string | ContentBlock[] | undefined;
+  result_ts: string | undefined;
+};
+
+/** Build a lookup from tool_use_id to result info from user entries. */
+export function buildResultLookup(entries: SessionEntry[]): Map<string, ToolResultInfo> {
+  const lookup = new Map<string, ToolResultInfo>();
+  for (const entry of entries) {
+    if (entry.type === 'user' && Array.isArray(entry.message?.content)) {
+      for (const block of entry.message!.content as ContentBlock[]) {
+        if (block.type === 'tool_result' && block.tool_use_id) {
+          lookup.set(block.tool_use_id, {
+            is_error: block.is_error ?? false,
+            content: block.content,
+            result_ts: entry.timestamp ?? undefined,
+          });
+        }
+      }
+    }
+  }
+  return lookup;
+}
+
 // ============================================================================
 // List Command
 // ============================================================================
@@ -482,30 +580,7 @@ const listCommand = defineCommand({
 
             if (minLines > 0 && lineCount < minLines) return null;
 
-            // Extract metadata from first few lines
-            let branch: string | null = null;
-            let timestamp: string | null = null;
-            let version: string | null = null;
-            let slug: string | null = null;
-
-            const lines = text.split('\n');
-            for (let j = 0; j < Math.min(5, lines.length); j++) {
-              const rawLine = lines[j];
-              if (!rawLine?.trim()) continue;
-              try {
-                const entry = JSON.parse(rawLine);
-                if (entry.sessionId) {
-                  branch = entry.gitBranch ?? null;
-                  version = entry.version ?? null;
-                  timestamp = entry.timestamp ?? null;
-                  break;
-                }
-              } catch { /* skip */ }
-            }
-
-            // Find slug via string search (fast, no full parse)
-            const slugMatch = text.match(/"slug":"([a-zA-Z0-9][a-zA-Z0-9-]*)"/);
-            if (slugMatch) slug = slugMatch[1] ?? null;
+            const { branch, timestamp, version, slug } = extractSessionMetadata(text);
 
             // Apply filters
             if (args.branch && branch !== args.branch) return null;
@@ -536,8 +611,8 @@ const listCommand = defineCommand({
       const total = sessions.length;
       const returned = lastN != null ? sessions.slice(0, lastN) : sessions;
       output(success(returned, meta(total, returned.length)));
-    } catch (err: any) {
-      output(failure(err.errorCode ?? 'FORMAT_ERROR', err.message));
+    } catch (err: unknown) {
+      handleCommandError(err);
     }
   },
 });
@@ -555,11 +630,7 @@ const tokensCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
-      const sessionFile = await resolveSessionFile(claudeDir, args.session);
-      const sessionId = basename(sessionFile, '.jsonl');
-      const allEntries = await parseSessionLines(sessionFile);
-      const entries = userAssistantEntries(allEntries);
+      const { sessionId, entries } = await resolveSession(args);
 
       const turns: TokenTurn[] = [];
       let turnNum = 0;
@@ -598,8 +669,8 @@ const tokensCommand = defineCommand({
 
       const result: TokensResult = { session_id: sessionId, turns: finalTurns, totals };
       output(success(result, meta(turns.length, turns.length)));
-    } catch (err: any) {
-      output(failure(err.errorCode ?? 'FORMAT_ERROR', err.message));
+    } catch (err: unknown) {
+      handleCommandError(err);
     }
   },
 });
@@ -616,11 +687,7 @@ const shapeCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
-      const sessionFile = await resolveSessionFile(claudeDir, args.session);
-      const sessionId = basename(sessionFile, '.jsonl');
-      const allEntries = await parseSessionLines(sessionFile);
-      const entries = userAssistantEntries(allEntries);
+      const { sessionId, entries } = await resolveSession(args);
 
       const rows: ShapeRow[] = [];
       const toolCounts: Record<string, number> = {};
@@ -704,8 +771,8 @@ const shapeCommand = defineCommand({
         },
       };
       output(success(result, meta(rows.length, rows.length)));
-    } catch (err: any) {
-      output(failure(err.errorCode ?? 'FORMAT_ERROR', err.message));
+    } catch (err: unknown) {
+      handleCommandError(err);
     }
   },
 });
@@ -725,29 +792,11 @@ const toolsCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
-      const sessionFile = await resolveSessionFile(claudeDir, args.session);
-      const sessionId = basename(sessionFile, '.jsonl');
-      const allEntries = await parseSessionLines(sessionFile);
-      const entries = userAssistantEntries(allEntries);
+      const { sessionId, entries } = await resolveSession(args);
 
       const turnRange = args.turn ? parseTurnRange(args.turn) : null;
 
-      // Pass 1: Build tool_use_id → result lookup from user entries
-      const resultLookup = new Map<string, { is_error?: boolean; content?: string | ContentBlock[]; result_ts?: string }>();
-      for (const entry of entries) {
-        if (entry.type === 'user' && Array.isArray(entry.message?.content)) {
-          for (const block of entry.message!.content as ContentBlock[]) {
-            if (block.type === 'tool_result' && block.tool_use_id) {
-              resultLookup.set(block.tool_use_id, {
-                is_error: block.is_error ?? false,
-                content: block.content,
-                result_ts: entry.timestamp ?? undefined,
-              });
-            }
-          }
-        }
-      }
+      const resultLookup = buildResultLookup(entries);
 
       // Pass 2: Extract tool calls
       let calls: ToolCall[] = [];
@@ -783,8 +832,8 @@ const toolsCommand = defineCommand({
       const total = calls.length;
       const result: ToolsResult = { session_id: sessionId, tool_calls: calls };
       output(success(result, meta(total, total)));
-    } catch (err: any) {
-      output(failure(err.errorCode ?? 'FORMAT_ERROR', err.message));
+    } catch (err: unknown) {
+      handleCommandError(err);
     }
   },
 });
@@ -804,11 +853,7 @@ const filesCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
-      const sessionFile = await resolveSessionFile(claudeDir, args.session);
-      const sessionId = basename(sessionFile, '.jsonl');
-      const allEntries = await parseSessionLines(sessionFile);
-      const entries = userAssistantEntries(allEntries);
+      const { sessionId, entries } = await resolveSession(args);
 
       const groupBy = args['group-by'] ?? 'file';
       if (groupBy !== 'file' && groupBy !== 'turn') {
@@ -820,17 +865,7 @@ const filesCommand = defineCommand({
         throw cliError('INVALID_ARGS', '--operation must be one of: read, edit, write, grep, glob');
       }
 
-      // Pass 1: Build tool_use_id -> error status lookup
-      const resultLookup = new Map<string, { is_error: boolean }>();
-      for (const entry of entries) {
-        if (entry.type === 'user' && Array.isArray(entry.message?.content)) {
-          for (const block of entry.message!.content as ContentBlock[]) {
-            if (block.type === 'tool_result' && block.tool_use_id) {
-              resultLookup.set(block.tool_use_id, { is_error: block.is_error ?? false });
-            }
-          }
-        }
-      }
+      const resultLookup = buildResultLookup(entries);
 
       // Pass 2: Extract file accesses from tool_use blocks
       let accesses: FileAccess[] = [];
@@ -883,8 +918,8 @@ const filesCommand = defineCommand({
         const result: FilesResult = { session_id: sessionId, group_by: 'file', files };
         output(success(result, meta(files.length, files.length)));
       }
-    } catch (err: any) {
-      output(failure(err.errorCode ?? 'FORMAT_ERROR', err.message));
+    } catch (err: unknown) {
+      handleCommandError(err);
     }
   },
 });
@@ -905,10 +940,7 @@ const messagesCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
-      const sessionFile = await resolveSessionFile(claudeDir, args.session);
-      const allEntries = await parseSessionLines(sessionFile);
-      const entries = userAssistantEntries(allEntries);
+      const { entries } = await resolveSession(args);
 
       const maxContent = parseIntArg(args['max-content'], '--max-content') ?? 200;
       const turnRange = args.turn ? parseTurnRange(args.turn) : null;
@@ -976,8 +1008,8 @@ const messagesCommand = defineCommand({
       }
 
       output(success(messages, meta(messages.length, messages.length)));
-    } catch (err: any) {
-      output(failure(err.errorCode ?? 'FORMAT_ERROR', err.message));
+    } catch (err: unknown) {
+      handleCommandError(err);
     }
   },
 });
@@ -996,10 +1028,7 @@ const sliceCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
-      const sessionFile = await resolveSessionFile(claudeDir, args.session);
-      const allEntries = await parseSessionLines(sessionFile);
-      const entries = userAssistantEntries(allEntries);
+      const { entries } = await resolveSession(args);
 
       const turnRange = parseTurnRange(args.turn);
       const maxContent = parseIntArg(args['max-content'], '--max-content');
@@ -1022,8 +1051,8 @@ const sliceCommand = defineCommand({
       }
 
       output(success(sliced, meta(sliced.length, sliced.length)));
-    } catch (err: any) {
-      output(failure(err.errorCode ?? 'FORMAT_ERROR', err.message));
+    } catch (err: unknown) {
+      handleCommandError(err);
     }
   },
 });
@@ -1105,28 +1134,7 @@ const searchCommand = defineCommand({
             const sessionId = f.replace('.jsonl', '');
             const text = await Bun.file(filePath).text();
 
-            // Extract metadata from first few lines
-            let branch: string | null = null;
-            let timestamp: string | null = null;
-            let slug: string | null = null;
-
-            const lines = text.split('\n');
-            for (let j = 0; j < Math.min(5, lines.length); j++) {
-              const rawLine = lines[j];
-              if (!rawLine?.trim()) continue;
-              try {
-                const entry = JSON.parse(rawLine);
-                if (entry.sessionId) {
-                  branch = entry.gitBranch ?? null;
-                  timestamp = entry.timestamp ?? null;
-                  break;
-                }
-              } catch { /* skip */ }
-            }
-
-            // Find slug via string search (fast, no full parse)
-            const slugMatch = text.match(/"slug":"([a-zA-Z0-9][a-zA-Z0-9-]*)"/);
-            if (slugMatch) slug = slugMatch[1] ?? null;
+            const { branch, timestamp, slug } = extractSessionMetadata(text);
 
             // Apply metadata filters to skip non-matching sessions early
             if (args.branch && branch !== args.branch) return null;
@@ -1240,8 +1248,8 @@ const searchCommand = defineCommand({
       const total = results.length;
       const returned = lastN != null ? results.slice(0, lastN) : results;
       output(success(returned, meta(total, returned.length)));
-    } catch (err: any) {
-      output(failure(err.errorCode ?? 'FORMAT_ERROR', err.message));
+    } catch (err: unknown) {
+      handleCommandError(err);
     }
   },
 });

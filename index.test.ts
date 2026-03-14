@@ -3,10 +3,10 @@ import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
-  ERROR_CODES, success, failure,
+  ERROR_CODES, success, failure, CliError, isCliError,
   parseTurnRange, truncateContent, inputSummary, determineOutcome, parseIntArg,
-  extractFilePath, parseSince,
-  resolveClaudeProjectDir, resolveSessionFile, parseSessionLines, userAssistantEntries,
+  extractFilePath, parseSince, buildResultLookup, extractSessionMetadata,
+  resolveClaudeProjectDir, resolveSessionFile, resolveSession, parseSessionLines, userAssistantEntries,
 } from './index.ts';
 
 // ============================================================================
@@ -43,6 +43,38 @@ describe('ERROR_CODES', () => {
     expect(ERROR_CODES.INVALID_ARGS.exitCode).toBe(2);
     expect(ERROR_CODES.NOT_FOUND.exitCode).toBe(3);
 });
+});
+
+// ============================================================================
+// CliError / isCliError
+// ============================================================================
+
+describe('CliError', () => {
+  test('has correct errorCode and message', () => {
+    const err = new CliError('NOT_FOUND', 'gone');
+    expect(err.errorCode).toBe('NOT_FOUND');
+    expect(err.message).toBe('gone');
+    expect(err.name).toBe('CliError');
+  });
+
+  test('is instanceof Error', () => {
+    const err = new CliError('INVALID_ARGS', 'bad');
+    expect(err).toBeInstanceOf(Error);
+  });
+});
+
+describe('isCliError', () => {
+  test('returns true for CliError', () => {
+    expect(isCliError(new CliError('NOT_FOUND', 'test'))).toBe(true);
+  });
+
+  test('returns false for plain Error', () => {
+    expect(isCliError(new Error('test'))).toBe(false);
+  });
+
+  test('returns false for plain object with errorCode', () => {
+    expect(isCliError({ errorCode: 'NOT_FOUND', message: 'test' })).toBe(false);
+  });
 });
 
 // ============================================================================
@@ -861,6 +893,37 @@ describe('resolveSessionFile', () => {
 });
 
 // ============================================================================
+// resolveSession
+// ============================================================================
+
+describe('resolveSession', () => {
+  test('returns sessionId and filtered entries', async () => {
+    const result = await resolveSession({ session: SESSION_ID, project: FAKE_PROJECT });
+    expect(result.sessionId).toBe(SESSION_ID);
+    expect(result.entries.length).toBeGreaterThan(0);
+    expect(result.entries.every(e => e.type === 'user' || e.type === 'assistant')).toBe(true);
+  });
+
+  test('throws NOT_FOUND for non-existent session', async () => {
+    try {
+      await resolveSession({ session: 'zzzzzzzz-0000-0000-0000-000000000000', project: FAKE_PROJECT });
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('NOT_FOUND');
+    }
+  });
+
+  test('throws NOT_FOUND for non-existent project', async () => {
+    try {
+      await resolveSession({ session: SESSION_ID, project: '/nonexistent/project/path' });
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('NOT_FOUND');
+    }
+  });
+});
+
+// ============================================================================
 // extractFilePath
 // ============================================================================
 
@@ -904,6 +967,116 @@ describe('extractFilePath', () => {
 
   test('unknown tool returns null', () => {
     expect(extractFilePath('WebSearch', { query: 'test' })).toBeNull();
+  });
+});
+
+// ============================================================================
+// buildResultLookup
+// ============================================================================
+
+describe('buildResultLookup', () => {
+  test('returns empty map for entries with no tool_results', () => {
+    const entries = [
+      { type: 'assistant' as const, message: { content: [{ type: 'tool_use', name: 'Read', id: 'tu1' }] } },
+    ];
+    const lookup = buildResultLookup(entries as any);
+    expect(lookup.size).toBe(0);
+  });
+
+  test('maps tool_use_id to correct result info', () => {
+    const entries = [
+      { type: 'user' as const, timestamp: '2025-01-01T00:00:00Z', message: { content: [
+        { type: 'tool_result', tool_use_id: 'tu1', is_error: false, content: 'file contents' },
+      ] } },
+    ];
+    const lookup = buildResultLookup(entries as any);
+    expect(lookup.get('tu1')).toEqual({
+      is_error: false,
+      content: 'file contents',
+      result_ts: '2025-01-01T00:00:00Z',
+    });
+  });
+
+  test('handles multiple tool_results in a single user entry', () => {
+    const entries = [
+      { type: 'user' as const, timestamp: '2025-01-01T00:00:00Z', message: { content: [
+        { type: 'tool_result', tool_use_id: 'tu1', is_error: false, content: 'ok' },
+        { type: 'tool_result', tool_use_id: 'tu2', is_error: true, content: 'fail' },
+      ] } },
+    ];
+    const lookup = buildResultLookup(entries as any);
+    expect(lookup.size).toBe(2);
+    expect(lookup.get('tu2')!.is_error).toBe(true);
+  });
+
+  test('skips non-user entries', () => {
+    const entries = [
+      { type: 'assistant' as const, message: { content: [
+        { type: 'tool_result', tool_use_id: 'tu1', is_error: false, content: 'x' },
+      ] } },
+    ];
+    const lookup = buildResultLookup(entries as any);
+    expect(lookup.size).toBe(0);
+  });
+
+  test('defaults is_error to false when undefined', () => {
+    const entries = [
+      { type: 'user' as const, message: { content: [
+        { type: 'tool_result', tool_use_id: 'tu1', content: 'ok' },
+      ] } },
+    ];
+    const lookup = buildResultLookup(entries as any);
+    expect(lookup.get('tu1')!.is_error).toBe(false);
+  });
+
+  test('sets result_ts from entry timestamp', () => {
+    const entries = [
+      { type: 'user' as const, timestamp: '2025-06-15T12:00:00Z', message: { content: [
+        { type: 'tool_result', tool_use_id: 'tu1', content: 'ok' },
+      ] } },
+    ];
+    const lookup = buildResultLookup(entries as any);
+    expect(lookup.get('tu1')!.result_ts).toBe('2025-06-15T12:00:00Z');
+  });
+});
+
+// ============================================================================
+// extractSessionMetadata
+// ============================================================================
+
+describe('extractSessionMetadata', () => {
+  test('extracts all fields from valid first entry', () => {
+    const text = JSON.stringify({ type: 'system', sessionId: 's1', gitBranch: 'main', timestamp: '2025-01-01T00:00:00Z', version: '1.0' });
+    const meta = extractSessionMetadata(text);
+    expect(meta).toEqual({ branch: 'main', timestamp: '2025-01-01T00:00:00Z', version: '1.0', slug: null });
+  });
+
+  test('returns all nulls when no sessionId in first 5 lines', () => {
+    const lines = Array.from({ length: 5 }, (_, i) => JSON.stringify({ type: 'user', message: { content: `msg${i}` } }));
+    const meta = extractSessionMetadata(lines.join('\n'));
+    expect(meta).toEqual({ branch: null, timestamp: null, version: null, slug: null });
+  });
+
+  test('finds slug deeper in text via regex', () => {
+    const header = JSON.stringify({ type: 'system', sessionId: 's1', gitBranch: 'dev', timestamp: '2025-01-01T00:00:00Z' });
+    const filler = Array.from({ length: 10 }, () => JSON.stringify({ type: 'user', message: { content: 'hi' } }));
+    const slugLine = JSON.stringify({ type: 'assistant', slug: 'my-cool-slug' });
+    const text = [header, ...filler, slugLine].join('\n');
+    const meta = extractSessionMetadata(text);
+    expect(meta.slug).toBe('my-cool-slug');
+  });
+
+  test('returns null slug when no slug pattern exists', () => {
+    const text = JSON.stringify({ type: 'system', sessionId: 's1', gitBranch: 'main', timestamp: '2025-01-01T00:00:00Z' });
+    const meta = extractSessionMetadata(text);
+    expect(meta.slug).toBeNull();
+  });
+
+  test('handles malformed JSON in first lines gracefully', () => {
+    const text = 'not json\n{bad\n' + JSON.stringify({ type: 'system', sessionId: 's1', gitBranch: 'fix', timestamp: '2025-06-01T00:00:00Z', version: '2.0' });
+    const meta = extractSessionMetadata(text);
+    expect(meta.branch).toBe('fix');
+    expect(meta.version).toBe('2.0');
   });
 });
 
