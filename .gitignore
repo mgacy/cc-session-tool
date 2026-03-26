@@ -7,6 +7,8 @@ dist
 *.tgz
 *.bun-build
 cc-session-tool
+cc-session-tool-darwin-*
+checksums.txt
 
 # code coverage
 coverage
