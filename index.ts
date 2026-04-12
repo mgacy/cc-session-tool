@@ -4,6 +4,8 @@ import { homedir } from 'os';
 import { join, basename } from 'path';
 import { readdirSync, existsSync } from 'fs';
 
+export const VERSION = '0.1.0';
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -1261,6 +1263,7 @@ const searchCommand = defineCommand({
 const main = defineCommand({
   meta: {
     name: 'cc-session-tool',
+    version: VERSION,
     description: 'Query Claude Code session transcripts',
   },
   subCommands: {
