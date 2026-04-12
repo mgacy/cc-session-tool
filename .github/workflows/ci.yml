@@ -32,9 +32,3 @@ jobs:
       - run: bun test
       - name: Verify build compiles
         run: bun build --compile index.ts --outfile /dev/null
-      - name: Upload build artifacts
-        if: failure()
-        uses: actions/upload-artifact@v6
-        with:
-          name: build-output
-          path: "*.log"

@@ -4,7 +4,7 @@ import { homedir } from 'os';
 import { join, basename } from 'path';
 import { readdirSync, existsSync } from 'fs';
 
-export const VERSION = "0.1.0";
+export const VERSION = '0.1.0';
 
 // ============================================================================
 // Types

@@ -72,6 +72,7 @@ jobs:
       - name: Smoke-test binaries
         run: |
           set -euo pipefail
+          chmod +x cc-session-tool cc-session-tool-darwin-arm64 cc-session-tool-darwin-x64
           ./cc-session-tool --version
           ./cc-session-tool-darwin-arm64 --version
 
