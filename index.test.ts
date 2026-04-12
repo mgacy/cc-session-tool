@@ -7,6 +7,7 @@ import {
   parseTurnRange, truncateContent, inputSummary, determineOutcome, parseIntArg,
   extractFilePath, parseSince, buildResultLookup, extractSessionMetadata,
   resolveClaudeProjectDir, resolveSessionFile, resolveSession, parseSessionLines, userAssistantEntries,
+  listSubagents,
 } from './index.ts';
 
 // ============================================================================
@@ -433,11 +434,66 @@ function makeFixtureLines(): string[] {
   ];
 }
 
+const SUBAGENT_ID = 'a8361bc';
+
 beforeAll(() => {
   mkdirSync(FAKE_PROJECT, { recursive: true });
   mkdirSync(CLAUDE_DIR, { recursive: true });
   const lines = makeFixtureLines();
   writeFileSync(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`), lines.join('\n') + '\n');
+
+  // Subagent fixture: create subagents dir within the parent session UUID dir
+  const subagentDir = join(CLAUDE_DIR, SESSION_ID, 'subagents');
+  mkdirSync(subagentDir, { recursive: true });
+  const subagentLines = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: SESSION_ID,
+      timestamp: '2026-03-01T10:10:00.000Z',
+      gitBranch: 'main',
+      version: '2.1.0',
+      message: { role: 'user', content: 'Subagent task' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-01T10:11:00.000Z',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Subagent response' }],
+        usage: { input_tokens: 40, output_tokens: 15 },
+      },
+    }),
+  ];
+  writeFileSync(join(subagentDir, `agent-${SUBAGENT_ID}.jsonl`), subagentLines.join('\n') + '\n');
+  writeFileSync(join(subagentDir, `agent-${SUBAGENT_ID}.meta.json`), JSON.stringify({
+    agentType: 'test-agent',
+    description: 'Test subagent',
+  }));
+
+  // Second subagent fixture WITHOUT .meta.json (for missing metadata tests)
+  const subagent2Id = 'b9472cd';
+  const subagent2Lines = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: SESSION_ID,
+      timestamp: '2026-03-01T10:05:00.000Z',
+      gitBranch: 'main',
+      version: '2.1.0',
+      message: { role: 'user', content: 'Second subagent task' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-01T10:06:00.000Z',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Second subagent response' }],
+        usage: { input_tokens: 30, output_tokens: 10 },
+      },
+    }),
+  ];
+  writeFileSync(join(subagentDir, `agent-${subagent2Id}.jsonl`), subagent2Lines.join('\n') + '\n');
+  // Intentionally no .meta.json for subagent2
+
   // Second fixture with same slug for ambiguous slug tests
   const lines2 = [
     JSON.stringify({
@@ -627,6 +683,7 @@ describe('shape integration', () => {
     expect(result.ok).toBe(true);
     const data = result.data;
     expect(data.session_id).toBe(SESSION_ID);
+    expect(data.agent_id).toBeNull();
     expect(data.summary.total_turns).toBe(6);
     expect(data.summary.user_messages).toBe(3);
     expect(data.summary.tool_calls.Grep).toBe(1);
@@ -657,6 +714,7 @@ describe('tools integration', () => {
     const { stdout } = await runCli(['tools', SESSION_ID, '--project', FAKE_PROJECT]);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
+    expect(result.data.agent_id).toBeNull();
     expect(result.data.tool_calls.length).toBe(2);
     expect(result.data.tool_calls[0].tool).toBe('Grep');
     expect(result.data.tool_calls[0].input_summary).toContain("pattern='hello'");
@@ -691,6 +749,7 @@ describe('tokens integration', () => {
     const { stdout } = await runCli(['tokens', SESSION_ID, '--project', FAKE_PROJECT]);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
+    expect(result.data.agent_id).toBeNull();
     expect(result.data.turns.length).toBe(3);
     expect(result.data.turns[0].n).toBe(2);
     expect(result.data.turns[0].input).toBe(100);
@@ -715,20 +774,22 @@ describe('messages integration', () => {
     const { stdout } = await runCli(['messages', SESSION_ID, '--project', FAKE_PROJECT]);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
-    expect(result.data.length).toBe(6);
+    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.data.agent_id).toBeNull();
+    expect(result.data.messages.length).toBe(6);
   });
 
   test('filters by role', async () => {
     const { stdout } = await runCli(['messages', SESSION_ID, '--project', FAKE_PROJECT, '--role', 'user']);
     const result = parseOutput(stdout);
-    expect(result.data.every((m: any) => m.role === 'user')).toBe(true);
-    expect(result.data.length).toBe(3);
+    expect(result.data.messages.every((m: any) => m.role === 'user')).toBe(true);
+    expect(result.data.messages.length).toBe(3);
   });
 
   test('filters by type', async () => {
     const { stdout } = await runCli(['messages', SESSION_ID, '--project', FAKE_PROJECT, '--type', 'tool_use']);
     const result = parseOutput(stdout);
-    for (const msg of result.data) {
+    for (const msg of result.data.messages) {
       expect(msg.content.every((b: any) => b.type === 'tool_use')).toBe(true);
     }
   });
@@ -736,15 +797,15 @@ describe('messages integration', () => {
   test('filters by turn range', async () => {
     const { stdout } = await runCli(['messages', SESSION_ID, '--project', FAKE_PROJECT, '--turn', '1-2']);
     const result = parseOutput(stdout);
-    expect(result.data.length).toBe(2);
-    expect(result.data[0].n).toBe(1);
-    expect(result.data[1].n).toBe(2);
+    expect(result.data.messages.length).toBe(2);
+    expect(result.data.messages[0].n).toBe(1);
+    expect(result.data.messages[1].n).toBe(2);
   });
 
   test('truncates content', async () => {
     const { stdout } = await runCli(['messages', SESSION_ID, '--project', FAKE_PROJECT, '--max-content', '10']);
     const result = parseOutput(stdout);
-    const userMsg = result.data.find((m: any) => m.n === 1);
+    const userMsg = result.data.messages.find((m: any) => m.n === 1);
     expect(userMsg.content[0].text).toContain('...[truncated,');
   });
 });
@@ -754,16 +815,18 @@ describe('slice integration', () => {
     const { stdout } = await runCli(['slice', SESSION_ID, '--project', FAKE_PROJECT, '--turn', '1-2']);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
-    expect(result.data.length).toBe(2);
-    expect(result.data[0].type).toBe('user');
-    expect(result.data[1].type).toBe('assistant');
+    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.data.agent_id).toBeNull();
+    expect(result.data.entries.length).toBe(2);
+    expect(result.data.entries[0].type).toBe('user');
+    expect(result.data.entries[1].type).toBe('assistant');
   });
 
   test('truncates content with max-content', async () => {
     const { stdout } = await runCli(['slice', SESSION_ID, '--project', FAKE_PROJECT, '--turn', '2', '--max-content', '10']);
     const result = parseOutput(stdout);
-    expect(result.data.length).toBe(1);
-    const blocks = result.data[0].message.content;
+    expect(result.data.entries.length).toBe(1);
+    const blocks = result.data.entries[0].message.content;
     const thinking = blocks.find((b: any) => b.type === 'thinking');
     expect(thinking.thinking).toContain('...[truncated,');
   });
@@ -869,7 +932,9 @@ describe('resolveSessionFile', () => {
 
   test('exact UUID match resolves', async () => {
     const result = await resolveSessionFile(CLAUDE_DIR, SESSION_ID);
-    expect(result).toBe(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`));
+    expect(result.filePath).toBe(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`));
+    expect(result.sessionId).toBe(SESSION_ID);
+    expect(result.agentId).toBeNull();
   });
 
   test('non-existent session throws NOT_FOUND', async () => {
@@ -890,6 +955,74 @@ describe('resolveSessionFile', () => {
       expect(err.message).toContain('Ambiguous slug');
     }
   });
+
+  // Colon notation tests
+  test('colon notation resolves to ResolvedFile with correct fields', async () => {
+    const result = await resolveSessionFile(CLAUDE_DIR, `${SESSION_ID}:${SUBAGENT_ID}`);
+    expect(result.sessionId).toBe(SESSION_ID);
+    expect(result.agentId).toBe(SUBAGENT_ID);
+    expect(result.filePath).toBe(join(CLAUDE_DIR, SESSION_ID, 'subagents', `agent-${SUBAGENT_ID}.jsonl`));
+  });
+
+  test('empty agent ID throws INVALID_ID', async () => {
+    try {
+      await resolveSessionFile(CLAUDE_DIR, `${SESSION_ID}:`);
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('INVALID_ID');
+      expect(err.message).toContain('Invalid agent ID');
+    }
+  });
+
+  test('empty session part throws INVALID_ID', async () => {
+    try {
+      await resolveSessionFile(CLAUDE_DIR, ':some-agent');
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('INVALID_ID');
+      expect(err.message).toContain('Invalid session ID portion');
+    }
+  });
+
+  test('multiple colons throws INVALID_ID (agent part contains colon)', async () => {
+    try {
+      await resolveSessionFile(CLAUDE_DIR, 'a:b:c');
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('INVALID_ID');
+      expect(err.message).toContain('Invalid agent ID');
+    }
+  });
+
+  test('underscore in agent ID is valid (validates regex but throws NOT_FOUND)', async () => {
+    try {
+      await resolveSessionFile(CLAUDE_DIR, `${SESSION_ID}:aprompt_suggestion-b96624`);
+      expect(true).toBe(false);
+    } catch (err: any) {
+      // Passes regex validation (underscores allowed in agent IDs) but file doesn't exist
+      expect(err.errorCode).toBe('NOT_FOUND');
+      expect(err.message).toContain('No subagent');
+    }
+  });
+
+  test('non-existent subagent throws NOT_FOUND', async () => {
+    try {
+      await resolveSessionFile(CLAUDE_DIR, `${SESSION_ID}:nonexistent-agent`);
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('NOT_FOUND');
+      expect(err.message).toContain('No subagent');
+    }
+  });
+
+  test('rejects path traversal in agent ID', async () => {
+    try {
+      await resolveSessionFile(CLAUDE_DIR, `${SESSION_ID}:../../../etc`);
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('INVALID_ID');
+    }
+  });
 });
 
 // ============================================================================
@@ -897,9 +1030,10 @@ describe('resolveSessionFile', () => {
 // ============================================================================
 
 describe('resolveSession', () => {
-  test('returns sessionId and filtered entries', async () => {
+  test('returns sessionId, agentId, and filtered entries', async () => {
     const result = await resolveSession({ session: SESSION_ID, project: FAKE_PROJECT });
     expect(result.sessionId).toBe(SESSION_ID);
+    expect(result.agentId).toBeNull();
     expect(result.entries.length).toBeGreaterThan(0);
     expect(result.entries.every(e => e.type === 'user' || e.type === 'assistant')).toBe(true);
   });
@@ -920,6 +1054,14 @@ describe('resolveSession', () => {
     } catch (err: any) {
       expect(err.errorCode).toBe('NOT_FOUND');
     }
+  });
+
+  test('resolves subagent with colon notation', async () => {
+    const result = await resolveSession({ session: `${SESSION_ID}:${SUBAGENT_ID}`, project: FAKE_PROJECT });
+    expect(result.sessionId).toBe(SESSION_ID);
+    expect(result.agentId).toBe(SUBAGENT_ID);
+    expect(result.entries.length).toBe(2);
+    expect(result.entries.every(e => e.type === 'user' || e.type === 'assistant')).toBe(true);
   });
 });
 
@@ -1125,6 +1267,7 @@ describe('files integration', () => {
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
+    expect(result.data.agent_id).toBeNull();
     expect(result.data.group_by).toBe('file');
     expect(result.data.files.length).toBe(2);
 
@@ -1354,5 +1497,214 @@ describe('search integration', () => {
     expect(result._meta.total).toBeGreaterThan(result._meta.returned);
     expect(result._meta.returned).toBe(1);
     expect(result._meta.hasMore).toBe(true);
+  });
+});
+
+// ============================================================================
+// listSubagents unit tests
+// ============================================================================
+
+describe('listSubagents', () => {
+  test('returns empty array when subagents directory does not exist', async () => {
+    const result = await listSubagents(CLAUDE_DIR, SESSION_ID_2);
+    expect(result).toEqual([]);
+  });
+
+  test('returns correct metadata from .meta.json', async () => {
+    const result = await listSubagents(CLAUDE_DIR, SESSION_ID);
+    const agent = result.find(a => a.agent_id === 'a8361bc');
+    expect(agent).toBeDefined();
+    expect(agent!.agent_type).toBe('test-agent');
+    expect(agent!.description).toBe('Test subagent');
+    expect(agent!.lines).toBe(2);
+    expect(agent!.timestamp).toBe('2026-03-01T10:10:00.000Z');
+  });
+
+  test('missing .meta.json returns null agent_type and description', async () => {
+    const result = await listSubagents(CLAUDE_DIR, SESSION_ID);
+    const agent = result.find(a => a.agent_id === 'b9472cd');
+    expect(agent).toBeDefined();
+    expect(agent!.agent_type).toBeNull();
+    expect(agent!.description).toBeNull();
+    expect(agent!.lines).toBe(2);
+  });
+
+  test('results are sorted by timestamp descending (newest first)', async () => {
+    const result = await listSubagents(CLAUDE_DIR, SESSION_ID);
+    expect(result.length).toBe(2);
+    // a8361bc has timestamp 2026-03-01T10:10:00.000Z (newer)
+    // b9472cd has timestamp 2026-03-01T10:05:00.000Z (older)
+    expect(result[0].agent_id).toBe('a8361bc');
+    expect(result[1].agent_id).toBe('b9472cd');
+  });
+
+  test('rejects invalid session UUID', async () => {
+    try {
+      await listSubagents(CLAUDE_DIR, '../etc');
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('INVALID_ID');
+    }
+  });
+});
+
+// ============================================================================
+// subagents integration tests
+// ============================================================================
+
+describe('subagents integration', () => {
+  test('returns correct metadata for session with subagents', async () => {
+    const { exitCode, stdout } = await runCli(['subagents', SESSION_ID, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.data.subagents.length).toBe(2);
+    const agent = result.data.subagents.find((a: any) => a.agent_id === 'a8361bc');
+    expect(agent).toBeDefined();
+    expect(agent.agent_type).toBe('test-agent');
+    expect(agent.description).toBe('Test subagent');
+    expect(agent.lines).toBe(2);
+  });
+
+  test('returns success with empty subagents array for session without subagents', async () => {
+    const { exitCode, stdout } = await runCli(['subagents', SESSION_ID_2, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_2);
+    expect(result.data.subagents).toEqual([]);
+    expect(result._meta.total).toBe(0);
+  });
+
+  test('rejects colon notation with INVALID_ARGS error', async () => {
+    const { exitCode, stdout } = await runCli(['subagents', `${SESSION_ID}:${SUBAGENT_ID}`, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+    expect(result.error.message).toContain('parent session ID');
+  });
+
+  test('non-existent session returns NOT_FOUND', async () => {
+    const { exitCode, stdout } = await runCli(['subagents', 'zzzzzzzz-0000-0000-0000-000000000000', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(3);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('NOT_FOUND');
+  });
+});
+
+// ============================================================================
+// Colon notation with session-scoped commands
+// ============================================================================
+
+describe('colon notation integration', () => {
+  test('shape <session>:<agent> processes subagent JSONL with correct agent_id', async () => {
+    const { exitCode, stdout } = await runCli(['shape', `${SESSION_ID}:${SUBAGENT_ID}`, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.data.agent_id).toBe(SUBAGENT_ID);
+    expect(result.data.summary.total_turns).toBe(2);
+    expect(result.data.summary.user_messages).toBe(1);
+  });
+
+  test('tools <session>:<agent> works with agent_id', async () => {
+    const { exitCode, stdout } = await runCli(['tools', `${SESSION_ID}:${SUBAGENT_ID}`, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.data.agent_id).toBe(SUBAGENT_ID);
+    expect(result.data.tool_calls.length).toBe(0); // subagent fixture has no tool_use blocks
+  });
+
+  test('messages <session>:<agent> has structured output with session_id and agent_id', async () => {
+    const { exitCode, stdout } = await runCli(['messages', `${SESSION_ID}:${SUBAGENT_ID}`, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.data.agent_id).toBe(SUBAGENT_ID);
+    expect(result.data.messages.length).toBe(2);
+  });
+
+  test('slice <session>:<agent> has structured output with session_id and agent_id', async () => {
+    const { exitCode, stdout } = await runCli(['slice', `${SESSION_ID}:${SUBAGENT_ID}`, '--project', FAKE_PROJECT, '--turn', '1-2']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.data.agent_id).toBe(SUBAGENT_ID);
+    expect(result.data.entries.length).toBe(2);
+  });
+
+  test('tokens <session>:<agent> works with agent_id', async () => {
+    const { exitCode, stdout } = await runCli(['tokens', `${SESSION_ID}:${SUBAGENT_ID}`, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.data.agent_id).toBe(SUBAGENT_ID);
+  });
+
+  test('files <session>:<agent> works with agent_id', async () => {
+    const { exitCode, stdout } = await runCli(['files', `${SESSION_ID}:${SUBAGENT_ID}`, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.data.agent_id).toBe(SUBAGENT_ID);
+  });
+
+  test('slug-based resolution with colon notation works', async () => {
+    const { exitCode, stdout } = await runCli(['shape', `multi-block-test:${SUBAGENT_ID}`, '--project', FAKE_PROJECT]);
+    // multi-block-test slug resolves to SESSION_ID_3 which has no subagents dir,
+    // so this should fail with NOT_FOUND
+    expect(exitCode).toBe(3);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('NOT_FOUND');
+    expect(result.error.message).toContain('No subagent');
+  });
+});
+
+// ============================================================================
+// list --include-subagents integration tests
+// ============================================================================
+
+describe('list --include-subagents integration', () => {
+  test('includes subagent_count on all sessions when flag is set', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--project', FAKE_PROJECT, '--include-subagents']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    // Every session should have subagent_count field
+    for (const session of result.data) {
+      expect('subagent_count' in session).toBe(true);
+      expect(typeof session.subagent_count).toBe('number');
+    }
+    // SESSION_ID has 2 subagent JSONL files in its subagents directory
+    const sessionWithSubagents = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(sessionWithSubagents).toBeDefined();
+    expect(sessionWithSubagents.subagent_count).toBe(2);
+    // Sessions without subagents directory should have count 0
+    const sessionWithout = result.data.find((s: any) => s.session_id === SESSION_ID_2);
+    expect(sessionWithout).toBeDefined();
+    expect(sessionWithout.subagent_count).toBe(0);
+  });
+
+  test('omits subagent_count entirely when flag is not set', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.length).toBeGreaterThan(0);
+    // No session should have subagent_count field
+    for (const session of result.data) {
+      expect('subagent_count' in session).toBe(false);
+    }
   });
 });

@@ -41,12 +41,15 @@ Single-file CLI (`index.ts`) using `citty` for command parsing. All types, helpe
 | `messages` | Filtered, truncated message content by role/type/turn |
 | `slice` | Raw entries for a turn range |
 | `search` | Find sessions matching structured queries (tool, file, text, bash filters) |
+| `subagents` | List subagents for a session with metadata |
 
-All session-scoped commands accept a positional session identifier (UUID, UUID prefix, or slug) and an optional `--project` flag (defaults to CWD).
+All session-scoped commands accept a positional session identifier (UUID, UUID prefix, or slug) and an optional `--project` flag (defaults to CWD). Subagent sessions can be targeted using colon notation: `<session>:<agent-id>` (e.g., `DA2738E3:a8361bc`).
 
 ### Session Resolution
 
-Sessions are resolved in order: exact UUID filename match, UUID prefix match, then slug search (first 8KB of each JSONL file). Ambiguous matches are errors. Input is validated against `[a-zA-Z0-9-]` to prevent path traversal.
+Sessions are resolved in order: exact UUID filename match, UUID prefix match, then slug search (first 8KB of each JSONL file). Ambiguous matches are errors. Session input is validated against `[a-zA-Z0-9-]` and agent IDs against `[a-zA-Z0-9_-]` to prevent path traversal.
+
+**Subagent targeting:** Use colon notation `<session>:<agent-id>` to address a subagent session (e.g., `DA2738E3:a8361bc`). The session part is resolved normally, then the subagent file is located at `<session-dir>/subagents/agent-<agent-id>.jsonl`. Agent IDs allow underscores: `[a-zA-Z0-9_-]+`. All session-scoped commands except `subagents` support this notation. The `subagents` command lists available agent IDs for a given session.
 
 ### Key Design Decisions
 
