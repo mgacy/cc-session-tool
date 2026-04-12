@@ -33,7 +33,9 @@ All commands except `list` require a `<session>` argument. Three forms are accep
 
 All session commands accept `--project <path>` to specify the project directory (defaults to CWD).
 
-**Input validation:** Only `[a-zA-Z0-9-]` characters are accepted; all other inputs are rejected with exit code 2.
+**Subagent targeting:** Append `:<agent-id>` to any session identifier to target a subagent session (e.g., `DA2738E3:a8361bc` or `snuggly-floating-barto:a8361bc`). The parent session is resolved normally, then the subagent file is located at `<session-dir>/subagents/agent-<agent-id>.jsonl`. Use the `subagents` command to discover available agent IDs.
+
+**Input validation:** Session IDs accept `[a-zA-Z0-9-]` characters; agent IDs also allow underscores `[a-zA-Z0-9_-]`. All other inputs are rejected with exit code 2.
 
 ### Turn Numbering
 
@@ -62,8 +64,9 @@ cc-session-tool list [--project <path>] [--branch <name>] [--after <date>] [--be
 | `--since`     | —       | Sessions from the last duration: `30m`, `2h`, `1d`, `1w` (mutually exclusive with `--after`) |
 | `--last`      | all     | Return only the N most recent sessions                         |
 | `--min-lines` | 0       | Sessions with at least N lines                                 |
+| `--include-subagents` | false | Include `subagent_count` per session                    |
 
-**Output:** Sessions sorted by timestamp (newest first). Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated.
+**Output:** Sessions sorted by timestamp (newest first). When `--include-subagents` is set, each session includes a `subagent_count` field; otherwise the field is omitted entirely. Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated.
 
 ```json
 {
@@ -99,6 +102,7 @@ cc-session-tool shape <session> [--project <path>]
   "ok": true,
   "data": {
     "session_id": "DA2738E3-...",
+    "agent_id": null,
     "turns": [
       { "n": 1, "role": "user", "type": "user", "block_index": 0 },
       { "n": 2, "role": "assistant", "type": "tool_use", "block_index": 0, "tools": ["Grep"] },
@@ -158,6 +162,7 @@ cc-session-tool tools <session> [--project <path>] [--name <tool>] [--failed] [-
   "ok": true,
   "data": {
     "session_id": "DA2738E3-...",
+    "agent_id": null,
     "tool_calls": [
       {
         "turn": 3,
@@ -229,6 +234,7 @@ cc-session-tool files <session> [--project <path>] [--group-by <file|turn>] [--t
   "ok": true,
   "data": {
     "session_id": "DA2738E3-...",
+    "agent_id": null,
     "group_by": "file",
     "files": [
       {
@@ -256,6 +262,7 @@ cc-session-tool files <session> [--project <path>] [--group-by <file|turn>] [--t
   "ok": true,
   "data": {
     "session_id": "DA2738E3-...",
+    "agent_id": null,
     "group_by": "turn",
     "accesses": [
       { "path": "/Users/me/project/src/auth.ts", "operation": "read", "turn": 6, "errored": false },
@@ -290,6 +297,7 @@ cc-session-tool tokens <session> [--project <path>] [--cumulative]
   "ok": true,
   "data": {
     "session_id": "DA2738E3-...",
+    "agent_id": null,
     "turns": [
       {
         "n": 2,
@@ -354,21 +362,25 @@ cc-session-tool messages <session> [--project <path>] [--role <user|assistant>] 
 ```json
 {
   "ok": true,
-  "data": [
-    {
-      "n": 1,
-      "role": "user",
-      "content": [{ "type": "text", "text": "Implement the feature..." }]
-    },
-    {
-      "n": 2,
-      "role": "assistant",
-      "content": [
-        { "type": "thinking", "text": "I need to...[truncated, 4832 chars]" },
-        { "type": "tool_use", "name": "Grep", "id": "toolu_abc123" }
-      ]
-    }
-  ],
+  "data": {
+    "session_id": "DA2738E3-...",
+    "agent_id": null,
+    "messages": [
+      {
+        "n": 1,
+        "role": "user",
+        "content": [{ "type": "text", "text": "Implement the feature..." }]
+      },
+      {
+        "n": 2,
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "text": "I need to...[truncated, 4832 chars]" },
+          { "type": "tool_use", "name": "Grep", "id": "toolu_abc123" }
+        ]
+      }
+    ]
+  },
   "_meta": { "total": 2, "returned": 2, "hasMore": false }
 }
 ```
@@ -397,7 +409,45 @@ cc-session-tool slice <session> --turn <N|N-M> [--project <path>] [--max-content
 **Notes:**
 
 - Without `--max-content`, entries are output as-is (full content preserved).
-- Output is wrapped in the standard `{ ok, data, _meta }` envelope where `data` is an array of raw session entries.
+- Output is wrapped in the standard `{ ok, data, _meta }` envelope where `data` is a structured object with `session_id`, `agent_id`, and `entries` (array of raw session entries). When targeting a subagent via colon notation, `agent_id` contains the agent ID; otherwise it is `null`.
+
+---
+
+### `subagents <session>`
+
+List subagents spawned during a session. Reads metadata from companion `.meta.json` files and counts JSONL lines for each subagent.
+
+```bash
+cc-session-tool subagents <session> [--project <path>]
+```
+
+**Output:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "session_id": "DA2738E3-...",
+    "subagents": [
+      {
+        "agent_id": "a8361bc",
+        "agent_type": "task",
+        "description": "Implement auth middleware",
+        "lines": 84,
+        "timestamp": "2026-03-07T22:35:00.000Z"
+      }
+    ]
+  },
+  "_meta": { "total": 1, "returned": 1, "hasMore": false }
+}
+```
+
+**Notes:**
+
+- Subagents are sorted by timestamp (newest first). Null timestamps sort to end.
+- `agent_type` and `description` come from `agent-<id>.meta.json`; both are `null` if the meta file is missing.
+- Use the returned `agent_id` with colon notation to target a subagent with any session-scoped command (e.g., `shape DA2738E3:a8361bc`).
+- Colon notation is rejected by this command (subagents of subagents do not exist).
 
 ## Composition Examples
 
@@ -462,6 +512,22 @@ cc-session-tool files DA2738E3 --group-by turn
 cc-session-tool tokens <planning-session>
 cc-session-tool tokens <implementation-session>
 # Compare input/output ratios and cache_read/cache_create patterns
+```
+
+### Inspect subagent activity
+
+```bash
+# Discover subagents spawned during a session
+cc-session-tool subagents DA2738E3
+
+# See what a specific subagent did
+cc-session-tool shape DA2738E3:a8361bc
+
+# Check tool calls in a subagent session
+cc-session-tool tools DA2738E3:a8361bc
+
+# List sessions with subagent counts
+cc-session-tool list --include-subagents
 ```
 
 ## Output Format

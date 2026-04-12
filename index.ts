@@ -67,6 +67,7 @@ export type ListSession = {
   version: string | null;
   lines: number;
   slug: string | null;
+  subagent_count?: number;
 };
 
 export type ShapeRow = {
@@ -79,6 +80,7 @@ export type ShapeRow = {
 
 export type ShapeResult = {
   session_id: string;
+  agent_id: string | null;
   turns: ShapeRow[];
   summary: {
     total_turns: number;
@@ -99,6 +101,7 @@ export type ToolCall = {
 
 export type ToolsResult = {
   session_id: string;
+  agent_id: string | null;
   tool_calls: ToolCall[];
 };
 
@@ -112,6 +115,7 @@ export type TokenTurn = {
 
 export type TokensResult = {
   session_id: string;
+  agent_id: string | null;
   turns: TokenTurn[];
   totals: {
     input: number;
@@ -143,9 +147,29 @@ export type FileEntry = {
 
 export type FilesResult = {
   session_id: string;
+  agent_id: string | null;
   group_by: 'file' | 'turn';
   files?: FileEntry[];
   accesses?: FileAccess[];
+};
+
+export type ResolvedFile = {
+  filePath: string;
+  sessionId: string;      // parent session UUID
+  agentId: string | null;  // non-null when targeting a subagent
+};
+
+export type SubagentInfo = {
+  agent_id: string;
+  agent_type: string | null;
+  description: string | null;
+  lines: number;
+  timestamp: string | null;
+};
+
+export type SubagentsResult = {
+  session_id: string;
+  subagents: SubagentInfo[];
 };
 
 export type SearchMatch = {
@@ -254,16 +278,9 @@ export function resolveClaudeProjectDir(projectPath: string): string {
 
 /**
  * Resolve a session file from a UUID, UUID prefix, or slug.
- * Validates input against path traversal.
+ * Returns the full absolute path to the .jsonl file.
  */
-export async function resolveSessionFile(claudeDir: string, input: string): Promise<string> {
-  if (!input) {
-    throw cliError('INVALID_ARGS', 'Session ID is required');
-  }
-  if (!/^[a-zA-Z0-9-]+$/.test(input)) {
-    throw cliError('INVALID_ID', 'Invalid session ID -- only alphanumeric characters and hyphens allowed');
-  }
-
+async function resolveByIdOrSlug(claudeDir: string, input: string): Promise<string> {
   // Try UUID/prefix match
   const files = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl') && f.startsWith(input));
   if (files.length === 1) return join(claudeDir, files[0]!);
@@ -292,6 +309,48 @@ export async function resolveSessionFile(claudeDir: string, input: string): Prom
   }
 
   throw cliError('NOT_FOUND', `No session found matching '${input}'`);
+}
+
+/**
+ * Resolve a session file from a UUID, UUID prefix, slug, or colon notation (session:agent-id).
+ * Validates input against path traversal.
+ */
+export async function resolveSessionFile(claudeDir: string, input: string): Promise<ResolvedFile> {
+  if (!input) {
+    throw cliError('INVALID_ARGS', 'Session ID is required');
+  }
+
+  // Check for colon notation: <session>:<agent-id>
+  const colonIdx = input.indexOf(':');
+  if (colonIdx !== -1) {
+    const sessionPart = input.slice(0, colonIdx);
+    const agentId = input.slice(colonIdx + 1);
+
+    // Validate each part independently
+    if (!/^[a-zA-Z0-9-]+$/.test(sessionPart)) {
+      throw cliError('INVALID_ID', 'Invalid session ID portion');
+    }
+    if (!/^[a-zA-Z0-9_-]+$/.test(agentId)) {
+      throw cliError('INVALID_ID', 'Invalid agent ID -- only alphanumeric characters, hyphens, and underscores allowed');
+    }
+
+    // Resolve parent session to get its UUID
+    const parentFile = await resolveByIdOrSlug(claudeDir, sessionPart);
+    const parentUuid = basename(parentFile, '.jsonl');
+    const subagentFile = join(claudeDir, parentUuid, 'subagents', `agent-${agentId}.jsonl`);
+
+    if (!existsSync(subagentFile)) {
+      throw cliError('NOT_FOUND', `No subagent '${agentId}' found for session '${parentUuid}'`);
+    }
+    return { filePath: subagentFile, sessionId: parentUuid, agentId };
+  }
+
+  // Non-subagent: existing resolution logic
+  if (!/^[a-zA-Z0-9-]+$/.test(input)) {
+    throw cliError('INVALID_ID', 'Invalid session ID -- only alphanumeric characters and hyphens allowed');
+  }
+  const filePath = await resolveByIdOrSlug(claudeDir, input);
+  return { filePath, sessionId: basename(filePath, '.jsonl'), agentId: null };
 }
 
 /** Parse a JSONL session file into an array of entries. Skips malformed lines. */
@@ -323,19 +382,19 @@ export function userAssistantEntries(entries: SessionEntry[]): SessionEntry[] {
   return entries.filter(e => e.type === 'user' || e.type === 'assistant');
 }
 
-/** Resolve a session from CLI args, returning the session ID and filtered entries. */
+/** Resolve a session from CLI args, returning the session ID, agent ID, and filtered entries. */
 export type ResolvedSession = {
   sessionId: string;
+  agentId: string | null;
   entries: SessionEntry[];
 };
 
 export async function resolveSession(args: { session: string; project?: string }): Promise<ResolvedSession> {
   const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
-  const sessionFile = await resolveSessionFile(claudeDir, args.session);
-  const sessionId = basename(sessionFile, '.jsonl');
-  const allEntries = await parseSessionLines(sessionFile);
+  const { filePath, sessionId, agentId } = await resolveSessionFile(claudeDir, args.session);
+  const allEntries = await parseSessionLines(filePath);
   const entries = userAssistantEntries(allEntries);
-  return { sessionId, entries };
+  return { sessionId, agentId, entries };
 }
 
 /** Parse turn range "N" or "N-M". Returns {start, end}. */
@@ -509,6 +568,47 @@ export function extractSessionMetadata(text: string): SessionMetadata {
   return { branch, timestamp, version, slug };
 }
 
+/** List subagents for a given session. Returns [] if no subagents directory exists. */
+export async function listSubagents(claudeDir: string, sessionUuid: string): Promise<SubagentInfo[]> {
+  if (!/^[a-zA-Z0-9-]+$/.test(sessionUuid)) {
+    throw cliError('INVALID_ID', 'Invalid session UUID');
+  }
+  const dir = join(claudeDir, sessionUuid, 'subagents');
+  if (!existsSync(dir)) return [];
+
+  const files = readdirSync(dir).filter(f => f.startsWith('agent-') && f.endsWith('.jsonl'));
+  const infos = await Promise.all(files.map(async (f) => {
+    const agentId = f.replace(/^agent-/, '').replace(/\.jsonl$/, '');
+    const jsonlPath = join(dir, f);
+    const metaPath = join(dir, f.replace('.jsonl', '.meta.json'));
+
+    let agentType: string | null = null;
+    let description: string | null = null;
+    try {
+      const meta = JSON.parse(await Bun.file(metaPath).text());
+      agentType = meta.agentType ?? null;
+      description = meta.description ?? null;
+    } catch { /* no meta file */ }
+
+    // Single read for both metadata extraction and line counting
+    const text = await Bun.file(jsonlPath).text();
+    const { timestamp } = extractSessionMetadata(text.slice(0, 8192));
+    const lines = text.split('\n').filter(l => l.trim()).length;
+
+    return { agent_id: agentId, agent_type: agentType, description, lines, timestamp };
+  }));
+
+  // Sort by timestamp descending (newest first), matching `list` command convention.
+  // Null timestamps sort to end.
+  infos.sort((a, b) => {
+    if (!a.timestamp && !b.timestamp) return 0;
+    if (!a.timestamp) return 1;
+    if (!b.timestamp) return -1;
+    return b.timestamp.localeCompare(a.timestamp);
+  });
+  return infos;
+}
+
 /** Result info for a tool_use_id, extracted from tool_result blocks. */
 export type ToolResultInfo = {
   is_error: boolean;
@@ -549,6 +649,7 @@ const listCommand = defineCommand({
     since: { type: 'string', description: 'Sessions from the last duration (e.g. 1d, 2h, 1w)' },
     last: { type: 'string', description: 'Return only the last N sessions' },
     'min-lines': { type: 'string', description: 'Sessions with at least N lines' },
+    'include-subagents': { type: 'boolean', description: 'Include subagent count per session', default: false },
   },
   async run({ args }) {
     try {
@@ -593,7 +694,16 @@ const listCommand = defineCommand({
               if (!timestamp || timestamp > args.before) return null;
             }
 
-            return { session_id: sessionId, branch, timestamp, version, lines: lineCount, slug } as ListSession;
+            const session: ListSession = { session_id: sessionId, branch, timestamp, version, lines: lineCount, slug };
+            if (args['include-subagents']) {
+              const subagentDir = join(claudeDir, sessionId, 'subagents');
+              if (existsSync(subagentDir)) {
+                session.subagent_count = readdirSync(subagentDir).filter(sf => sf.startsWith('agent-') && sf.endsWith('.jsonl')).length;
+              } else {
+                session.subagent_count = 0;
+              }
+            }
+            return session;
           } catch {
             return null; // skip unreadable files
           }
@@ -632,7 +742,7 @@ const tokensCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const { sessionId, entries } = await resolveSession(args);
+      const { sessionId, agentId, entries } = await resolveSession(args);
 
       const turns: TokenTurn[] = [];
       let turnNum = 0;
@@ -669,7 +779,7 @@ const tokensCommand = defineCommand({
         });
       }
 
-      const result: TokensResult = { session_id: sessionId, turns: finalTurns, totals };
+      const result: TokensResult = { session_id: sessionId, agent_id: agentId, turns: finalTurns, totals };
       output(success(result, meta(turns.length, turns.length)));
     } catch (err: unknown) {
       handleCommandError(err);
@@ -689,7 +799,7 @@ const shapeCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const { sessionId, entries } = await resolveSession(args);
+      const { sessionId, agentId, entries } = await resolveSession(args);
 
       const rows: ShapeRow[] = [];
       const toolCounts: Record<string, number> = {};
@@ -763,6 +873,7 @@ const shapeCommand = defineCommand({
 
       const result: ShapeResult = {
         session_id: sessionId,
+        agent_id: agentId,
         turns: rows,
         summary: {
           total_turns: turnNum,
@@ -794,7 +905,7 @@ const toolsCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const { sessionId, entries } = await resolveSession(args);
+      const { sessionId, agentId, entries } = await resolveSession(args);
 
       const turnRange = args.turn ? parseTurnRange(args.turn) : null;
 
@@ -832,7 +943,7 @@ const toolsCommand = defineCommand({
       if (turnRange) calls = calls.filter(c => c.turn >= turnRange.start && c.turn <= turnRange.end);
 
       const total = calls.length;
-      const result: ToolsResult = { session_id: sessionId, tool_calls: calls };
+      const result: ToolsResult = { session_id: sessionId, agent_id: agentId, tool_calls: calls };
       output(success(result, meta(total, total)));
     } catch (err: unknown) {
       handleCommandError(err);
@@ -855,7 +966,7 @@ const filesCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const { sessionId, entries } = await resolveSession(args);
+      const { sessionId, agentId, entries } = await resolveSession(args);
 
       const groupBy = args['group-by'] ?? 'file';
       if (groupBy !== 'file' && groupBy !== 'turn') {
@@ -897,7 +1008,7 @@ const filesCommand = defineCommand({
       if (opFilter) accesses = accesses.filter(a => a.operation === opFilter);
 
       if (groupBy === 'turn') {
-        const result: FilesResult = { session_id: sessionId, group_by: 'turn', accesses };
+        const result: FilesResult = { session_id: sessionId, agent_id: agentId, group_by: 'turn', accesses };
         output(success(result, meta(accesses.length, accesses.length)));
       } else {
         const fileMap = new Map<string, FileEntry>();
@@ -917,7 +1028,7 @@ const filesCommand = defineCommand({
         }
         const files = Array.from(fileMap.values());
         files.sort((a, b) => (a.turns[0] ?? 0) - (b.turns[0] ?? 0));
-        const result: FilesResult = { session_id: sessionId, group_by: 'file', files };
+        const result: FilesResult = { session_id: sessionId, agent_id: agentId, group_by: 'file', files };
         output(success(result, meta(files.length, files.length)));
       }
     } catch (err: unknown) {
@@ -942,7 +1053,7 @@ const messagesCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const { entries } = await resolveSession(args);
+      const { sessionId, agentId, entries } = await resolveSession(args);
 
       const maxContent = parseIntArg(args['max-content'], '--max-content') ?? 200;
       const turnRange = args.turn ? parseTurnRange(args.turn) : null;
@@ -1009,7 +1120,7 @@ const messagesCommand = defineCommand({
         messages.push({ n: turnNum, role: entry.type as 'user' | 'assistant', content: processed as ContentBlock[] });
       }
 
-      output(success(messages, meta(messages.length, messages.length)));
+      output(success({ session_id: sessionId, agent_id: agentId, messages }, meta(messages.length, messages.length)));
     } catch (err: unknown) {
       handleCommandError(err);
     }
@@ -1030,7 +1141,7 @@ const sliceCommand = defineCommand({
   },
   async run({ args }) {
     try {
-      const { entries } = await resolveSession(args);
+      const { sessionId, agentId, entries } = await resolveSession(args);
 
       const turnRange = parseTurnRange(args.turn);
       const maxContent = parseIntArg(args['max-content'], '--max-content');
@@ -1052,7 +1163,7 @@ const sliceCommand = defineCommand({
         }
       }
 
-      output(success(sliced, meta(sliced.length, sliced.length)));
+      output(success({ session_id: sessionId, agent_id: agentId, entries: sliced }, meta(sliced.length, sliced.length)));
     } catch (err: unknown) {
       handleCommandError(err);
     }
@@ -1257,6 +1368,33 @@ const searchCommand = defineCommand({
 });
 
 // ============================================================================
+// Subagents Command
+// ============================================================================
+
+const subagentsCommand = defineCommand({
+  meta: { name: 'subagents', description: 'List subagents for a session' },
+  args: {
+    session: { type: 'positional', description: 'Parent session ID', required: true },
+    project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+  },
+  async run({ args }) {
+    try {
+      // Reject colon notation — subagents of subagents don't exist
+      if (args.session.includes(':')) {
+        throw cliError('INVALID_ARGS', 'subagents command takes a parent session ID, not a subagent reference');
+      }
+      const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
+      const { sessionId } = await resolveSessionFile(claudeDir, args.session);
+      const subagents = await listSubagents(claudeDir, sessionId);
+      const result: SubagentsResult = { session_id: sessionId, subagents };
+      output(success(result, meta(subagents.length, subagents.length)));
+    } catch (err: unknown) {
+      handleCommandError(err);
+    }
+  },
+});
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -1275,6 +1413,7 @@ const main = defineCommand({
     slice: sliceCommand,
     files: filesCommand,
     search: searchCommand,
+    subagents: subagentsCommand,
   },
 });
 
