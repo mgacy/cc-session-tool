@@ -1014,6 +1014,15 @@ describe('resolveSessionFile', () => {
       expect(err.message).toContain('No subagent');
     }
   });
+
+  test('rejects path traversal in agent ID', async () => {
+    try {
+      await resolveSessionFile(CLAUDE_DIR, `${SESSION_ID}:../../../etc`);
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('INVALID_ID');
+    }
+  });
 });
 
 // ============================================================================
@@ -1045,6 +1054,14 @@ describe('resolveSession', () => {
     } catch (err: any) {
       expect(err.errorCode).toBe('NOT_FOUND');
     }
+  });
+
+  test('resolves subagent with colon notation', async () => {
+    const result = await resolveSession({ session: `${SESSION_ID}:${SUBAGENT_ID}`, project: FAKE_PROJECT });
+    expect(result.sessionId).toBe(SESSION_ID);
+    expect(result.agentId).toBe(SUBAGENT_ID);
+    expect(result.entries.length).toBe(2);
+    expect(result.entries.every(e => e.type === 'user' || e.type === 'assistant')).toBe(true);
   });
 });
 
@@ -1519,6 +1536,15 @@ describe('listSubagents', () => {
     // b9472cd has timestamp 2026-03-01T10:05:00.000Z (older)
     expect(result[0].agent_id).toBe('a8361bc');
     expect(result[1].agent_id).toBe('b9472cd');
+  });
+
+  test('rejects invalid session UUID', async () => {
+    try {
+      await listSubagents(CLAUDE_DIR, '../etc');
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('INVALID_ID');
+    }
   });
 });
 

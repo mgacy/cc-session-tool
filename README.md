@@ -33,7 +33,7 @@ All commands except `list` require a `<session>` argument. Three forms are accep
 
 All session commands accept `--project <path>` to specify the project directory (defaults to CWD).
 
-**Subagent targeting:** Append `:<agent-id>` to any session identifier to target a subagent session (e.g., `DA2738E3:a8361bc` or `snuggly-floating-barto:a8361bc`). The parent session is resolved normally, then the subagent file is located at `<session-dir>/subagents/agent-<agent-id>.jsonl`. Use the `subagents` command to discover available agent IDs.
+**Subagent targeting:** Append `:<agent-id>` to a session identifier in any session-scoped command (except `subagents`) to target a subagent session (e.g., `DA2738E3:a8361bc` or `snuggly-floating-barto:a8361bc`). The parent session is resolved normally, then the subagent file is located at `<session-dir>/subagents/agent-<agent-id>.jsonl`. Use the `subagents` command to discover available agent IDs.
 
 **Input validation:** Session IDs accept `[a-zA-Z0-9-]` characters; agent IDs also allow underscores `[a-zA-Z0-9_-]`. All other inputs are rejected with exit code 2.
 

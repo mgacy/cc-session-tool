@@ -159,6 +159,18 @@ export type ResolvedFile = {
   agentId: string | null;  // non-null when targeting a subagent
 };
 
+export type MessagesResult = {
+  session_id: string;
+  agent_id: string | null;
+  messages: MessageEntry[];
+};
+
+export type SliceResult = {
+  session_id: string;
+  agent_id: string | null;
+  entries: SessionEntry[];
+};
+
 export type SubagentInfo = {
   agent_id: string;
   agent_type: string | null;
@@ -172,6 +184,7 @@ export type SubagentsResult = {
   subagents: SubagentInfo[];
 };
 
+// SearchMatch intentionally omits agent_id — it operates at the session-listing level, not session-scoped.
 export type SearchMatch = {
   session_id: string;
   branch: string | null;
@@ -328,7 +341,7 @@ export async function resolveSessionFile(claudeDir: string, input: string): Prom
 
     // Validate each part independently
     if (!/^[a-zA-Z0-9-]+$/.test(sessionPart)) {
-      throw cliError('INVALID_ID', 'Invalid session ID portion');
+      throw cliError('INVALID_ID', 'Invalid session ID portion -- only alphanumeric characters and hyphens allowed');
     }
     if (!/^[a-zA-Z0-9_-]+$/.test(agentId)) {
       throw cliError('INVALID_ID', 'Invalid agent ID -- only alphanumeric characters, hyphens, and underscores allowed');
@@ -568,6 +581,8 @@ export function extractSessionMetadata(text: string): SessionMetadata {
   return { branch, timestamp, version, slug };
 }
 
+const isSubagentFile = (f: string) => f.startsWith('agent-') && f.endsWith('.jsonl');
+
 /** List subagents for a given session. Returns [] if no subagents directory exists. */
 export async function listSubagents(claudeDir: string, sessionUuid: string): Promise<SubagentInfo[]> {
   if (!/^[a-zA-Z0-9-]+$/.test(sessionUuid)) {
@@ -576,9 +591,10 @@ export async function listSubagents(claudeDir: string, sessionUuid: string): Pro
   const dir = join(claudeDir, sessionUuid, 'subagents');
   if (!existsSync(dir)) return [];
 
-  const files = readdirSync(dir).filter(f => f.startsWith('agent-') && f.endsWith('.jsonl'));
-  const infos = await Promise.all(files.map(async (f) => {
+  const files = readdirSync(dir).filter(isSubagentFile);
+  const results = await Promise.all(files.map(async (f) => {
     const agentId = f.replace(/^agent-/, '').replace(/\.jsonl$/, '');
+    if (!/^[a-zA-Z0-9_-]+$/.test(agentId)) return null;
     const jsonlPath = join(dir, f);
     const metaPath = join(dir, f.replace('.jsonl', '.meta.json'));
 
@@ -586,17 +602,27 @@ export async function listSubagents(claudeDir: string, sessionUuid: string): Pro
     let description: string | null = null;
     try {
       const meta = JSON.parse(await Bun.file(metaPath).text());
-      agentType = meta.agentType ?? null;
-      description = meta.description ?? null;
-    } catch { /* no meta file */ }
+      agentType = typeof meta.agentType === 'string' ? meta.agentType : null;
+      description = typeof meta.description === 'string' ? meta.description : null;
+    } catch (err: unknown) {
+      if (!(err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT')) {
+        throw cliError('FORMAT_ERROR', `Failed to read metadata for subagent '${agentId}': ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
 
-    // Single read for both metadata extraction and line counting
-    const text = await Bun.file(jsonlPath).text();
+    // Single JSONL read for both metadata extraction and line counting
+    let text: string;
+    try {
+      text = await Bun.file(jsonlPath).text();
+    } catch (err: unknown) {
+      throw cliError('FORMAT_ERROR', `Failed to read subagent file '${agentId}': ${err instanceof Error ? err.message : String(err)}`);
+    }
     const { timestamp } = extractSessionMetadata(text.slice(0, 8192));
     const lines = text.split('\n').filter(l => l.trim()).length;
 
     return { agent_id: agentId, agent_type: agentType, description, lines, timestamp };
   }));
+  const infos = results.filter((info): info is SubagentInfo => info !== null);
 
   // Sort by timestamp descending (newest first), matching `list` command convention.
   // Null timestamps sort to end.
@@ -696,10 +722,14 @@ const listCommand = defineCommand({
 
             const session: ListSession = { session_id: sessionId, branch, timestamp, version, lines: lineCount, slug };
             if (args['include-subagents']) {
-              const subagentDir = join(claudeDir, sessionId, 'subagents');
-              if (existsSync(subagentDir)) {
-                session.subagent_count = readdirSync(subagentDir).filter(sf => sf.startsWith('agent-') && sf.endsWith('.jsonl')).length;
-              } else {
+              try {
+                const subagentDir = join(claudeDir, sessionId, 'subagents');
+                if (existsSync(subagentDir)) {
+                  session.subagent_count = readdirSync(subagentDir).filter(isSubagentFile).length;
+                } else {
+                  session.subagent_count = 0;
+                }
+              } catch {
                 session.subagent_count = 0;
               }
             }
@@ -1120,7 +1150,8 @@ const messagesCommand = defineCommand({
         messages.push({ n: turnNum, role: entry.type as 'user' | 'assistant', content: processed as ContentBlock[] });
       }
 
-      output(success({ session_id: sessionId, agent_id: agentId, messages }, meta(messages.length, messages.length)));
+      const result: MessagesResult = { session_id: sessionId, agent_id: agentId, messages };
+      output(success(result, meta(messages.length, messages.length)));
     } catch (err: unknown) {
       handleCommandError(err);
     }
@@ -1163,7 +1194,8 @@ const sliceCommand = defineCommand({
         }
       }
 
-      output(success({ session_id: sessionId, agent_id: agentId, entries: sliced }, meta(sliced.length, sliced.length)));
+      const result: SliceResult = { session_id: sessionId, agent_id: agentId, entries: sliced };
+      output(success(result, meta(sliced.length, sliced.length)));
     } catch (err: unknown) {
       handleCommandError(err);
     }
