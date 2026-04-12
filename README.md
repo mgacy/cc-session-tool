@@ -499,3 +499,18 @@ Errors:
 ```bash
 bun test
 ```
+
+## Releasing
+
+```bash
+bun run release <major|minor|patch>
+```
+
+The release script (`scripts/release.sh`) handles the full local workflow:
+
+1. Asserts clean working tree on `main`, up-to-date with remote
+2. Runs tests
+3. Bumps `VERSION` in `index.ts`, commits, tags `vX.Y.Z`
+4. Pushes commit + tag to origin
+
+The tag push triggers the `release.yml` GitHub Actions workflow, which builds universal macOS binaries and creates a GitHub release with checksums.

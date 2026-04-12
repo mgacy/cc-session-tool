@@ -7,7 +7,8 @@
   },
   "scripts": {
     "dev": "bun run index.ts",
-    "build": "bun build --compile index.ts --outfile cc-session-tool"
+    "build": "bun build --compile index.ts --outfile cc-session-tool",
+    "release": "./scripts/release.sh"
   },
   "devDependencies": {
     "@types/bun": "latest"
