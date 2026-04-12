@@ -53,7 +53,7 @@ All commands use consistent turn numbering:
 Index all sessions by reading metadata from the first few lines of each file.
 
 ```bash
-cc-session-tool list [--project <path>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>] [--min-lines <n>]
+cc-session-tool list [--project <path>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>] [--min-lines <n>] [--include-subagents]
 ```
 
 | Option        | Default | Description                                                    |
