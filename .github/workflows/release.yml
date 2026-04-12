@@ -27,11 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           SOURCE_VERSION=$(bun -e "import { VERSION } from './index.ts'; console.log(VERSION)")
-          if [ -z "$SOURCE_VERSION" ]; then
-            echo "::error::Failed to extract VERSION from index.ts (got empty string)"
-            exit 1
-          fi
-          if ! echo "$SOURCE_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          if [[ ! "$SOURCE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Extracted VERSION is not valid semver: '$SOURCE_VERSION'"
             exit 1
           fi
@@ -60,7 +56,16 @@ jobs:
             echo "$bin: $size bytes"
           done
           lipo -create cc-session-tool-darwin-arm64 cc-session-tool-darwin-x64 -output cc-session-tool
-          lipo -info cc-session-tool
+          arch_info=$(lipo -info cc-session-tool)
+          echo "$arch_info"
+          if ! echo "$arch_info" | grep -q "x86_64"; then
+            echo "::error::Universal binary missing x86_64 architecture"
+            exit 1
+          fi
+          if ! echo "$arch_info" | grep -q "arm64"; then
+            echo "::error::Universal binary missing arm64 architecture"
+            exit 1
+          fi
 
       - name: Generate checksums
         run: |
@@ -77,6 +82,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             cc-session-tool
             cc-session-tool-darwin-arm64
