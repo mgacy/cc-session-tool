@@ -49,7 +49,7 @@ if ! bun test; then
 fi
 
 # 5. Compute next version
-CURRENT=$(sed -n 's/^export const VERSION = "\([^"]*\)";$/\1/p' index.ts)
+CURRENT=$(sed -n "s/^export const VERSION = '\([^']*\)';$/\1/p" index.ts)
 if [[ -z "$CURRENT" ]]; then
   echo "Error: could not read VERSION from index.ts" >&2
   exit 1
@@ -82,9 +82,9 @@ if git show-ref --tags --verify -- "refs/tags/$TAG" >/dev/null 2>&1; then
 fi
 
 # 7. Update VERSION in index.ts
-sed -i '' "s/^export const VERSION = \"${CURRENT}\";$/export const VERSION = \"${NEXT}\";/" index.ts
+sed -i '' "s/^export const VERSION = '${CURRENT}';$/export const VERSION = '${NEXT}';/" index.ts
 
-VERIFY=$(sed -n 's/^export const VERSION = "\([^"]*\)";$/\1/p' index.ts)
+VERIFY=$(sed -n "s/^export const VERSION = '\([^']*\)';$/\1/p" index.ts)
 if [[ "$VERIFY" != "$NEXT" ]]; then
   echo "Error: VERSION substitution failed — got '$VERIFY', expected '$NEXT'" >&2
   git checkout index.ts

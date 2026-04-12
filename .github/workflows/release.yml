@@ -69,12 +69,11 @@ jobs:
             exit 1
           fi
 
-      - name: Smoke-test binaries
+      - name: Smoke-test binary
         run: |
           set -euo pipefail
-          chmod +x cc-session-tool cc-session-tool-darwin-arm64 cc-session-tool-darwin-x64
+          chmod +x cc-session-tool
           ./cc-session-tool --version
-          ./cc-session-tool-darwin-arm64 --version
 
       - name: Generate checksums
         run: |
