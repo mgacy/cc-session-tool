@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -66,6 +68,12 @@ jobs:
             echo "::error::Universal binary missing arm64 architecture"
             exit 1
           fi
+
+      - name: Smoke-test binaries
+        run: |
+          set -euo pipefail
+          ./cc-session-tool --version
+          ./cc-session-tool-darwin-arm64 --version
 
       - name: Generate checksums
         run: |
