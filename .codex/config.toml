@@ -1,4 +1,4 @@
-# Project-scoped Codex configuration for GetWyz.
+# Project-scoped Codex configuration for cc-session-tool.
 #
 # Codex loads this file only when the repository is trusted. Keep this file
 # focused on repo behavior; user-specific model/provider settings belong in
