@@ -324,25 +324,49 @@ async function resolveByIdOrSlug(claudeDir: string, input: string): Promise<stri
 
 async function fileContainsSlug(filePath: string, slug: string): Promise<boolean> {
   const slugNeedle = `"slug":"${slug}"`;
-  const text = await Bun.file(filePath).text();
+  const stream = Bun.file(filePath).stream();
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffered = '';
 
-  for (const line of text.split('\n')) {
-    if (!line.includes(slugNeedle)) continue;
+  const matchesSlug = (line: string): boolean => {
+    if (!line.includes(slugNeedle)) return false;
     try {
       const parsed: unknown = JSON.parse(line);
-      if (
+      return (
         typeof parsed === 'object' &&
         parsed !== null &&
         (parsed as SessionEntry).slug === slug
-      ) {
-        return true;
-      }
+      );
     } catch {
       // skip malformed lines during slug matching
+      return false;
     }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffered += decoder.decode(value, { stream: true });
+      let newlineIndex = buffered.indexOf('\n');
+      while (newlineIndex !== -1) {
+        const line = buffered.slice(0, newlineIndex);
+        buffered = buffered.slice(newlineIndex + 1);
+        if (matchesSlug(line)) {
+          await reader.cancel();
+          return true;
+        }
+        newlineIndex = buffered.indexOf('\n');
+      }
+    }
+    buffered += decoder.decode();
+  } finally {
+    reader.releaseLock();
   }
 
-  return false;
+  return buffered.length > 0 && matchesSlug(buffered);
 }
 
 /**
