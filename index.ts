@@ -295,21 +295,19 @@ export function resolveClaudeProjectDir(projectPath: string): string {
  */
 async function resolveByIdOrSlug(claudeDir: string, input: string): Promise<string> {
   // Try UUID/prefix match
-  const files = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl') && f.startsWith(input));
-  if (files.length === 1) return join(claudeDir, files[0]!);
-  if (files.length > 1) {
-    throw cliError('INVALID_ID', `Ambiguous session ID prefix '${input}' -- matches ${files.length} sessions`);
+  const allFiles = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl'));
+  const prefixMatches = allFiles.filter(f => f.startsWith(input));
+  if (prefixMatches.length === 1) return join(claudeDir, prefixMatches[0]!);
+  if (prefixMatches.length > 1) {
+    throw cliError('INVALID_ID', `Ambiguous session ID prefix '${input}' -- matches ${prefixMatches.length} sessions`);
   }
 
-  // Try slug match - search for "slug":"<input>" in all jsonl files
-  const allFiles = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl'));
-  const slugPattern = `"slug":"${input}"`;
+  // Try slug match in all JSONL files after UUID/prefix matching fails.
   const slugMatches: string[] = [];
   for (const f of allFiles) {
+    const filePath = join(claudeDir, f);
     try {
-      const filePath = join(claudeDir, f);
-      const chunk = await Bun.file(filePath).slice(0, 8192).text();
-      if (chunk.includes(slugPattern)) {
+      if (await fileContainsSlug(filePath, input)) {
         slugMatches.push(filePath);
       }
     } catch {
@@ -322,6 +320,29 @@ async function resolveByIdOrSlug(claudeDir: string, input: string): Promise<stri
   }
 
   throw cliError('NOT_FOUND', `No session found matching '${input}'`);
+}
+
+async function fileContainsSlug(filePath: string, slug: string): Promise<boolean> {
+  const slugNeedle = `"slug":"${slug}"`;
+  const text = await Bun.file(filePath).text();
+
+  for (const line of text.split('\n')) {
+    if (!line.includes(slugNeedle)) continue;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        (parsed as SessionEntry).slug === slug
+      ) {
+        return true;
+      }
+    } catch {
+      // skip malformed lines during slug matching
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -617,7 +638,7 @@ export async function listSubagents(claudeDir: string, sessionUuid: string): Pro
     } catch (err: unknown) {
       throw cliError('FORMAT_ERROR', `Failed to read subagent file '${agentId}': ${err instanceof Error ? err.message : String(err)}`);
     }
-    const { timestamp } = extractSessionMetadata(text.slice(0, 8192));
+    const { timestamp } = extractSessionMetadata(text);
     const lines = text.split('\n').filter(l => l.trim()).length;
 
     return { agent_id: agentId, agent_type: agentType, description, lines, timestamp };
