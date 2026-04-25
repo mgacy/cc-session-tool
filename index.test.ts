@@ -354,6 +354,15 @@ const SESSION_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const SESSION_ID_2 = 'bbbbbbbb-1111-2222-3333-444444444444';
 const SESSION_ID_3 = 'cccccccc-1111-2222-3333-444444444444';
 const SESSION_ID_4 = 'dddddddd-1111-2222-3333-444444444444';
+const SESSION_ID_5 = 'eeeeeeee-1111-2222-3333-444444444444';
+const LATE_SLUG_FIRST_LINE = JSON.stringify({
+  type: 'user',
+  sessionId: SESSION_ID_5,
+  timestamp: '2026-03-05T10:00:00.000Z',
+  gitBranch: 'main',
+  version: '2.1.0',
+  message: { role: 'user', content: 'x'.repeat(8300) },
+});
 
 function makeFixtureLines(): string[] {
   const ts1 = '2026-03-01T10:00:00.000Z';
@@ -378,6 +387,7 @@ function makeFixtureLines(): string[] {
     JSON.stringify({
       type: 'assistant',
       timestamp: ts2,
+      slug: 'parent-subagent-test',
       message: {
         role: 'assistant',
         content: [
@@ -494,6 +504,26 @@ beforeAll(() => {
   writeFileSync(join(subagentDir, `agent-${subagent2Id}.jsonl`), subagent2Lines.join('\n') + '\n');
   // Intentionally no .meta.json for subagent2
 
+  // Third subagent fixture with metadata beyond the old 8192-byte extraction window.
+  const subagent3Id = 'c0583de';
+  const lateSubagentMetadataFirstLine = JSON.stringify({
+    type: 'summary',
+    summary: 'x'.repeat(8300),
+  });
+  const subagent3Lines = [
+    lateSubagentMetadataFirstLine,
+    JSON.stringify({
+      type: 'user',
+      sessionId: SESSION_ID,
+      timestamp: '2026-03-01T10:20:00.000Z',
+      gitBranch: 'main',
+      version: '2.1.0',
+      message: { role: 'user', content: 'Late metadata subagent task' },
+    }),
+  ];
+  expect(Buffer.byteLength(lateSubagentMetadataFirstLine)).toBeGreaterThan(8192);
+  writeFileSync(join(subagentDir, `agent-${subagent3Id}.jsonl`), subagent3Lines.join('\n') + '\n');
+
   // Second fixture with same slug for ambiguous slug tests
   const lines2 = [
     JSON.stringify({
@@ -564,6 +594,21 @@ beforeAll(() => {
     }),
   ];
   writeFileSync(join(CLAUDE_DIR, `${SESSION_ID_4}.jsonl`), lines4.join('\n') + '\n');
+
+  const lateSlugLines = [
+    LATE_SLUG_FIRST_LINE,
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-05T10:01:00.000Z',
+      slug: 'late-slug-test',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Late slug response' }],
+        usage: { input_tokens: 40, output_tokens: 10 },
+      },
+    }),
+  ];
+  writeFileSync(join(CLAUDE_DIR, `${SESSION_ID_5}.jsonl`), lateSlugLines.join('\n') + '\n');
 });
 
 afterAll(() => {
@@ -596,7 +641,7 @@ describe('list integration', () => {
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
-    expect(result.data.length).toBe(4);
+    expect(result.data.length).toBe(5);
     const session1 = result.data.find((s: any) => s.session_id === SESSION_ID);
     expect(session1).toBeDefined();
     expect(session1.branch).toBe('main');
@@ -630,8 +675,8 @@ describe('list integration', () => {
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result.data.length).toBe(1);
-    expect(result.data[0].session_id).toBe(SESSION_ID_4); // newest (2026-03-04)
-    expect(result._meta.total).toBe(4);
+    expect(result.data[0].session_id).toBe(SESSION_ID_5); // newest (2026-03-05)
+    expect(result._meta.total).toBe(5);
     expect(result._meta.returned).toBe(1);
     expect(result._meta.hasMore).toBe(true);
   });
@@ -645,7 +690,7 @@ describe('list integration', () => {
   test('--last larger than total returns all', async () => {
     const { stdout } = await runCli(['list', '--project', FAKE_PROJECT, '--last', '100']);
     const result = parseOutput(stdout);
-    expect(result.data.length).toBe(4);
+    expect(result.data.length).toBe(5);
     expect(result._meta.hasMore).toBe(false);
   });
 
@@ -662,7 +707,7 @@ describe('list integration', () => {
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
-    expect(result.data.length).toBe(4);
+    expect(result.data.length).toBe(5);
   });
 
   test('--since and --after together returns error', async () => {
@@ -697,6 +742,24 @@ describe('shape integration', () => {
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.data.session_id).toBe(SESSION_ID);
+  });
+
+  test('resolves session by ordinary unique slug', async () => {
+    const { exitCode, stdout } = await runCli(['shape', 'multi-block-test', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_3);
+    expect(result.data.agent_id).toBeNull();
+  });
+
+  test('resolves session by late slug', async () => {
+    const { exitCode, stdout } = await runCli(['shape', 'late-slug-test', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_5);
+    expect(result.data.agent_id).toBeNull();
   });
 
   test('ambiguous slug returns error', async () => {
@@ -934,6 +997,22 @@ describe('resolveSessionFile', () => {
     const result = await resolveSessionFile(CLAUDE_DIR, SESSION_ID);
     expect(result.filePath).toBe(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`));
     expect(result.sessionId).toBe(SESSION_ID);
+    expect(result.agentId).toBeNull();
+  });
+
+  test('UUID prefix match resolves', async () => {
+    const result = await resolveSessionFile(CLAUDE_DIR, SESSION_ID_3.slice(0, 8));
+    expect(result.filePath).toBe(join(CLAUDE_DIR, `${SESSION_ID_3}.jsonl`));
+    expect(result.sessionId).toBe(SESSION_ID_3);
+    expect(result.agentId).toBeNull();
+  });
+
+  test('late slug after 8192 bytes resolves', async () => {
+    expect(Buffer.byteLength(LATE_SLUG_FIRST_LINE)).toBeGreaterThan(8192);
+
+    const result = await resolveSessionFile(CLAUDE_DIR, 'late-slug-test');
+    expect(result.filePath).toBe(join(CLAUDE_DIR, `${SESSION_ID_5}.jsonl`));
+    expect(result.sessionId).toBe(SESSION_ID_5);
     expect(result.agentId).toBeNull();
   });
 
@@ -1206,6 +1285,15 @@ describe('extractSessionMetadata', () => {
     const text = [header, ...filler, slugLine].join('\n');
     const meta = extractSessionMetadata(text);
     expect(meta.slug).toBe('my-cool-slug');
+  });
+
+  test('can skip slug extraction', () => {
+    const header = JSON.stringify({ type: 'system', sessionId: 's1', gitBranch: 'dev', timestamp: '2025-01-01T00:00:00Z' });
+    const slugLine = JSON.stringify({ type: 'assistant', slug: 'my-cool-slug' });
+    const meta = extractSessionMetadata([header, slugLine].join('\n'), { includeSlug: false });
+    expect(meta.branch).toBe('dev');
+    expect(meta.timestamp).toBe('2025-01-01T00:00:00Z');
+    expect(meta.slug).toBeNull();
   });
 
   test('returns null slug when no slug pattern exists', () => {
@@ -1529,13 +1617,23 @@ describe('listSubagents', () => {
     expect(agent!.lines).toBe(2);
   });
 
+  test('extracts timestamp from subagent metadata after first 8192 bytes', async () => {
+    const result = await listSubagents(CLAUDE_DIR, SESSION_ID);
+    const agent = result.find(a => a.agent_id === 'c0583de');
+    expect(agent).toBeDefined();
+    expect(agent!.lines).toBe(2);
+    expect(agent!.timestamp).toBe('2026-03-01T10:20:00.000Z');
+  });
+
   test('results are sorted by timestamp descending (newest first)', async () => {
     const result = await listSubagents(CLAUDE_DIR, SESSION_ID);
-    expect(result.length).toBe(2);
+    expect(result.length).toBe(3);
+    // c0583de has timestamp 2026-03-01T10:20:00.000Z (newest)
     // a8361bc has timestamp 2026-03-01T10:10:00.000Z (newer)
     // b9472cd has timestamp 2026-03-01T10:05:00.000Z (older)
-    expect(result[0].agent_id).toBe('a8361bc');
-    expect(result[1].agent_id).toBe('b9472cd');
+    expect(result[0].agent_id).toBe('c0583de');
+    expect(result[1].agent_id).toBe('a8361bc');
+    expect(result[2].agent_id).toBe('b9472cd');
   });
 
   test('rejects invalid session UUID', async () => {
@@ -1559,7 +1657,7 @@ describe('subagents integration', () => {
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result.data.session_id).toBe(SESSION_ID);
-    expect(result.data.subagents.length).toBe(2);
+    expect(result.data.subagents.length).toBe(3);
     const agent = result.data.subagents.find((a: any) => a.agent_id === 'a8361bc');
     expect(agent).toBeDefined();
     expect(agent.agent_type).toBe('test-agent');
@@ -1659,6 +1757,16 @@ describe('colon notation integration', () => {
     expect(result.data.agent_id).toBe(SUBAGENT_ID);
   });
 
+  test('shape <slug>:<agent> resolves parent slug before subagent lookup', async () => {
+    const { exitCode, stdout } = await runCli(['shape', `parent-subagent-test:${SUBAGENT_ID}`, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.data.agent_id).toBe(SUBAGENT_ID);
+    expect(result.data.summary.total_turns).toBe(2);
+  });
+
   test('slug-based resolution with colon notation works', async () => {
     const { exitCode, stdout } = await runCli(['shape', `multi-block-test:${SUBAGENT_ID}`, '--project', FAKE_PROJECT]);
     // multi-block-test slug resolves to SESSION_ID_3 which has no subagents dir,
@@ -1686,10 +1794,10 @@ describe('list --include-subagents integration', () => {
       expect('subagent_count' in session).toBe(true);
       expect(typeof session.subagent_count).toBe('number');
     }
-    // SESSION_ID has 2 subagent JSONL files in its subagents directory
+    // SESSION_ID has 3 subagent JSONL files in its subagents directory
     const sessionWithSubagents = result.data.find((s: any) => s.session_id === SESSION_ID);
     expect(sessionWithSubagents).toBeDefined();
-    expect(sessionWithSubagents.subagent_count).toBe(2);
+    expect(sessionWithSubagents.subagent_count).toBe(3);
     // Sessions without subagents directory should have count 0
     const sessionWithout = result.data.find((s: any) => s.session_id === SESSION_ID_2);
     expect(sessionWithout).toBeDefined();

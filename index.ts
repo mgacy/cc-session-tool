@@ -295,21 +295,19 @@ export function resolveClaudeProjectDir(projectPath: string): string {
  */
 async function resolveByIdOrSlug(claudeDir: string, input: string): Promise<string> {
   // Try UUID/prefix match
-  const files = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl') && f.startsWith(input));
-  if (files.length === 1) return join(claudeDir, files[0]!);
-  if (files.length > 1) {
-    throw cliError('INVALID_ID', `Ambiguous session ID prefix '${input}' -- matches ${files.length} sessions`);
+  const allFiles = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl'));
+  const prefixMatches = allFiles.filter(f => f.startsWith(input));
+  if (prefixMatches.length === 1) return join(claudeDir, prefixMatches[0]!);
+  if (prefixMatches.length > 1) {
+    throw cliError('INVALID_ID', `Ambiguous session ID prefix '${input}' -- matches ${prefixMatches.length} sessions`);
   }
 
-  // Try slug match - search for "slug":"<input>" in all jsonl files
-  const allFiles = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl'));
-  const slugPattern = `"slug":"${input}"`;
+  // Try slug match in all JSONL files after UUID/prefix matching fails.
   const slugMatches: string[] = [];
   for (const f of allFiles) {
+    const filePath = join(claudeDir, f);
     try {
-      const filePath = join(claudeDir, f);
-      const chunk = await Bun.file(filePath).slice(0, 8192).text();
-      if (chunk.includes(slugPattern)) {
+      if (await fileContainsSlug(filePath, input)) {
         slugMatches.push(filePath);
       }
     } catch {
@@ -322,6 +320,57 @@ async function resolveByIdOrSlug(claudeDir: string, input: string): Promise<stri
   }
 
   throw cliError('NOT_FOUND', `No session found matching '${input}'`);
+}
+
+async function fileContainsSlug(filePath: string, slug: string): Promise<boolean> {
+  const slugNeedle = `"slug":"${slug}"`;
+  const stream = Bun.file(filePath).stream();
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffered = '';
+
+  const matchesSlug = (line: string): boolean => {
+    if (!line.includes(slugNeedle)) return false;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      return (
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        (parsed as SessionEntry).slug === slug
+      );
+    } catch {
+      // skip malformed lines during slug matching
+      return false;
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffered += decoder.decode(value, { stream: true });
+      let newlineIndex = buffered.indexOf('\n');
+      while (newlineIndex !== -1) {
+        const line = buffered.slice(0, newlineIndex);
+        buffered = buffered.slice(newlineIndex + 1);
+        if (matchesSlug(line)) {
+          try {
+            await reader.cancel();
+          } catch {
+            // A cleanup failure should not change a confirmed slug match.
+          }
+          return true;
+        }
+        newlineIndex = buffered.indexOf('\n');
+      }
+    }
+    buffered += decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+
+  return buffered.length > 0 && matchesSlug(buffered);
 }
 
 /**
@@ -554,34 +603,63 @@ export type SessionMetadata = {
   slug: string | null;
 };
 
-export function extractSessionMetadata(text: string): SessionMetadata {
+type ExtractSessionMetadataOptions = {
+  includeSlug?: boolean;
+};
+
+export function extractSessionMetadata(text: string, options: ExtractSessionMetadataOptions = {}): SessionMetadata {
+  const includeSlug = options.includeSlug ?? true;
   let branch: string | null = null;
   let timestamp: string | null = null;
   let version: string | null = null;
   let slug: string | null = null;
 
-  const lines = text.split('\n');
-  for (let j = 0; j < Math.min(5, lines.length); j++) {
-    const rawLine = lines[j];
-    if (!rawLine?.trim()) continue;
-    try {
-      const entry = JSON.parse(rawLine);
-      if (entry.sessionId) {
-        branch = entry.gitBranch ?? null;
-        version = entry.version ?? null;
-        timestamp = entry.timestamp ?? null;
-        break;
-      }
-    } catch { /* skip */ }
+  let lineStart = 0;
+  for (let j = 0; j < 5 && lineStart <= text.length; j++) {
+    const newlineIndex = text.indexOf('\n', lineStart);
+    const lineEnd = newlineIndex === -1 ? text.length : newlineIndex;
+    const rawLine = text.slice(lineStart, lineEnd);
+    if (rawLine.trim()) {
+      try {
+        const entry = JSON.parse(rawLine);
+        if (entry.sessionId) {
+          branch = entry.gitBranch ?? null;
+          version = entry.version ?? null;
+          timestamp = entry.timestamp ?? null;
+          break;
+        }
+      } catch { /* skip */ }
+    }
+    if (newlineIndex === -1) break;
+    lineStart = newlineIndex + 1;
   }
 
-  const slugMatch = text.match(/"slug":"([a-zA-Z0-9][a-zA-Z0-9-]*)"/);
-  if (slugMatch) slug = slugMatch[1] ?? null;
+  if (includeSlug) {
+    const slugMatch = text.match(/"slug":"([a-zA-Z0-9][a-zA-Z0-9-]*)"/);
+    if (slugMatch) slug = slugMatch[1] ?? null;
+  }
 
   return { branch, timestamp, version, slug };
 }
 
 const isSubagentFile = (f: string) => f.startsWith('agent-') && f.endsWith('.jsonl');
+
+function countNonEmptyLines(text: string): number {
+  let count = 0;
+  let lineHasContent = false;
+
+  for (const char of text) {
+    if (char === '\n') {
+      if (lineHasContent) count++;
+      lineHasContent = false;
+    } else if (char.trim() !== '') {
+      lineHasContent = true;
+    }
+  }
+
+  if (lineHasContent) count++;
+  return count;
+}
 
 /** List subagents for a given session. Returns [] if no subagents directory exists. */
 export async function listSubagents(claudeDir: string, sessionUuid: string): Promise<SubagentInfo[]> {
@@ -617,8 +695,8 @@ export async function listSubagents(claudeDir: string, sessionUuid: string): Pro
     } catch (err: unknown) {
       throw cliError('FORMAT_ERROR', `Failed to read subagent file '${agentId}': ${err instanceof Error ? err.message : String(err)}`);
     }
-    const { timestamp } = extractSessionMetadata(text.slice(0, 8192));
-    const lines = text.split('\n').filter(l => l.trim()).length;
+    const { timestamp } = extractSessionMetadata(text, { includeSlug: false });
+    const lines = countNonEmptyLines(text);
 
     return { agent_id: agentId, agent_type: agentType, description, lines, timestamp };
   }));
