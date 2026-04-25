@@ -605,19 +605,24 @@ export function extractSessionMetadata(text: string): SessionMetadata {
   let version: string | null = null;
   let slug: string | null = null;
 
-  const lines = text.split('\n');
-  for (let j = 0; j < Math.min(5, lines.length); j++) {
-    const rawLine = lines[j];
-    if (!rawLine?.trim()) continue;
-    try {
-      const entry = JSON.parse(rawLine);
-      if (entry.sessionId) {
-        branch = entry.gitBranch ?? null;
-        version = entry.version ?? null;
-        timestamp = entry.timestamp ?? null;
-        break;
-      }
-    } catch { /* skip */ }
+  let lineStart = 0;
+  for (let j = 0; j < 5 && lineStart <= text.length; j++) {
+    const newlineIndex = text.indexOf('\n', lineStart);
+    const lineEnd = newlineIndex === -1 ? text.length : newlineIndex;
+    const rawLine = text.slice(lineStart, lineEnd);
+    if (rawLine.trim()) {
+      try {
+        const entry = JSON.parse(rawLine);
+        if (entry.sessionId) {
+          branch = entry.gitBranch ?? null;
+          version = entry.version ?? null;
+          timestamp = entry.timestamp ?? null;
+          break;
+        }
+      } catch { /* skip */ }
+    }
+    if (newlineIndex === -1) break;
+    lineStart = newlineIndex + 1;
   }
 
   const slugMatch = text.match(/"slug":"([a-zA-Z0-9][a-zA-Z0-9-]*)"/);
@@ -627,6 +632,23 @@ export function extractSessionMetadata(text: string): SessionMetadata {
 }
 
 const isSubagentFile = (f: string) => f.startsWith('agent-') && f.endsWith('.jsonl');
+
+function countNonEmptyLines(text: string): number {
+  let count = 0;
+  let lineHasContent = false;
+
+  for (const char of text) {
+    if (char === '\n') {
+      if (lineHasContent) count++;
+      lineHasContent = false;
+    } else if (char.trim() !== '') {
+      lineHasContent = true;
+    }
+  }
+
+  if (lineHasContent) count++;
+  return count;
+}
 
 /** List subagents for a given session. Returns [] if no subagents directory exists. */
 export async function listSubagents(claudeDir: string, sessionUuid: string): Promise<SubagentInfo[]> {
@@ -663,7 +685,7 @@ export async function listSubagents(claudeDir: string, sessionUuid: string): Pro
       throw cliError('FORMAT_ERROR', `Failed to read subagent file '${agentId}': ${err instanceof Error ? err.message : String(err)}`);
     }
     const { timestamp } = extractSessionMetadata(text);
-    const lines = text.split('\n').filter(l => l.trim()).length;
+    const lines = countNonEmptyLines(text);
 
     return { agent_id: agentId, agent_type: agentType, description, lines, timestamp };
   }));
