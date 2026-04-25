@@ -603,7 +603,12 @@ export type SessionMetadata = {
   slug: string | null;
 };
 
-export function extractSessionMetadata(text: string): SessionMetadata {
+type ExtractSessionMetadataOptions = {
+  includeSlug?: boolean;
+};
+
+export function extractSessionMetadata(text: string, options: ExtractSessionMetadataOptions = {}): SessionMetadata {
+  const includeSlug = options.includeSlug ?? true;
   let branch: string | null = null;
   let timestamp: string | null = null;
   let version: string | null = null;
@@ -629,8 +634,10 @@ export function extractSessionMetadata(text: string): SessionMetadata {
     lineStart = newlineIndex + 1;
   }
 
-  const slugMatch = text.match(/"slug":"([a-zA-Z0-9][a-zA-Z0-9-]*)"/);
-  if (slugMatch) slug = slugMatch[1] ?? null;
+  if (includeSlug) {
+    const slugMatch = text.match(/"slug":"([a-zA-Z0-9][a-zA-Z0-9-]*)"/);
+    if (slugMatch) slug = slugMatch[1] ?? null;
+  }
 
   return { branch, timestamp, version, slug };
 }
@@ -688,7 +695,7 @@ export async function listSubagents(claudeDir: string, sessionUuid: string): Pro
     } catch (err: unknown) {
       throw cliError('FORMAT_ERROR', `Failed to read subagent file '${agentId}': ${err instanceof Error ? err.message : String(err)}`);
     }
-    const { timestamp } = extractSessionMetadata(text);
+    const { timestamp } = extractSessionMetadata(text, { includeSlug: false });
     const lines = countNonEmptyLines(text);
 
     return { agent_id: agentId, agent_type: agentType, description, lines, timestamp };

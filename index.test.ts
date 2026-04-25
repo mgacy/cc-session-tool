@@ -1287,6 +1287,15 @@ describe('extractSessionMetadata', () => {
     expect(meta.slug).toBe('my-cool-slug');
   });
 
+  test('can skip slug extraction', () => {
+    const header = JSON.stringify({ type: 'system', sessionId: 's1', gitBranch: 'dev', timestamp: '2025-01-01T00:00:00Z' });
+    const slugLine = JSON.stringify({ type: 'assistant', slug: 'my-cool-slug' });
+    const meta = extractSessionMetadata([header, slugLine].join('\n'), { includeSlug: false });
+    expect(meta.branch).toBe('dev');
+    expect(meta.timestamp).toBe('2025-01-01T00:00:00Z');
+    expect(meta.slug).toBeNull();
+  });
+
   test('returns null slug when no slug pattern exists', () => {
     const text = JSON.stringify({ type: 'system', sessionId: 's1', gitBranch: 'main', timestamp: '2025-01-01T00:00:00Z' });
     const meta = extractSessionMetadata(text);
