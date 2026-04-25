@@ -355,7 +355,11 @@ async function fileContainsSlug(filePath: string, slug: string): Promise<boolean
         const line = buffered.slice(0, newlineIndex);
         buffered = buffered.slice(newlineIndex + 1);
         if (matchesSlug(line)) {
-          await reader.cancel();
+          try {
+            await reader.cancel();
+          } catch {
+            // A cleanup failure should not change a confirmed slug match.
+          }
           return true;
         }
         newlineIndex = buffered.indexOf('\n');
