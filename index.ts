@@ -227,15 +227,13 @@ export type SearchArgs = {
   operation?: SearchOperation;
 };
 
-export type ScanProjectOptions = {
-  claudeDir: string;
+export type SearchTarget = {
+  filePath: string;
+  sessionId: string;
   projectRef?: ProjectRef;
-  includeProjectFields: boolean;
-  afterCutoff: string | null;
-  args: SearchArgs;
 };
 
-export type ProjectScanResult = {
+export type SearchScanResult = {
   matches: SearchMatch[];
   fileMatchesWithoutWrite: number;
 };
@@ -254,6 +252,7 @@ export const ERROR_CODES = {
 
 type ErrorCode = keyof typeof ERROR_CODES;
 const SEARCH_OPERATIONS: SearchOperation[] = ['read', 'edit', 'write', 'grep', 'glob'];
+const SEARCH_SCAN_CONCURRENCY = 50;
 
 // ============================================================================
 // Response Helpers
@@ -1380,127 +1379,166 @@ function truncateEntryContent(entry: SessionEntry, maxLen: number): void {
   }
 }
 
-export async function scanProjectForSearch(options: ScanProjectOptions): Promise<ProjectScanResult> {
-  const { claudeDir, projectRef, includeProjectFields, afterCutoff, args } = options;
-  const files = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl'));
-  const matches: SearchMatch[] = [];
+export function listSearchTargetsForProject(claudeDir: string, projectRef?: ProjectRef): SearchTarget[] {
+  return readdirSync(claudeDir)
+    .filter(f => f.endsWith('.jsonl'))
+    .map(f => ({
+      filePath: join(claudeDir, f),
+      sessionId: f.replace('.jsonl', ''),
+      projectRef,
+    }));
+}
+
+export async function mapConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index]!, index);
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
+type SearchTargetResult = {
+  match: SearchMatch | null;
+  fileMatchesWithoutWrite: number;
+};
+
+export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, afterCutoff: string | null): Promise<SearchTargetResult> {
   let fileMatchesWithoutWrite = 0;
 
-  const BATCH_SIZE = 50;
-  for (let i = 0; i < files.length; i += BATCH_SIZE) {
-    const batch = files.slice(i, i + BATCH_SIZE);
-    const batchResults = await Promise.all(batch.map(async (f) => {
-      try {
-        const filePath = join(claudeDir, f);
-        const sessionId = f.replace('.jsonl', '');
-        const text = await Bun.file(filePath).text();
+  try {
+    const text = await Bun.file(target.filePath).text();
 
-        const { branch, timestamp, slug } = extractSessionMetadata(text);
+    const { branch, timestamp, slug } = extractSessionMetadata(text);
 
-        if (args.branch && branch !== args.branch) return null;
-        if (afterCutoff) {
-          if (!timestamp || timestamp < afterCutoff) return null;
+    if (args.branch && branch !== args.branch) return { match: null, fileMatchesWithoutWrite };
+    if (afterCutoff) {
+      if (!timestamp || timestamp < afterCutoff) return { match: null, fileMatchesWithoutWrite };
+    }
+    if (args.before) {
+      if (!timestamp || timestamp > args.before) return { match: null, fileMatchesWithoutWrite };
+    }
+
+    const entries = await parseSessionLines(target.filePath);
+    const uaEntries = userAssistantEntries(entries);
+
+    const matchedTools = new Set<string>();
+    const matchedFiles = new Set<string>();
+    const matchedOperations = new Set<SearchOperation>();
+    const matchedTurns = new Set<number>();
+
+    const toolQuery = args.tool?.toLowerCase();
+    const fileQuery = args.file?.toLowerCase();
+    const textQuery = args.text?.toLowerCase();
+    const bashQuery = args.bash?.toLowerCase();
+    const operationQuery = args.operation;
+
+    let toolHit = !toolQuery;
+    let fileHit = !fileQuery;
+    let textHit = !textQuery;
+    let bashHit = !bashQuery;
+
+    for (let ei = 0; ei < uaEntries.length; ei++) {
+      const entry = uaEntries[ei]!;
+      const turnNum = ei + 1;
+      const content = entry.message?.content;
+      if (!Array.isArray(content)) continue;
+
+      for (const block of content as ContentBlock[]) {
+        if (toolQuery && block.type === 'tool_use' && block.name) {
+          if (block.name.toLowerCase().includes(toolQuery)) {
+            matchedTools.add(block.name);
+            matchedTurns.add(turnNum);
+            toolHit = true;
+          }
         }
-        if (args.before) {
-          if (!timestamp || timestamp > args.before) return null;
-        }
 
-        const entries = await parseSessionLines(filePath);
-        const uaEntries = userAssistantEntries(entries);
-
-        const matchedTools = new Set<string>();
-        const matchedFiles = new Set<string>();
-        const matchedOperations = new Set<SearchOperation>();
-        const matchedTurns = new Set<number>();
-
-        const toolQuery = args.tool?.toLowerCase();
-        const fileQuery = args.file?.toLowerCase();
-        const textQuery = args.text?.toLowerCase();
-        const bashQuery = args.bash?.toLowerCase();
-        const operationQuery = args.operation;
-
-        let toolHit = !toolQuery;
-        let fileHit = !fileQuery;
-        let textHit = !textQuery;
-        let bashHit = !bashQuery;
-
-        for (let ei = 0; ei < uaEntries.length; ei++) {
-          const entry = uaEntries[ei]!;
-          const turnNum = ei + 1;
-          const content = entry.message?.content;
-          if (!Array.isArray(content)) continue;
-
-          for (const block of content as ContentBlock[]) {
-            if (toolQuery && block.type === 'tool_use' && block.name) {
-              if (block.name.toLowerCase().includes(toolQuery)) {
-                matchedTools.add(block.name);
-                matchedTurns.add(turnNum);
-                toolHit = true;
-              }
-            }
-
-            if (fileQuery && block.type === 'tool_use' && block.name) {
-              const fileInfo = extractFilePath(block.name, block.input ?? {});
-              if (fileInfo && fileInfo.path.toLowerCase().includes(fileQuery)) {
-                if (fileInfo.operation !== 'write') fileMatchesWithoutWrite++;
-                if (!operationQuery || fileInfo.operation === operationQuery) {
-                  matchedFiles.add(fileInfo.path);
-                  matchedOperations.add(fileInfo.operation);
-                  matchedTurns.add(turnNum);
-                  fileHit = true;
-                }
-              }
-            }
-
-            if (textQuery && entry.type === 'assistant') {
-              if (block.type === 'text' && block.text && block.text.toLowerCase().includes(textQuery)) {
-                matchedTurns.add(turnNum);
-                textHit = true;
-              }
-              if (block.type === 'thinking' && block.thinking && block.thinking.toLowerCase().includes(textQuery)) {
-                matchedTurns.add(turnNum);
-                textHit = true;
-              }
-            }
-
-            if (bashQuery && block.type === 'tool_use' && block.name === 'Bash') {
-              const command = (block.input as Record<string, any>)?.command;
-              if (typeof command === 'string' && command.toLowerCase().includes(bashQuery)) {
-                matchedTurns.add(turnNum);
-                bashHit = true;
-              }
+        if (fileQuery && block.type === 'tool_use' && block.name) {
+          const fileInfo = extractFilePath(block.name, block.input ?? {});
+          if (fileInfo && fileInfo.path.toLowerCase().includes(fileQuery)) {
+            if (fileInfo.operation !== 'write') fileMatchesWithoutWrite++;
+            if (!operationQuery || fileInfo.operation === operationQuery) {
+              matchedFiles.add(fileInfo.path);
+              matchedOperations.add(fileInfo.operation);
+              matchedTurns.add(turnNum);
+              fileHit = true;
             }
           }
         }
 
-        if (!toolHit || !fileHit || !textHit || !bashHit) return null;
-
-        const match: SearchMatch = {
-          session_id: sessionId,
-          branch,
-          timestamp,
-          slug,
-          matches: {
-            tools: Array.from(matchedTools),
-            files: Array.from(matchedFiles),
-            turns: Array.from(matchedTurns).sort((a, b) => a - b),
-          },
-        };
-
-        if (matchedOperations.size > 0) {
-          match.matches.operations = Array.from(matchedOperations);
-        }
-        if (includeProjectFields && projectRef) {
-          match.project = projectRef.project;
-          match.project_path_guess = projectRef.project_path_guess;
+        if (textQuery && entry.type === 'assistant') {
+          if (block.type === 'text' && block.text && block.text.toLowerCase().includes(textQuery)) {
+            matchedTurns.add(turnNum);
+            textHit = true;
+          }
+          if (block.type === 'thinking' && block.thinking && block.thinking.toLowerCase().includes(textQuery)) {
+            matchedTurns.add(turnNum);
+            textHit = true;
+          }
         }
 
-        return match;
-      } catch {
-        return null;
+        if (bashQuery && block.type === 'tool_use' && block.name === 'Bash') {
+          const command = (block.input as Record<string, any>)?.command;
+          if (typeof command === 'string' && command.toLowerCase().includes(bashQuery)) {
+            matchedTurns.add(turnNum);
+            bashHit = true;
+          }
+        }
       }
-    }));
-    matches.push(...batchResults.filter((r): r is SearchMatch => r !== null));
+    }
+
+    if (!toolHit || !fileHit || !textHit || !bashHit) return { match: null, fileMatchesWithoutWrite };
+
+    const match: SearchMatch = {
+      session_id: target.sessionId,
+      branch,
+      timestamp,
+      slug,
+      matches: {
+        tools: Array.from(matchedTools),
+        files: Array.from(matchedFiles),
+        turns: Array.from(matchedTurns).sort((a, b) => a - b),
+      },
+    };
+
+    if (matchedOperations.size > 0) {
+      match.matches.operations = Array.from(matchedOperations);
+    }
+    if (target.projectRef) {
+      match.project = target.projectRef.project;
+      match.project_path_guess = target.projectRef.project_path_guess;
+    }
+
+    return { match, fileMatchesWithoutWrite };
+  } catch {
+    return { match: null, fileMatchesWithoutWrite: 0 };
+  }
+}
+
+export async function scanSearchTargets(targets: SearchTarget[], args: SearchArgs, afterCutoff: string | null): Promise<SearchScanResult> {
+  const matches: SearchMatch[] = [];
+  let fileMatchesWithoutWrite = 0;
+
+  const targetResults = await mapConcurrent(
+    targets,
+    SEARCH_SCAN_CONCURRENCY,
+    target => scanSearchTarget(target, args, afterCutoff),
+  );
+  for (const result of targetResults) {
+    fileMatchesWithoutWrite += result.fileMatchesWithoutWrite;
+    if (result.match) matches.push(result.match);
   }
 
   return { matches, fileMatchesWithoutWrite };
@@ -1574,35 +1612,21 @@ const searchCommand = defineCommand({
       if (allProjects) {
         const refs = listClaudeProjectRefs();
         projectsScanned = refs.length;
-        const PROJECT_BATCH_SIZE = 10;
-        for (let i = 0; i < refs.length; i += PROJECT_BATCH_SIZE) {
-          const batch = refs.slice(i, i + PROJECT_BATCH_SIZE);
-          const scanResults = await Promise.all(batch.map(async (projectRef) => {
-            try {
-              return await scanProjectForSearch({
-                claudeDir: projectRef.claude_dir,
-                projectRef,
-                includeProjectFields: true,
-                afterCutoff,
-                args: searchArgs,
-              });
-            } catch {
-              return null;
-            }
-          }));
-          for (const result of scanResults) {
-            if (result) results.push(...result.matches);
+        const targets: SearchTarget[] = [];
+        for (const projectRef of refs) {
+          try {
+            targets.push(...listSearchTargetsForProject(projectRef.claude_dir, projectRef));
+          } catch {
+            // Match the existing all-project behavior: skip unreadable project directories.
           }
         }
+        const scanResult = await scanSearchTargets(targets, searchArgs, afterCutoff);
+        results.push(...scanResult.matches);
       } else {
         const projectPath = args.project || process.cwd();
         const claudeDir = resolveClaudeProjectDir(projectPath);
-        const { matches, fileMatchesWithoutWrite } = await scanProjectForSearch({
-          claudeDir,
-          includeProjectFields: false,
-          afterCutoff,
-          args: searchArgs,
-        });
+        const targets = listSearchTargetsForProject(claudeDir);
+        const { matches, fileMatchesWithoutWrite } = await scanSearchTargets(targets, searchArgs, afterCutoff);
         scopedFileMatchesWithoutWrite = fileMatchesWithoutWrite;
         if (args.file) {
           const relatedProjects = findRelatedProjectRefs(projectPath, listClaudeProjectRefs());

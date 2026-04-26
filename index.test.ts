@@ -8,7 +8,7 @@ import {
   extractFilePath, parseSince, buildResultLookup, extractSessionMetadata,
   resolveClaudeProjectDir, resolveSessionFile, resolveSession, parseSessionLines, userAssistantEntries,
   claudeProjectsRoot, findRelatedProjectRefs, listClaudeProjectRefs, listSubagents,
-  mangleProjectPath, projectPathGuessFromClaudeProject,
+  mangleProjectPath, mapConcurrent, projectPathGuessFromClaudeProject,
 } from './index.ts';
 
 // ============================================================================
@@ -403,6 +403,28 @@ describe('Claude project discovery helpers', () => {
 
     expect(related.project_path_guess).not.toStartWith(`${projectPath}/.claude/worktrees/`);
     expect(findRelatedProjectRefs(projectPath, refs)).toEqual([related]);
+  });
+});
+
+// ============================================================================
+// Concurrent mapping helper
+// ============================================================================
+
+describe('mapConcurrent', () => {
+  test('runs work with a global concurrency ceiling', async () => {
+    let active = 0;
+    let maxActive = 0;
+
+    const results = await mapConcurrent([1, 2, 3, 4, 5, 6], 2, async (item) => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await Bun.sleep(1);
+      active--;
+      return item * 2;
+    });
+
+    expect(results).toEqual([2, 4, 6, 8, 10, 12]);
+    expect(maxActive).toBeLessThanOrEqual(2);
   });
 });
 
