@@ -335,6 +335,11 @@ describe('Claude project discovery helpers', () => {
     expect(mangleProjectPath('/tmp/example')).toBe('-tmp-example');
   });
 
+  test('mangleProjectPath normalizes path-equivalent project inputs', () => {
+    expect(mangleProjectPath('/tmp/example/')).toBe(mangleProjectPath('/tmp/example'));
+    expect(mangleProjectPath('/tmp/example/./')).toBe(mangleProjectPath('/tmp/example'));
+  });
+
   test('claudeProjectsRoot can resolve from an explicit home directory', () => {
     expect(claudeProjectsRoot('/tmp/example-home')).toBe('/tmp/example-home/.claude/projects');
   });
@@ -542,7 +547,7 @@ describe('Claude project discovery helpers', () => {
     };
 
     const result = await scanProjectContexts([context], { tool: 'Read' }, null);
-    expect(result).toEqual({ matches: [], fileMatchesWithoutWrite: 0 });
+    expect(result).toEqual({ matches: [] });
   });
 
   test('projectMatchesGlob supports wildcards and escapes regex metacharacters', () => {
@@ -792,6 +797,20 @@ describe('resolveClaudeProjectDir', () => {
 
     try {
       expect(resolveClaudeProjectDir(projectPath, root)).toBe(claudeDir);
+    } finally {
+      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+    }
+  });
+
+  test('resolves project paths with trailing slashes to the same Claude directory', () => {
+    const unique = `cc-session-tool-resolve-trailing-${Date.now()}`;
+    const root = join(tmpdir(), unique, '.claude', 'projects');
+    const projectPath = join(tmpdir(), unique, 'project');
+    const claudeDir = join(root, mangleProjectPath(projectPath));
+    mkdirSync(claudeDir, { recursive: true });
+
+    try {
+      expect(resolveClaudeProjectDir(`${projectPath}/`, root)).toBe(claudeDir);
     } finally {
       rmSync(join(tmpdir(), unique), { recursive: true, force: true });
     }

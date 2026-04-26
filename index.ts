@@ -350,7 +350,6 @@ export type SessionProjectSelector =
 
 export type SearchScanResult = {
   matches: SearchMatch[];
-  fileMatchesWithoutWrite: number;
 };
 
 export type ListMeta = ResponseMeta & {
@@ -449,7 +448,8 @@ export function claudeProjectsRoot(home = homedir()): string {
 }
 
 export function mangleProjectPath(projectPath: string): string {
-  const stripped = projectPath.startsWith('/') ? projectPath.slice(1) : projectPath;
+  const normalized = normalizePathForContainment(projectPath);
+  const stripped = normalized.startsWith('/') ? normalized.slice(1) : normalized;
   return '-' + stripped.replace(/\//g, '-');
 }
 
@@ -674,7 +674,10 @@ function globToRegExp(glob: string): RegExp {
 }
 
 export function projectMatchesGlob(ref: ProjectRef, glob: string): boolean {
-  const regex = globToRegExp(glob);
+  return projectMatchesPattern(ref, globToRegExp(glob));
+}
+
+function projectMatchesPattern(ref: ProjectRef, regex: RegExp): boolean {
   return regex.test(ref.project) || Boolean(ref.project_path_guess && regex.test(ref.project_path_guess));
 }
 
@@ -684,6 +687,7 @@ export function selectProjectContexts(options: ProjectSelectionOptions): Project
   if (options.mode === 'all-projects') {
     const included: SearchProjectContext[] = [];
     const skipped: SearchProjectContext[] = [];
+    const projectGlobRegex = options.projectGlob ? globToRegExp(options.projectGlob) : null;
     for (const projectRef of listClaudeProjectRefs(root)) {
       const context: SearchProjectContext = {
         role: 'global',
@@ -691,7 +695,7 @@ export function selectProjectContexts(options: ProjectSelectionOptions): Project
         worktreeRoot: null,
         projectRef,
       };
-      if (options.projectGlob && !projectMatchesGlob(projectRef, options.projectGlob)) {
+      if (projectGlobRegex && !projectMatchesPattern(projectRef, projectGlobRegex)) {
         skipped.push(context);
       } else {
         included.push(context);
@@ -1290,7 +1294,7 @@ async function listSessionsForContext(
         const filePath = join(context.projectRef.claude_dir, f);
         const sessionId = f.replace('.jsonl', '');
         const text = await Bun.file(filePath).text();
-        const lineCount = text.split('\n').filter(l => l.trim()).length;
+        const lineCount = countNonEmptyLines(text);
 
         if (minLines > 0 && lineCount < minLines) return null;
 
@@ -1925,23 +1929,20 @@ export async function mapConcurrent<T, R>(
 
 type SearchTargetResult = {
   match: SearchMatch | null;
-  fileMatchesWithoutWrite: number;
 };
 
 export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, afterCutoff: string | null): Promise<SearchTargetResult> {
-  let fileMatchesWithoutWrite = 0;
-
   try {
     const text = await Bun.file(target.filePath).text();
 
     const { branch, timestamp, slug } = extractSessionMetadata(text);
 
-    if (args.branch && branch !== args.branch) return { match: null, fileMatchesWithoutWrite };
+    if (args.branch && branch !== args.branch) return { match: null };
     if (afterCutoff) {
-      if (!timestamp || timestamp < afterCutoff) return { match: null, fileMatchesWithoutWrite };
+      if (!timestamp || timestamp < afterCutoff) return { match: null };
     }
     if (args.before) {
-      if (!timestamp || timestamp > args.before) return { match: null, fileMatchesWithoutWrite };
+      if (!timestamp || timestamp > args.before) return { match: null };
     }
 
     const entries = parseSessionText(text);
@@ -2015,7 +2016,6 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
                 logicalPath: null,
               };
           if (fileInfo && fileMatch.matched) {
-            if (fileInfo.operation !== 'write') fileMatchesWithoutWrite++;
             if (!operationQuery || fileInfo.operation === operationQuery) {
               matchedFiles.add(fileInfo.path);
               if (fileMatch.logicalPath) matchedNormalizedFiles.add(fileMatch.logicalPath);
@@ -2054,7 +2054,7 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
       }
     }
 
-    if (!toolHit || !fileHit || !textHit || !bashHit || !inputHit) return { match: null, fileMatchesWithoutWrite };
+    if (!toolHit || !fileHit || !textHit || !bashHit || !inputHit) return { match: null };
 
     const match: SearchMatch = {
       session_id: target.sessionId,
@@ -2094,15 +2094,14 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
       };
     }
 
-    return { match, fileMatchesWithoutWrite };
+    return { match };
   } catch {
-    return { match: null, fileMatchesWithoutWrite: 0 };
+    return { match: null };
   }
 }
 
 export async function scanSearchTargets(targets: SearchTarget[], args: SearchArgs, afterCutoff: string | null): Promise<SearchScanResult> {
   const matches: SearchMatch[] = [];
-  let fileMatchesWithoutWrite = 0;
 
   const targetResults = await mapConcurrent(
     targets,
@@ -2110,11 +2109,10 @@ export async function scanSearchTargets(targets: SearchTarget[], args: SearchArg
     target => scanSearchTarget(target, args, afterCutoff),
   );
   for (const result of targetResults) {
-    fileMatchesWithoutWrite += result.fileMatchesWithoutWrite;
     if (result.match) matches.push(result.match);
   }
 
-  return { matches, fileMatchesWithoutWrite };
+  return { matches };
 }
 
 export async function scanProjectContexts(
