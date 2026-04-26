@@ -322,8 +322,8 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
  * Convert an absolute project path to the Claude projects directory.
  * /Users/jane/foo → ~/.claude/projects/-Users-jane-foo
  */
-export function claudeProjectsRoot(): string {
-  return join(homedir(), '.claude', 'projects');
+export function claudeProjectsRoot(home = homedir()): string {
+  return join(home, '.claude', 'projects');
 }
 
 export function mangleProjectPath(projectPath: string): string {
@@ -336,8 +336,7 @@ export function projectPathGuessFromClaudeProject(projectName: string): string |
   return '/' + projectName.slice(1).replace(/-/g, '/');
 }
 
-export function listClaudeProjectRefs(): ProjectRef[] {
-  const root = claudeProjectsRoot();
+export function listClaudeProjectRefs(root = claudeProjectsRoot()): ProjectRef[] {
   if (!existsSync(root)) return [];
   return readdirSync(root, { withFileTypes: true })
     .filter(d => d.isDirectory())
@@ -354,8 +353,8 @@ export function findRelatedProjectRefs(projectPath: string, refs: ProjectRef[]):
   return refs.filter(ref => ref.project.startsWith(worktreeProjectPrefix));
 }
 
-export function resolveClaudeProjectDir(projectPath: string): string {
-  const claudeDir = join(claudeProjectsRoot(), mangleProjectPath(projectPath));
+export function resolveClaudeProjectDir(projectPath: string, root = claudeProjectsRoot()): string {
+  const claudeDir = join(root, mangleProjectPath(projectPath));
   if (!existsSync(claudeDir)) {
     throw cliError('NOT_FOUND', `Claude project directory not found: ${claudeDir}`);
   }
@@ -524,8 +523,8 @@ export type ResolvedSession = {
   entries: SessionEntry[];
 };
 
-export async function resolveSession(args: { session: string; project?: string }): Promise<ResolvedSession> {
-  const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
+export async function resolveSession(args: { session: string; project?: string; claudeProjectsRoot?: string }): Promise<ResolvedSession> {
+  const claudeDir = resolveClaudeProjectDir(args.project || process.cwd(), args.claudeProjectsRoot);
   const { filePath, sessionId, agentId } = await resolveSessionFile(claudeDir, args.session);
   const allEntries = await parseSessionLines(filePath);
   const entries = userAssistantEntries(allEntries);

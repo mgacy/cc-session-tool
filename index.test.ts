@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
-import { cpSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -321,6 +321,10 @@ describe('Claude project discovery helpers', () => {
     expect(mangleProjectPath('/tmp/example')).toBe('-tmp-example');
   });
 
+  test('claudeProjectsRoot can resolve from an explicit home directory', () => {
+    expect(claudeProjectsRoot('/tmp/example-home')).toBe('/tmp/example-home/.claude/projects');
+  });
+
   test('projectPathGuessFromClaudeProject converts mangled names to best-effort paths', () => {
     expect(projectPathGuessFromClaudeProject('-tmp-example')).toBe('/tmp/example');
   });
@@ -330,8 +334,8 @@ describe('Claude project discovery helpers', () => {
   });
 
   test('listClaudeProjectRefs returns directories and skips files', () => {
-    const root = claudeProjectsRoot();
     const unique = `cc-session-tool-project-refs-${Date.now()}`;
+    const root = join(tmpdir(), unique, '.claude', 'projects');
     const dirProject = `-${unique}-dir`;
     const worktreeProject = `-${unique}-worktree`;
     const fileProject = `-${unique}-file`;
@@ -341,7 +345,7 @@ describe('Claude project discovery helpers', () => {
     writeFileSync(join(root, fileProject), '');
 
     try {
-      const refs = listClaudeProjectRefs();
+      const refs = listClaudeProjectRefs(root);
       const projects = refs.map(ref => ref.project);
       expect(projects).toContain(dirProject);
       expect(projects).toContain(worktreeProject);
@@ -354,9 +358,7 @@ describe('Claude project discovery helpers', () => {
         project_path_guess: projectPathGuessFromClaudeProject(dirProject),
       });
     } finally {
-      rmSync(join(root, dirProject), { recursive: true, force: true });
-      rmSync(join(root, worktreeProject), { recursive: true, force: true });
-      rmSync(join(root, fileProject), { force: true });
+      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
     }
   });
 
@@ -436,6 +438,20 @@ describe('resolveClaudeProjectDir', () => {
   test('throws NOT_FOUND for non-existent path', () => {
     expect(() => resolveClaudeProjectDir('/nonexistent/path/12345')).toThrow('not found');
   });
+
+  test('resolves against an explicit Claude projects root', () => {
+    const unique = `cc-session-tool-resolve-root-${Date.now()}`;
+    const root = join(tmpdir(), unique, '.claude', 'projects');
+    const projectPath = join(tmpdir(), unique, 'project');
+    const claudeDir = join(root, mangleProjectPath(projectPath));
+    mkdirSync(claudeDir, { recursive: true });
+
+    try {
+      expect(resolveClaudeProjectDir(projectPath, root)).toBe(claudeDir);
+    } finally {
+      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+    }
+  });
 });
 
 // ============================================================================
@@ -460,7 +476,7 @@ describe('CLI', () => {
 
 const FIXTURE_DIR = join(tmpdir(), `cc-session-test-${Date.now()}`);
 const FIXTURE_HOME = join(FIXTURE_DIR, 'home');
-const ORIGINAL_HOME = process.env.HOME;
+const FIXTURE_CLAUDE_PROJECTS_ROOT = claudeProjectsRoot(FIXTURE_HOME);
 const FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project');
 const SECOND_FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project-worktree');
 const RELATED_PROJECT = join(tmpdir(), `ccsessionrelated${Date.now()}`);
@@ -470,24 +486,20 @@ const secondFakeDirName = '-' + SECOND_FAKE_PROJECT.slice(1).replace(/\//g, '-')
 const relatedDirName = mangleProjectPath(RELATED_PROJECT);
 const relatedWorktreeDirName = mangleProjectPath(join(RELATED_PROJECT, '.claude', 'worktrees', 'feature'));
 const CLAUDE_DIR = join(
-  FIXTURE_HOME,
-  '.claude', 'projects', fakeDirName,
-);
-const REAL_CLAUDE_DIR = join(
-  ORIGINAL_HOME ?? tmpdir(),
-  '.claude', 'projects', fakeDirName,
+  FIXTURE_CLAUDE_PROJECTS_ROOT,
+  fakeDirName,
 );
 const SECOND_CLAUDE_DIR = join(
-  FIXTURE_HOME,
-  '.claude', 'projects', secondFakeDirName,
+  FIXTURE_CLAUDE_PROJECTS_ROOT,
+  secondFakeDirName,
 );
 const RELATED_CLAUDE_DIR = join(
-  FIXTURE_HOME,
-  '.claude', 'projects', relatedDirName,
+  FIXTURE_CLAUDE_PROJECTS_ROOT,
+  relatedDirName,
 );
 const RELATED_WORKTREE_CLAUDE_DIR = join(
-  FIXTURE_HOME,
-  '.claude', 'projects', relatedWorktreeDirName,
+  FIXTURE_CLAUDE_PROJECTS_ROOT,
+  relatedWorktreeDirName,
 );
 
 const SESSION_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -591,7 +603,6 @@ function makeFixtureLines(): string[] {
 const SUBAGENT_ID = 'a8361bc';
 
 beforeAll(() => {
-  process.env.HOME = FIXTURE_HOME;
   mkdirSync(FAKE_PROJECT, { recursive: true });
   mkdirSync(SECOND_FAKE_PROJECT, { recursive: true });
   mkdirSync(RELATED_PROJECT, { recursive: true });
@@ -810,24 +821,15 @@ beforeAll(() => {
     }),
   ];
   writeFileSync(join(RELATED_CLAUDE_DIR, `${SESSION_ID_7}.jsonl`), relatedProjectLines.join('\n') + '\n');
-
-  mkdirSync(join(ORIGINAL_HOME ?? tmpdir(), '.claude', 'projects'), { recursive: true });
-  cpSync(CLAUDE_DIR, REAL_CLAUDE_DIR, { recursive: true });
 });
 
 afterAll(() => {
   rmSync(FIXTURE_DIR, { recursive: true, force: true });
   rmSync(RELATED_PROJECT, { recursive: true, force: true });
   rmSync(CLAUDE_DIR, { recursive: true, force: true });
-  rmSync(REAL_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(SECOND_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(RELATED_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(RELATED_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
-  if (ORIGINAL_HOME == null) {
-    delete process.env.HOME;
-  } else {
-    process.env.HOME = ORIGINAL_HOME;
-  }
 });
 
 function runCli(args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -1325,7 +1327,7 @@ describe('resolveSessionFile', () => {
 
 describe('resolveSession', () => {
   test('returns sessionId, agentId, and filtered entries', async () => {
-    const result = await resolveSession({ session: SESSION_ID, project: FAKE_PROJECT });
+    const result = await resolveSession({ session: SESSION_ID, project: FAKE_PROJECT, claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT });
     expect(result.sessionId).toBe(SESSION_ID);
     expect(result.agentId).toBeNull();
     expect(result.entries.length).toBeGreaterThan(0);
@@ -1334,7 +1336,7 @@ describe('resolveSession', () => {
 
   test('throws NOT_FOUND for non-existent session', async () => {
     try {
-      await resolveSession({ session: 'zzzzzzzz-0000-0000-0000-000000000000', project: FAKE_PROJECT });
+      await resolveSession({ session: 'zzzzzzzz-0000-0000-0000-000000000000', project: FAKE_PROJECT, claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT });
       expect(true).toBe(false);
     } catch (err: any) {
       expect(err.errorCode).toBe('NOT_FOUND');
@@ -1351,7 +1353,7 @@ describe('resolveSession', () => {
   });
 
   test('resolves subagent with colon notation', async () => {
-    const result = await resolveSession({ session: `${SESSION_ID}:${SUBAGENT_ID}`, project: FAKE_PROJECT });
+    const result = await resolveSession({ session: `${SESSION_ID}:${SUBAGENT_ID}`, project: FAKE_PROJECT, claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT });
     expect(result.sessionId).toBe(SESSION_ID);
     expect(result.agentId).toBe(SUBAGENT_ID);
     expect(result.entries.length).toBe(2);
