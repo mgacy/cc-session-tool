@@ -414,7 +414,7 @@ describe('Claude project discovery helpers', () => {
       },
     ];
 
-    expect(findRelatedProjectRefs('/Users/matt/repo/', refs)).toEqual([refs[0], refs[1]]);
+    expect(findRelatedProjectRefs('/Users/matt/repo/', refs)).toEqual([refs[0]!, refs[1]!]);
   });
 
   test('findRelatedProjectRefs handles hyphenated project paths without relying on path guesses', () => {
@@ -448,7 +448,7 @@ describe('Claude project discovery helpers', () => {
 
     expect(refs[0]!.project_path_guess).not.toStartWith(`${projectPath}/.claude/worktrees/`);
     expect(refs[1]!.project_path_guess).not.toStartWith(`${projectPath}/.claude/worktrees/`);
-    expect(findRelatedProjectRefs(projectPath, refs)).toEqual([refs[0], refs[1]]);
+    expect(findRelatedProjectRefs(projectPath, refs)).toEqual([refs[0]!, refs[1]!]);
   });
 
   test('isPathWithinOrEqual is separator-safe', () => {
@@ -781,6 +781,21 @@ describe('Claude project discovery helpers', () => {
         },
       },
     ], projectRoot)).toEqual([observedWorktreeRoot]);
+  });
+
+  test('collectObservedWorktreeRoots ignores malformed non-string file inputs', () => {
+    expect(collectObservedWorktreeRoots([
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Read', input: { file_path: 42 } },
+            { type: 'tool_use', name: 'Write', input: { file_path: '' } },
+            { type: 'tool_use', name: 'Grep', input: { path: ['src'] } },
+          ],
+        },
+      },
+    ], '/tmp/repo')).toEqual([]);
   });
 
   test('logical file matching equates main-tree queries with transcript cwd worktree accesses', () => {
@@ -1178,6 +1193,7 @@ const SESSION_ID_8 = 'ffffffbb-1111-2222-3333-444444444444';
 const SESSION_ID_9 = 'ffffffcc-1111-2222-3333-444444444444';
 const SESSION_ID_10 = 'ffffffdd-1111-2222-3333-444444444444';
 const SESSION_ID_11 = 'ffffff11-1111-2222-3333-444444444444';
+const SESSION_ID_12 = 'ffffff22-1111-2222-3333-444444444444';
 const CROSS_PROJECT_FILE = 'cross-project-fixture-target.ts';
 const RELATED_PROJECT_FILE = 'related-origin-warning.ts';
 const RELATED_MISSING_CWD_FILE = 'related-missing-cwd.ts';
@@ -1628,6 +1644,33 @@ beforeAll(() => {
     }),
   ];
   writeFileSync(join(RELATED_WORKTREE_CLAUDE_DIR, `${SESSION_ID_11}.jsonl`), relatedWorktreeMissingCwdLines.join('\n') + '\n');
+
+  const relatedWorktreeMalformedFileLines = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: SESSION_ID_12,
+      timestamp: '2026-03-11T10:00:00.000Z',
+      gitBranch: 'feature-worktree',
+      version: '2.1.0',
+      cwd: RELATED_WORKTREE_ROOT,
+      slug: 'related-worktree-malformed-file-input',
+      message: { role: 'user', content: 'Run a tool after malformed file input' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-11T10:01:00.000Z',
+      cwd: RELATED_WORKTREE_ROOT,
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Read', id: 'tool_malformed_read_1', input: { file_path: 42 } },
+          { type: 'tool_use', name: 'Bash', id: 'tool_malformed_bash_1', input: { command: 'bun test malformed-file-input-survives' } },
+        ],
+        usage: { input_tokens: 60, output_tokens: 15 },
+      },
+    }),
+  ];
+  writeFileSync(join(RELATED_WORKTREE_CLAUDE_DIR, `${SESSION_ID_12}.jsonl`), relatedWorktreeMalformedFileLines.join('\n') + '\n');
 });
 
 afterAll(() => {
@@ -2272,6 +2315,14 @@ describe('extractFilePath', () => {
     expect(extractFilePath('Grep', { pattern: 'foo' })).toBeNull();
   });
 
+  test('file tools with malformed or blank paths return null', () => {
+    expect(extractFilePath('Read', { file_path: 42 })).toBeNull();
+    expect(extractFilePath('Write', { file_path: '' })).toBeNull();
+    expect(extractFilePath('Edit', { file_path: '   ' })).toBeNull();
+    expect(extractFilePath('Grep', { path: ['src'] })).toBeNull();
+    expect(extractFilePath('Glob', { path: null })).toBeNull();
+  });
+
   test('Glob extracts path as glob', () => {
     expect(extractFilePath('Glob', { pattern: '*.ts', path: 'lib/' }))
       .toEqual({ path: 'lib/', operation: 'glob' });
@@ -2867,6 +2918,18 @@ describe('search integration', () => {
     expect(worktreeMatch).toBeDefined();
     expect(worktreeMatch.project).toBe(relatedWorktreeDirName);
     expect(worktreeMatch.project_role).toBe('worktree');
+  });
+
+  test('malformed file tool input does not suppress unrelated tool search matches', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'Bash', '--input-match', 'malformed-file-input-survives', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+
+    const malformedInputMatch = result.data.find((s: any) => s.session_id === SESSION_ID_12);
+    expect(malformedInputMatch).toBeDefined();
+    expect(malformedInputMatch.project).toBe(relatedWorktreeDirName);
+    expect(malformedInputMatch.project_role).toBe('worktree');
   });
 
   test('logical file operation binding rejects writes to same basename at a different logical path', async () => {

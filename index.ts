@@ -1197,18 +1197,22 @@ export function determineOutcome(resultInfo: { is_error?: boolean; content?: str
 
 /** Extract the file path from a tool_use block's input, if applicable. */
 export function extractFilePath(toolName: string, input: Record<string, unknown>): { path: string; operation: SearchOperation } | null {
-  const inp = input as Record<string, any>;
+  const fileAccess = (key: 'file_path' | 'path', operation: SearchOperation): { path: string; operation: SearchOperation } | null => {
+    const value = input[key];
+    return typeof value === 'string' && value.trim() ? { path: value, operation } : null;
+  };
+
   switch (toolName) {
     case 'Read':
-      return inp.file_path ? { path: inp.file_path, operation: 'read' } : null;
+      return fileAccess('file_path', 'read');
     case 'Edit':
-      return inp.file_path ? { path: inp.file_path, operation: 'edit' } : null;
+      return fileAccess('file_path', 'edit');
     case 'Write':
-      return inp.file_path ? { path: inp.file_path, operation: 'write' } : null;
+      return fileAccess('file_path', 'write');
     case 'Grep':
-      return inp.path ? { path: inp.path, operation: 'grep' } : null;
+      return fileAccess('path', 'grep');
     case 'Glob':
-      return inp.path ? { path: inp.path, operation: 'glob' } : null;
+      return fileAccess('path', 'glob');
     default:
       return null;
   }
