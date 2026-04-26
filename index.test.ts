@@ -480,9 +480,8 @@ const FIXTURE_CLAUDE_PROJECTS_ROOT = claudeProjectsRoot(FIXTURE_HOME);
 const FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project');
 const SECOND_FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project-worktree');
 const RELATED_PROJECT = join(tmpdir(), `ccsessionrelated${Date.now()}`);
-// Compute the Claude dir path for our fake project
-const fakeDirName = '-' + FAKE_PROJECT.slice(1).replace(/\//g, '-');
-const secondFakeDirName = '-' + SECOND_FAKE_PROJECT.slice(1).replace(/\//g, '-');
+const fakeDirName = mangleProjectPath(FAKE_PROJECT);
+const secondFakeDirName = mangleProjectPath(SECOND_FAKE_PROJECT);
 const relatedDirName = mangleProjectPath(RELATED_PROJECT);
 const relatedWorktreeDirName = mangleProjectPath(join(RELATED_PROJECT, '.claude', 'worktrees', 'feature'));
 const CLAUDE_DIR = join(

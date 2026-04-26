@@ -340,6 +340,7 @@ export function listClaudeProjectRefs(root = claudeProjectsRoot()): ProjectRef[]
   if (!existsSync(root)) return [];
   return readdirSync(root, { withFileTypes: true })
     .filter(d => d.isDirectory())
+    .sort((a, b) => a.name.localeCompare(b.name))
     .map(d => ({
       project: d.name,
       claude_dir: join(root, d.name),
