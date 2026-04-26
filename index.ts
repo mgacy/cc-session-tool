@@ -539,6 +539,24 @@ function logicalPathForAbsolutePath(pathname: string, roots: string[]): string |
   return null;
 }
 
+export function deriveWorktreeRootFromPath(projectRoot: string | null, pathname: string | null): string | null {
+  if (!projectRoot || !pathname || !isAbsolute(pathname)) return null;
+
+  for (const projectCandidate of pathContainmentCandidates(projectRoot)) {
+    const worktreesRoot = normalizePathForContainment(join(projectCandidate, '.claude', 'worktrees'));
+    for (const pathCandidate of pathContainmentCandidates(pathname)) {
+      if (!isPathWithinOrEqual(pathCandidate, worktreesRoot)) continue;
+      const rel = relative(worktreesRoot, pathCandidate);
+      if (!rel || rel.startsWith('..') || isAbsolute(rel)) continue;
+      const [worktreeDir] = rel.split('/');
+      if (!worktreeDir) continue;
+      return normalizePathForContainment(join(worktreesRoot, worktreeDir));
+    }
+  }
+
+  return null;
+}
+
 export function extractSessionCwd(entries: SessionEntry[]): string | null {
   for (const entry of entries) {
     if (typeof entry.cwd === 'string' && entry.cwd.trim()) return entry.cwd;
@@ -548,11 +566,14 @@ export function extractSessionCwd(entries: SessionEntry[]): string | null {
 
 export function buildSearchSessionContext(context: SearchProjectContext, entries: SessionEntry[]): SearchSessionContext {
   const sessionCwd = extractSessionCwd(entries);
+  const observedWorktreeRoot = context.role === 'worktree'
+    ? deriveWorktreeRootFromPath(context.projectRoot, sessionCwd)
+    : null;
   return {
     ...context,
     sessionCwd,
     normalizedProjectRoots: uniqueNormalizedCandidates([context.projectRoot]),
-    normalizedWorktreeRoots: uniqueNormalizedCandidates([context.worktreeRoot, context.role === 'worktree' ? sessionCwd : null]),
+    normalizedWorktreeRoots: uniqueNormalizedCandidates([context.worktreeRoot, observedWorktreeRoot]),
   };
 }
 
@@ -572,7 +593,14 @@ export function normalizeFileAccess(
   operation: SearchOperation,
   context: SearchSessionContext,
 ): NormalizedFileAccess {
-  const roots = [...context.normalizedProjectRoots, ...context.normalizedWorktreeRoots];
+  const observedWorktreeRoot = context.role === 'worktree'
+    ? deriveWorktreeRootFromPath(context.projectRoot, rawPath)
+    : null;
+  const roots = [
+    ...context.normalizedProjectRoots,
+    ...context.normalizedWorktreeRoots,
+    ...uniqueNormalizedCandidates([observedWorktreeRoot]),
+  ];
   const logicalPath = isAbsolute(rawPath)
     ? logicalPathForAbsolutePath(rawPath, roots)
     : null;
@@ -622,7 +650,7 @@ export function buildScopedSearchScope(options: SearchScopeOptions): SearchScope
       projects.push({
         role: 'worktree',
         projectRoot: options.projectPath,
-        worktreeRoot: ref.project_path_guess,
+        worktreeRoot: null,
         projectRef: ref,
       });
     }
@@ -2057,13 +2085,13 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
     if (projectRef && exposeProjectRef) {
       match.project = projectRef.project;
       match.project_path_guess = projectRef.project_path_guess;
+      if (target.context) {
+        match.project_role = target.context.role;
+      }
       match.session_ref = {
         session_id: target.sessionId,
         project: projectRef.project,
       };
-    }
-    if (target.context?.role === 'worktree') {
-      match.project_role = target.context.role;
     }
 
     return { match, fileMatchesWithoutWrite };

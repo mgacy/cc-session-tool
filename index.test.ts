@@ -13,7 +13,7 @@ import {
   normalizePathForContainment, parseSessionText, pathContainmentCandidates,
   scanProjectContexts, buildSearchSessionContext, extractSessionCwd, normalizeFileAccess,
   normalizeFileQuery, matchFileAccess, projectMatchesGlob, selectProjectContexts,
-  stableJsonStringify, toolInputMatches,
+  stableJsonStringify, toolInputMatches, deriveWorktreeRootFromPath,
 } from './index.ts';
 
 // ============================================================================
@@ -480,8 +480,8 @@ describe('Claude project discovery helpers', () => {
       const scope = buildScopedSearchScope({ projectPath, claudeProjectsRoot: root, includeWorktrees: true });
       expect(scope.projects.map(context => context.role)).toEqual(['main', 'worktree']);
       expect(scope.projects[1]!.projectRef.project).toBe(worktreeProject);
-      expect(scope.projects[1]!.worktreeRoot).toBe(projectPathGuessFromClaudeProject(worktreeProject));
-      expect(scope.projects[1]!.worktreeRoot).not.toStartWith(`${projectPath}/.claude/worktrees/`);
+      expect(scope.projects[1]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(worktreeProject));
+      expect(scope.projects[1]!.worktreeRoot).toBeNull();
     } finally {
       rmSync(join(tmpdir(), unique), { recursive: true, force: true });
     }
@@ -622,6 +622,57 @@ describe('Claude project discovery helpers', () => {
       matchedBy: 'logical',
       logicalPath: '.claude-tracking/009/plan.md',
     });
+  });
+
+  test('deriveWorktreeRootFromPath finds the worktree root from nested cwd or file access paths', () => {
+    const projectRoot = '/tmp/hyphen-repo/main-app';
+    const worktreeRoot = '/tmp/hyphen-repo/main-app/.claude/worktrees/feature-a';
+
+    expect(deriveWorktreeRootFromPath(projectRoot, join(worktreeRoot, 'src'))).toBe(worktreeRoot);
+    expect(deriveWorktreeRootFromPath(projectRoot, join(worktreeRoot, '.claude-tracking/009/plan.md'))).toBe(worktreeRoot);
+    expect(deriveWorktreeRootFromPath(projectRoot, '/tmp/hyphen-repo/main-app2/.claude/worktrees/feature-a/src')).toBeNull();
+  });
+
+  test('logical file matching derives worktree root from nested transcript cwd', () => {
+    const projectRoot = '/tmp/hyphen-repo/main-app';
+    const worktreeRoot = '/tmp/hyphen-repo/main-app/.claude/worktrees/feature-a';
+    const context = buildSearchSessionContext({
+      role: 'worktree',
+      projectRoot,
+      worktreeRoot: null,
+      projectRef: {
+        project: mangleProjectPath(worktreeRoot),
+        claude_dir: '/tmp/claude',
+        project_path_guess: '/tmp/hyphen/repo/main/app/.claude/worktrees/feature/a',
+      },
+    }, [{ type: 'user', cwd: join(worktreeRoot, 'src') }]);
+
+    const query = normalizeFileQuery(join(projectRoot, '.claude-tracking/009/plan.md'), context);
+    const access = normalizeFileAccess(join(worktreeRoot, '.claude-tracking/009/plan.md'), 'write', context);
+
+    expect(access.logicalPath).toBe('.claude-tracking/009/plan.md');
+    expect(matchFileAccess(query, access).matched).toBe(true);
+  });
+
+  test('logical file matching derives worktree root from file access when transcript cwd is absent', () => {
+    const projectRoot = '/tmp/hyphen-repo/main-app';
+    const worktreeRoot = '/tmp/hyphen-repo/main-app/.claude/worktrees/feature-a';
+    const context = buildSearchSessionContext({
+      role: 'worktree',
+      projectRoot,
+      worktreeRoot: null,
+      projectRef: {
+        project: mangleProjectPath(worktreeRoot),
+        claude_dir: '/tmp/claude',
+        project_path_guess: '/tmp/hyphen/repo/main/app/.claude/worktrees/feature/a',
+      },
+    }, [{ type: 'user' }]);
+
+    const query = normalizeFileQuery(join(projectRoot, '.claude-tracking/009/plan.md'), context);
+    const access = normalizeFileAccess(join(worktreeRoot, '.claude-tracking/009/plan.md'), 'write', context);
+
+    expect(access.logicalPath).toBe('.claude-tracking/009/plan.md');
+    expect(matchFileAccess(query, access).matched).toBe(true);
   });
 
   test('logical file matching uses realpath candidates for supplied project roots', () => {
@@ -805,8 +856,10 @@ const SESSION_ID_7 = 'ffffffee-1111-2222-3333-444444444444';
 const SESSION_ID_8 = 'ffffffbb-1111-2222-3333-444444444444';
 const SESSION_ID_9 = 'ffffffcc-1111-2222-3333-444444444444';
 const SESSION_ID_10 = 'ffffffdd-1111-2222-3333-444444444444';
+const SESSION_ID_11 = 'ffffff11-1111-2222-3333-444444444444';
 const CROSS_PROJECT_FILE = 'cross-project-fixture-target.ts';
 const RELATED_PROJECT_FILE = 'related-origin-warning.ts';
+const RELATED_MISSING_CWD_FILE = 'related-missing-cwd.ts';
 const LATE_SLUG_FIRST_LINE = JSON.stringify({
   type: 'user',
   sessionId: SESSION_ID_5,
@@ -1128,14 +1181,14 @@ beforeAll(() => {
       timestamp: '2026-03-08T10:00:00.000Z',
       gitBranch: 'feature-worktree',
       version: '2.1.0',
-      cwd: RELATED_WORKTREE_ROOT,
+      cwd: join(RELATED_WORKTREE_ROOT, 'src'),
       slug: 'related-worktree-writer',
       message: { role: 'user', content: 'Write equivalent file from worktree' },
     }),
     JSON.stringify({
       type: 'assistant',
       timestamp: '2026-03-08T10:01:00.000Z',
-      cwd: RELATED_WORKTREE_ROOT,
+      cwd: join(RELATED_WORKTREE_ROOT, 'src'),
       message: {
         role: 'assistant',
         content: [
@@ -1229,6 +1282,30 @@ beforeAll(() => {
     }),
   ];
   writeFileSync(join(RELATED_WORKTREE_CLAUDE_DIR, `${SESSION_ID_10}.jsonl`), relatedWorktreeEarlierOriginLines.join('\n') + '\n');
+
+  const relatedWorktreeMissingCwdLines = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: SESSION_ID_11,
+      timestamp: '2026-03-10T10:00:00.000Z',
+      gitBranch: 'feature-worktree',
+      version: '2.1.0',
+      slug: 'related-worktree-missing-cwd',
+      message: { role: 'user', content: 'Write equivalent file from worktree without cwd metadata' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-10T10:01:00.000Z',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Write', id: 'tool_related_worktree_write_4', input: { file_path: join(RELATED_WORKTREE_ROOT, RELATED_MISSING_CWD_FILE), content: 'export const missingCwd = true;' } },
+        ],
+        usage: { input_tokens: 60, output_tokens: 15 },
+      },
+    }),
+  ];
+  writeFileSync(join(RELATED_WORKTREE_CLAUDE_DIR, `${SESSION_ID_11}.jsonl`), relatedWorktreeMissingCwdLines.join('\n') + '\n');
 });
 
 afterAll(() => {
@@ -2239,9 +2316,11 @@ describe('search integration', () => {
     expect(primary).toBeDefined();
     expect(primary.project).toBe(fakeDirName);
     expect(primary.project_path_guess).toBe(projectPathGuessFromClaudeProject(fakeDirName));
+    expect(primary.project_role).toBe('global');
     expect(secondary).toBeDefined();
     expect(secondary.project).toBe(secondFakeDirName);
     expect(secondary.project_path_guess).toBe(projectPathGuessFromClaudeProject(secondFakeDirName));
+    expect(secondary.project_role).toBe('global');
   });
 
   test('--all-projects --file --operation write returns only same-file writer fixture', async () => {
@@ -2309,7 +2388,7 @@ describe('search integration', () => {
     });
     expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_6]);
     expect(result.data[0].project).toBe(secondFakeDirName);
-    expect(result.data[0].project_role).toBeUndefined();
+    expect(result.data[0].project_role).toBe('global');
   });
 
   test('search --project-glob without --all-projects returns invalid args', async () => {
@@ -2405,6 +2484,20 @@ describe('search integration', () => {
       session_id: SESSION_ID_8,
       project: relatedWorktreeDirName,
     });
+  });
+
+  test('scoped absolute main-path file search derives worktree root when transcript cwd is absent', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_MISSING_CWD_FILE), '--operation', 'write', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+
+    const writer = result.data.find((s: any) => s.session_id === SESSION_ID_11);
+    expect(writer).toBeDefined();
+    expect(writer.matches.files).toEqual([join(RELATED_WORKTREE_ROOT, RELATED_MISSING_CWD_FILE)]);
+    expect(writer.matches.normalized_files).toEqual([RELATED_MISSING_CWD_FILE]);
+    expect(writer.project).toBe(relatedWorktreeDirName);
+    expect(writer.project_role).toBe('worktree');
   });
 
   test('scoped --tool search includes associated worktree sessions by default', async () => {
