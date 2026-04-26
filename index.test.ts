@@ -14,6 +14,7 @@ import {
   scanProjectContexts, buildSearchSessionContext, extractSessionCwd, normalizeFileAccess,
   normalizeFileQuery, matchFileAccess, projectMatchesGlob, selectProjectContexts,
   stableJsonStringify, toolInputMatches, deriveWorktreeRootFromPath,
+  extractWorktreeStatePaths, collectObservedWorktreeRoots, absolutePathCandidatesFor,
 } from './index.ts';
 
 // ============================================================================
@@ -381,12 +382,25 @@ describe('Claude project discovery helpers', () => {
     }
   });
 
-  test('findRelatedProjectRefs returns raw-mangled worktree projects under the project path', () => {
+  test('findRelatedProjectRefs returns both raw worktree project-name shapes under the project path', () => {
+    const projectPath = '/Users/matt/repo';
+    const worktreesDirProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
+    const doubleDashProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-b`;
     const refs = [
       {
-        project: '-Users-matt-repo-.claude-worktrees-feature-a',
-        claude_dir: '/tmp/claude/projects/-Users-matt-repo-.claude-worktrees-feature-a',
+        project: worktreesDirProject,
+        claude_dir: `/tmp/claude/projects/${worktreesDirProject}`,
         project_path_guess: '/Users/matt/repo/.claude/worktrees/feature/a',
+      },
+      {
+        project: doubleDashProject,
+        claude_dir: `/tmp/claude/projects/${doubleDashProject}`,
+        project_path_guess: projectPathGuessFromClaudeProject(doubleDashProject),
+      },
+      {
+        project: doubleDashProject,
+        claude_dir: `/tmp/claude/projects/${doubleDashProject}-duplicate`,
+        project_path_guess: projectPathGuessFromClaudeProject(doubleDashProject),
       },
       {
         project: '-Users-matt-repo-other',
@@ -399,15 +413,16 @@ describe('Claude project discovery helpers', () => {
         project_path_guess: null,
       },
     ];
-    const related = refs[0]!;
 
-    expect(findRelatedProjectRefs('/Users/matt/repo/', refs)).toEqual([related]);
+    expect(findRelatedProjectRefs('/Users/matt/repo/', refs)).toEqual([refs[0], refs[1]]);
   });
 
   test('findRelatedProjectRefs handles hyphenated project paths without relying on path guesses', () => {
     const projectPath = '/Users/matt/Developer/cc-session-tool/cc-session-tool';
     const relatedProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
+    const relatedDoubleDashProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-b`;
     const siblingProject = mangleProjectPath('/Users/matt/Developer/cc-session-tool/other');
+    const similarPrefixProject = `${mangleProjectPath(`${projectPath}-other`)}--claude-worktrees-feature-c`;
     const refs = [
       {
         project: relatedProject,
@@ -415,15 +430,25 @@ describe('Claude project discovery helpers', () => {
         project_path_guess: projectPathGuessFromClaudeProject(relatedProject),
       },
       {
+        project: relatedDoubleDashProject,
+        claude_dir: join('/tmp/claude/projects', relatedDoubleDashProject),
+        project_path_guess: projectPathGuessFromClaudeProject(relatedDoubleDashProject),
+      },
+      {
         project: siblingProject,
         claude_dir: join('/tmp/claude/projects', siblingProject),
         project_path_guess: projectPathGuessFromClaudeProject(siblingProject),
       },
+      {
+        project: similarPrefixProject,
+        claude_dir: join('/tmp/claude/projects', similarPrefixProject),
+        project_path_guess: projectPathGuessFromClaudeProject(similarPrefixProject),
+      },
     ];
-    const related = refs[0]!;
 
-    expect(related.project_path_guess).not.toStartWith(`${projectPath}/.claude/worktrees/`);
-    expect(findRelatedProjectRefs(projectPath, refs)).toEqual([related]);
+    expect(refs[0]!.project_path_guess).not.toStartWith(`${projectPath}/.claude/worktrees/`);
+    expect(refs[1]!.project_path_guess).not.toStartWith(`${projectPath}/.claude/worktrees/`);
+    expect(findRelatedProjectRefs(projectPath, refs)).toEqual([refs[0], refs[1]]);
   });
 
   test('isPathWithinOrEqual is separator-safe', () => {
@@ -469,24 +494,29 @@ describe('Claude project discovery helpers', () => {
     }
   });
 
-  test('buildScopedSearchScope includes related hyphenated worktree refs without reverse-mangling', () => {
+  test('buildScopedSearchScope includes both related hyphenated worktree refs without reverse-mangling', () => {
     const unique = `cc-session-tool-scope-worktree-${Date.now()}`;
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const projectPath = join(tmpdir(), unique, 'cc-session-tool', 'cc-session-tool');
     const mainProject = mangleProjectPath(projectPath);
     const worktreeProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
+    const doubleDashWorktreeProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-b`;
     const siblingProject = mangleProjectPath(join(tmpdir(), unique, 'cc-session-tool-other'));
 
     mkdirSync(join(root, mainProject), { recursive: true });
     mkdirSync(join(root, worktreeProject), { recursive: true });
+    mkdirSync(join(root, doubleDashWorktreeProject), { recursive: true });
     mkdirSync(join(root, siblingProject), { recursive: true });
 
     try {
       const scope = buildScopedSearchScope({ projectPath, claudeProjectsRoot: root, includeWorktrees: true });
-      expect(scope.projects.map(context => context.role)).toEqual(['main', 'worktree']);
-      expect(scope.projects[1]!.projectRef.project).toBe(worktreeProject);
-      expect(scope.projects[1]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(worktreeProject));
+      expect(scope.projects.map(context => context.role)).toEqual(['main', 'worktree', 'worktree']);
+      expect(scope.projects[1]!.projectRef.project).toBe(doubleDashWorktreeProject);
+      expect(scope.projects[1]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(doubleDashWorktreeProject));
       expect(scope.projects[1]!.worktreeRoot).toBeNull();
+      expect(scope.projects[2]!.projectRef.project).toBe(worktreeProject);
+      expect(scope.projects[2]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(worktreeProject));
+      expect(scope.projects[2]!.worktreeRoot).toBeNull();
     } finally {
       rmSync(join(tmpdir(), unique), { recursive: true, force: true });
     }
@@ -603,6 +633,156 @@ describe('Claude project discovery helpers', () => {
     ])).toBe('/tmp/repo/.claude/worktrees/feature-a');
   });
 
+  test('extractWorktreeStatePaths accepts worktree-state and worktreeState top-level shapes', () => {
+    expect(extractWorktreeStatePaths([
+      {
+        type: 'system',
+        'worktree-state': {
+          originalCwd: '/tmp/repo',
+          worktreePath: '/tmp/repo/.claude/worktrees/feature-a',
+        },
+      } as any,
+    ])).toEqual({
+      originalCwd: '/tmp/repo',
+      worktreePath: '/tmp/repo/.claude/worktrees/feature-a',
+    });
+
+    expect(extractWorktreeStatePaths([
+      {
+        type: 'system',
+        worktreeState: {
+          originalCwd: '/tmp/repo-b',
+          worktreePath: '/tmp/repo-b/.claude/worktrees/feature-b',
+        },
+      } as any,
+    ])).toEqual({
+      originalCwd: '/tmp/repo-b',
+      worktreePath: '/tmp/repo-b/.claude/worktrees/feature-b',
+    });
+  });
+
+  test('extractWorktreeStatePaths ignores malformed and nested worktree metadata', () => {
+    expect(extractWorktreeStatePaths([
+      { type: 'system', 'worktree-state': 'bad' } as any,
+      { type: 'system', worktreeState: { originalCwd: 42, worktreePath: '' } } as any,
+      {
+        type: 'user',
+        message: {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ worktreeState: { originalCwd: '/tmp/repo' } }),
+          }],
+        },
+      },
+    ])).toEqual({
+      originalCwd: null,
+      worktreePath: null,
+    });
+  });
+
+  test('buildSearchSessionContext derives accepted roots from cwd, worktree-state, and observed tool paths', () => {
+    const projectRoot = '/tmp/repo';
+    const cwdWorktreeRoot = '/tmp/repo/.claude/worktrees/cwd-feature';
+    const stateWorktreeRoot = '/tmp/repo/.claude/worktrees/state-feature';
+    const observedWorktreeRoot = '/tmp/repo/.claude/worktrees/observed-feature';
+    const context = buildSearchSessionContext({
+      role: 'worktree',
+      projectRoot,
+      worktreeRoot: null,
+      projectRef: {
+        project: mangleProjectPath(stateWorktreeRoot),
+        claude_dir: '/tmp/claude',
+        project_path_guess: '/tmp/not-authoritative',
+      },
+    }, [
+      { type: 'user', cwd: join(cwdWorktreeRoot, 'src') },
+      {
+        type: 'system',
+        worktreeState: {
+          originalCwd: projectRoot,
+          worktreePath: join(stateWorktreeRoot, 'nested'),
+        },
+      } as any,
+      {
+        type: 'assistant',
+        message: {
+          content: [{
+            type: 'tool_use',
+            name: 'Write',
+            input: { file_path: join(observedWorktreeRoot, '.claude-tracking/010/plan.md') },
+          }],
+        },
+      },
+    ]);
+
+    expect(context.sessionCwd).toBe(join(cwdWorktreeRoot, 'src'));
+    expect(context.worktreeStateOriginalCwd).toBe(projectRoot);
+    expect(context.worktreeStateWorktreePath).toBe(join(stateWorktreeRoot, 'nested'));
+    expect(context.queryAnchorRoot).toBeNull();
+    expect(context.normalizedProjectRoots).toContain(projectRoot);
+    expect(context.normalizedWorktreeRoots).toContain(cwdWorktreeRoot);
+    expect(context.normalizedWorktreeRoots).toContain(stateWorktreeRoot);
+    expect(context.normalizedWorktreeRoots).toContain(observedWorktreeRoot);
+    expect(context.normalizedWorktreeRoots.indexOf(cwdWorktreeRoot))
+      .toBeLessThan(context.normalizedWorktreeRoots.indexOf(stateWorktreeRoot));
+    expect(context.normalizedWorktreeRoots.indexOf(stateWorktreeRoot))
+      .toBeLessThan(context.normalizedWorktreeRoots.indexOf(observedWorktreeRoot));
+    expect(context.pathCandidateCache).toBeInstanceOf(Map);
+  });
+
+  test('buildSearchSessionContext ignores out-of-scope metadata and project_path_guess roots', () => {
+    const context = buildSearchSessionContext({
+      role: 'global',
+      projectRoot: null,
+      worktreeRoot: null,
+      projectRef: {
+        project: '-tmp-unrelated',
+        claude_dir: '/tmp/claude',
+        project_path_guess: '/tmp/project-path-guess',
+      },
+    }, [
+      { type: 'user', cwd: '/tmp/project-path-guess/.claude/worktrees/feature-a' },
+      {
+        type: 'system',
+        'worktree-state': {
+          originalCwd: '/tmp/project-path-guess',
+          worktreePath: '/tmp/project-path-guess/.claude/worktrees/feature-a',
+        },
+      } as any,
+      {
+        type: 'assistant',
+        message: {
+          content: [{
+            type: 'tool_use',
+            name: 'Write',
+            input: { file_path: '/tmp/project-path-guess/.claude/worktrees/feature-a/src/index.ts' },
+          }],
+        },
+      },
+    ]);
+
+    expect(context.normalizedProjectRoots).toEqual([]);
+    expect(context.normalizedWorktreeRoots).toEqual([]);
+  });
+
+  test('collectObservedWorktreeRoots accepts only absolute tool paths under the scoped worktrees directory', () => {
+    const projectRoot = '/tmp/repo';
+    const observedWorktreeRoot = '/tmp/repo/.claude/worktrees/feature-a';
+
+    expect(collectObservedWorktreeRoots([
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Read', input: { file_path: join(observedWorktreeRoot, 'src/index.ts') } },
+            { type: 'tool_use', name: 'Write', input: { file_path: '/tmp/repo-other/.claude/worktrees/feature-a/src/index.ts' } },
+            { type: 'tool_use', name: 'Write', input: { file_path: 'relative/path.ts' } },
+          ],
+        },
+      },
+    ], projectRoot)).toEqual([observedWorktreeRoot]);
+  });
+
   test('logical file matching equates main-tree queries with transcript cwd worktree accesses', () => {
     const projectRoot = '/tmp/repo';
     const worktreeRoot = '/tmp/repo/.claude/worktrees/feature-a';
@@ -707,6 +887,99 @@ describe('Claude project discovery helpers', () => {
     }
   });
 
+  test('canonical file matching equates symlinked main and worktree paths', () => {
+    const unique = `cc-session-tool-canonical-${Date.now()}`;
+    const root = join(tmpdir(), unique);
+    const projectRoot = join(root, 'repo');
+    const worktreeRoot = join(projectRoot, '.claude', 'worktrees', 'feature-a');
+    const sharedTracking = join(root, 'shared-tracking');
+    const sharedPlan = join(sharedTracking, '010', 'plan.md');
+
+    mkdirSync(join(projectRoot, '.claude', 'worktrees'), { recursive: true });
+    mkdirSync(worktreeRoot, { recursive: true });
+    mkdirSync(join(sharedTracking, '010'), { recursive: true });
+    writeFileSync(sharedPlan, 'plan');
+    symlinkSync(sharedTracking, join(projectRoot, '.claude-tracking'));
+    symlinkSync(sharedTracking, join(worktreeRoot, '.claude-tracking'));
+
+    try {
+      const context = buildSearchSessionContext({
+        role: 'worktree',
+        projectRoot,
+        worktreeRoot,
+        projectRef: {
+          project: mangleProjectPath(worktreeRoot),
+          claude_dir: '/tmp/claude',
+          project_path_guess: null,
+        },
+      }, []);
+
+      const query = normalizeFileQuery(join(projectRoot, '.claude-tracking/010/plan.md'), context);
+      const access = normalizeFileAccess(join(worktreeRoot, '.claude-tracking/010/plan.md'), 'write', context);
+
+      const sharedCandidates = pathContainmentCandidates(sharedPlan);
+      expect(query.absoluteCandidates.some(candidate => sharedCandidates.includes(candidate))).toBe(true);
+      expect(access.absoluteCandidates.some(candidate => sharedCandidates.includes(candidate))).toBe(true);
+      expect(matchFileAccess(query, access)).toEqual({
+        matched: true,
+        matchedBy: 'canonical',
+        logicalPath: '.claude-tracking/010/plan.md',
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('canonical file matching requires exact candidate equality, not shared suffixes', () => {
+    const context = buildSearchSessionContext({
+      role: 'global',
+      projectRoot: null,
+      worktreeRoot: null,
+      projectRef: {
+        project: '-tmp-global',
+        claude_dir: '/tmp/claude',
+        project_path_guess: null,
+      },
+    }, []);
+
+    const query = normalizeFileQuery('/tmp/repo-a/src/file.ts', context);
+    const access = normalizeFileAccess('/tmp/repo-b/src/file.ts', 'write', context);
+
+    expect(query.logicalPath).toBeNull();
+    expect(access.logicalPath).toBeNull();
+    expect(matchFileAccess(query, access)).toEqual({
+      matched: false,
+      matchedBy: 'substring',
+      logicalPath: null,
+    });
+  });
+
+  test('logical file matching falls back when canonical candidates cannot resolve', () => {
+    const projectRoot = '/tmp/missing-main-repo';
+    const worktreeRoot = '/tmp/missing-main-repo/.claude/worktrees/feature-a';
+    const context = buildSearchSessionContext({
+      role: 'worktree',
+      projectRoot,
+      worktreeRoot,
+      projectRef: {
+        project: mangleProjectPath(worktreeRoot),
+        claude_dir: '/tmp/claude',
+        project_path_guess: null,
+      },
+    }, []);
+
+    const query = normalizeFileQuery(join(projectRoot, 'src/missing.ts'), context);
+    const access = normalizeFileAccess(join(worktreeRoot, 'src/missing.ts'), 'edit', context);
+
+    expect(query.absoluteCandidates).toContain(join(projectRoot, 'src/missing.ts'));
+    expect(access.absoluteCandidates).toContain(join(worktreeRoot, 'src/missing.ts'));
+    expect(matchFileAccess(query, access)).toEqual({
+      matched: true,
+      matchedBy: 'logical',
+      logicalPath: 'src/missing.ts',
+    });
+  });
+
   test('logical file matching is separator-safe and blocks substring fallback for absolute logical queries', () => {
     const context = buildSearchSessionContext({
       role: 'main',
@@ -754,6 +1027,30 @@ describe('Claude project discovery helpers', () => {
       matchedBy: 'substring',
       logicalPath: 'src/file.ts',
     });
+  });
+
+  test('absolute candidate normalization is cached per session context', () => {
+    const context = buildSearchSessionContext({
+      role: 'main',
+      projectRoot: '/tmp/repo',
+      worktreeRoot: null,
+      projectRef: {
+        project: '-tmp-repo',
+        claude_dir: '/tmp/claude',
+        project_path_guess: '/tmp/repo',
+      },
+    }, []);
+    const pathname = '/tmp/repo/src/file.ts';
+
+    const first = absolutePathCandidatesFor(pathname, context);
+    const second = absolutePathCandidatesFor(pathname, context);
+    const query = normalizeFileQuery(pathname, context);
+    const access = normalizeFileAccess(pathname, 'read', context);
+
+    expect(second).toBe(first);
+    expect(context.pathCandidateCache.size).toBe(1);
+    expect(query.absoluteCandidates).toBe(first);
+    expect(access.absoluteCandidates).toBe(first);
   });
 });
 
@@ -848,6 +1145,7 @@ const fakeDirName = mangleProjectPath(FAKE_PROJECT);
 const secondFakeDirName = mangleProjectPath(SECOND_FAKE_PROJECT);
 const relatedDirName = mangleProjectPath(RELATED_PROJECT);
 const relatedWorktreeDirName = mangleProjectPath(RELATED_WORKTREE_ROOT);
+const relatedDoubleDashWorktreeDirName = `${mangleProjectPath(RELATED_PROJECT)}--claude-worktrees-feature`;
 const CLAUDE_DIR = join(
   FIXTURE_CLAUDE_PROJECTS_ROOT,
   fakeDirName,
@@ -863,6 +1161,10 @@ const RELATED_CLAUDE_DIR = join(
 const RELATED_WORKTREE_CLAUDE_DIR = join(
   FIXTURE_CLAUDE_PROJECTS_ROOT,
   relatedWorktreeDirName,
+);
+const RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR = join(
+  FIXTURE_CLAUDE_PROJECTS_ROOT,
+  relatedDoubleDashWorktreeDirName,
 );
 
 const SESSION_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -978,6 +1280,7 @@ beforeAll(() => {
   mkdirSync(SECOND_CLAUDE_DIR, { recursive: true });
   mkdirSync(RELATED_CLAUDE_DIR, { recursive: true });
   mkdirSync(RELATED_WORKTREE_CLAUDE_DIR, { recursive: true });
+  mkdirSync(RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR, { recursive: true });
   const lines = makeFixtureLines();
   writeFileSync(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`), lines.join('\n') + '\n');
 
@@ -1334,6 +1637,7 @@ afterAll(() => {
   rmSync(SECOND_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(RELATED_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(RELATED_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
+  rmSync(RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
 });
 
 function runCli(args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -2477,6 +2781,11 @@ describe('search integration', () => {
         project_role: 'main',
       },
       {
+        project: relatedDoubleDashWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedDoubleDashWorktreeDirName),
+        project_role: 'worktree',
+      },
+      {
         project: relatedWorktreeDirName,
         project_path_guess: projectPathGuessFromClaudeProject(relatedWorktreeDirName),
         project_role: 'worktree',
@@ -2503,6 +2812,35 @@ describe('search integration', () => {
       session_id: SESSION_ID_8,
       project: relatedWorktreeDirName,
     });
+  });
+
+  test('--all-projects with explicit --project anchor matches equivalent worktree writer', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--all-projects', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--operation', 'write', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBeGreaterThanOrEqual(4);
+
+    const writer = result.data.find((s: any) => s.session_id === SESSION_ID_8);
+    expect(writer).toBeDefined();
+    expect(writer.matches.files).toEqual([join(RELATED_WORKTREE_ROOT, RELATED_PROJECT_FILE)]);
+    expect(writer.matches.normalized_files).toEqual([RELATED_PROJECT_FILE]);
+    expect(writer.matches.operations).toEqual(['write']);
+    expect(writer.project).toBe(relatedWorktreeDirName);
+    expect(writer.project_role).toBe('global');
+    expect(writer.session_ref).toEqual({
+      session_id: SESSION_ID_8,
+      project: relatedWorktreeDirName,
+    });
+  });
+
+  test('--all-projects without explicit anchor does not infer main/worktree identity from cwd', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--all-projects', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--operation', 'write']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.find((s: any) => s.session_id === SESSION_ID_8)).toBeUndefined();
+    expect(result.data.find((s: any) => s.session_id === SESSION_ID_10)).toBeUndefined();
   });
 
   test('scoped absolute main-path file search derives worktree root when transcript cwd is absent', async () => {

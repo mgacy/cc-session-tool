@@ -431,8 +431,8 @@ cc-session-tool search [--project <path>] [--all-projects] [--project-glob <patt
 
 | Option           | Default | Description |
 | ---------------- | ------- | ----------- |
-| `--project`      | CWD     | Logical project path for scoped search. Scoped searches include associated Claude worktrees by default. Ignored as a scope limit when `--all-projects` is set. |
-| `--all-projects` | false   | Search every top-level Claude project directory under `~/.claude/projects` for broad audits. |
+| `--project`      | CWD     | Logical project path for scoped search. Scoped searches include associated Claude worktrees by default. With `--all-projects`, this becomes a file-identity query anchor, not a scan limit. |
+| `--all-projects` | false   | Search every top-level Claude project directory under `~/.claude/projects` for broad audits. Without an explicit `--project`, absolute file queries do not infer a logical project anchor from CWD or `project_path_guess`. |
 | `--project-glob` | —       | With `--all-projects`, filter by raw Claude project basename or display-only `project_path_guess`. Supports `*` and `?`. |
 | `--tool`         | —       | Match tool names by case-insensitive substring. |
 | `--input-match`  | —       | Match raw structured tool input by case-insensitive substring, including fields omitted or truncated by `input_summary`. |
@@ -451,7 +451,7 @@ cc-session-tool search [--project <path>] [--all-projects] [--project-glob <patt
 
 At least one of `--tool`, `--input-match`, `--file`, `--text`, or `--bash` is required. You may provide more than one; multiple filters use AND semantics. `--operation` is valid only with `--file`, and it is tied to the same matching file access, not any other file access in the session.
 
-For absolute `--file` queries inside the logical project, search compares by project-relative identity before substring matching. For example, `/workspace/app/src/auth.ts` in the main checkout matches `/workspace/app/.claude/worktrees/feature-a/src/auth.ts` from a related Claude worktree as the same logical file `src/auth.ts`. If both sides normalize to logical paths and they differ, search does not fall back to substring matching.
+For absolute `--file` queries inside the logical project, search compares exact canonical path candidates first, then exact project-relative logical identity. For example, `/workspace/app/src/auth.ts` in the main checkout matches `/workspace/app/.claude/worktrees/feature-a/src/auth.ts` from a related Claude worktree as the same logical file `src/auth.ts`. If a worktree path reaches the same file through a symlinked directory, the realpath candidate can also match even when the lexical absolute paths differ. If both sides normalize to logical paths and they differ, search does not fall back to substring matching.
 
 **Examples:**
 
@@ -467,6 +467,9 @@ cc-session-tool search --file /workspace/app/src/auth.ts --origin
 
 # Search all selected Claude project identities for recent Bash usage
 cc-session-tool search --all-projects --project-glob "*app*" --bash "bun test" --since 1d --last 5
+
+# Broad audit with the main checkout used only as a file-identity anchor
+cc-session-tool search --all-projects --project /workspace/app --file /workspace/app/src/auth.ts --operation write
 
 # Audit raw Bash inputs, including long commands beyond the condensed summary
 cc-session-tool search --tool Bash --input-match "bun test" --aggregate count-per-session
@@ -526,7 +529,7 @@ With `--aggregate count-per-session`, `data` is a per-session summary instead of
 }
 ```
 
-Scoped responses include `_meta.included_projects`, showing the main project and associated worktree Claude project contexts that were scanned. Worktree or all-project result rows can include:
+Scoped responses include `_meta.included_projects`, showing the main project and associated worktree Claude project contexts that were scanned. All-project responses include every scanned Claude project unless narrowed by `--project-glob`; an explicit `--project` in all-project mode is only used to normalize absolute file queries against that logical checkout. Worktree or all-project result rows can include:
 
 | Field | Description |
 | ----- | ----------- |
@@ -541,7 +544,7 @@ Use `session_ref.project` with `--claude-project` rather than relying on `projec
 cc-session-tool tools DA2738E3 --claude-project -workspace-app--claude-worktrees-feature-a
 ```
 
-All-project responses also include `_meta.projects_scanned`. `--project-glob` matches Claude project identity fields, not filesystem globs over project files.
+All-project responses also include `_meta.projects_scanned`. `--project-glob` matches Claude project identity fields, not filesystem globs over project files. Do not derive follow-up commands or roots from `project_path_guess`; it is for display and rough filtering only.
 
 `--origin` reports the earliest matching transcript write evidence that satisfies the filters. It is not VCS creation history.
 
