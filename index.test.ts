@@ -15,6 +15,7 @@ import {
   normalizeFileQuery, matchFileAccess, projectMatchesGlob, selectProjectContexts,
   stableJsonStringify, toolInputMatches, deriveWorktreeRootFromPath,
   extractWorktreeStatePaths, collectObservedWorktreeRoots, absolutePathCandidatesFor,
+  scanSearchTarget,
 } from './index.ts';
 
 // ============================================================================
@@ -1702,6 +1703,54 @@ function parseOutput(stdout: string) {
   try { return JSON.parse(stdout); }
   catch (e) { throw new Error(`Failed to parse CLI output: ${stdout.slice(0, 500)}\n${e}`); }
 }
+
+describe('scanSearchTarget', () => {
+  test('no-context file filters require a matching raw file access', async () => {
+    const unique = `cc-session-tool-no-context-search-${Date.now()}`;
+    const root = join(tmpdir(), unique);
+    const sessionId = '11111111-2222-3333-4444-555555555555';
+    const sessionFile = join(root, `${sessionId}.jsonl`);
+    mkdirSync(root, { recursive: true });
+
+    try {
+      writeFileSync(sessionFile, [
+        JSON.stringify({
+          type: 'user',
+          sessionId,
+          timestamp: '2026-03-01T10:00:00.000Z',
+          message: { role: 'user', content: 'Run test command' },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: '2026-03-01T10:01:00.000Z',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', name: 'Bash', id: 'tool_bash_1', input: { command: 'bun test no-context-gate' } },
+              { type: 'tool_use', name: 'Read', id: 'tool_read_1', input: { file_path: '/tmp/actual.ts' } },
+            ],
+          },
+        }),
+      ].join('\n') + '\n');
+
+      const target = { filePath: sessionFile, sessionId };
+      const missed = await scanSearchTarget(target, {
+        file: '/tmp/missing.ts',
+        tool: 'Bash',
+      }, null);
+      expect(missed.match).toBeNull();
+
+      const matched = await scanSearchTarget(target, {
+        file: '/tmp/actual.ts',
+        tool: 'Bash',
+      }, null);
+      expect(matched.match?.session_id).toBe(sessionId);
+      expect(matched.match?.matches.files).toEqual(['/tmp/actual.ts']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('list integration', () => {
   test('lists sessions in fixture dir', async () => {

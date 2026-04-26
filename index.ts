@@ -2096,7 +2096,7 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
     const operationQuery = args.operation;
 
     let toolHit = !toolQuery;
-    let fileHit = !fileQuery;
+    let fileHit = !args.file;
     let textHit = !textQuery;
     let bashHit = !bashQuery;
     let inputHit = !inputQuery;
