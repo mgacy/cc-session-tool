@@ -413,6 +413,89 @@ cc-session-tool slice <session> --turn <N|N-M> [--project <path>] [--max-content
 
 ---
 
+### `search`
+
+Find sessions matching structured filters. By default, search is scoped to one Claude project directory, derived from `--project <path>` or the current working directory.
+
+```bash
+cc-session-tool search [--project <path>] [--all-projects] (--tool <name> | --file <path> | --text <text> | --bash <text>) [--operation <op>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>]
+```
+
+| Option           | Default | Description |
+| ---------------- | ------- | ----------- |
+| `--project`      | CWD     | Project path for scoped search. Ignored as a scope limit when `--all-projects` is set. |
+| `--all-projects` | false   | Search every top-level Claude project directory under `~/.claude/projects`. |
+| `--tool`         | —       | Match tool names by case-insensitive substring. |
+| `--file`         | —       | Match touched file paths by substring. |
+| `--operation`    | all     | With `--file`, filter by matching file operation: `read`, `edit`, `write`, `grep`, `glob`. |
+| `--text`         | —       | Match assistant text and thinking by case-insensitive substring. |
+| `--bash`         | —       | Match Bash command inputs by case-insensitive substring. |
+| `--branch`       | all     | Filter by git branch name. |
+| `--after`        | —       | Sessions after ISO 8601 date (mutually exclusive with `--since`). |
+| `--before`       | —       | Sessions before ISO 8601 date. |
+| `--since`        | —       | Sessions from the last duration: `30m`, `2h`, `1d`, `1w` (mutually exclusive with `--after`). |
+| `--last`         | all     | Return only the N most recent matches after sorting newest first. |
+
+At least one of `--tool`, `--file`, `--text`, or `--bash` is required. Multiple filters use AND semantics. `--operation` is valid only with `--file`, and it is tied to the same matching file access, not any other file access in the session.
+
+**Examples:**
+
+```bash
+# Search the current project for sessions that touched auth.ts
+cc-session-tool search --file auth.ts
+
+# Find sessions that wrote auth.ts in any Claude project, including worktrees
+cc-session-tool search --all-projects --file auth.ts --operation write
+
+# Search all projects for recent Bash usage
+cc-session-tool search --all-projects --bash "bun test" --since 1d --last 5
+```
+
+**Output:**
+
+```json
+{
+  "ok": true,
+  "data": [
+    {
+      "session_id": "DA2738E3-...",
+      "branch": "feature/auth",
+      "timestamp": "2026-03-07T22:31:26.359Z",
+      "slug": "snuggly-floating-barto",
+      "matches": {
+        "tools": ["Read", "Edit"],
+        "files": ["/Users/me/project/src/auth.ts"],
+        "operations": ["read", "edit"],
+        "turns": [6, 8]
+      }
+    }
+  ],
+  "_meta": { "total": 1, "returned": 1, "hasMore": false }
+}
+```
+
+When `--all-projects` is set, each result row also includes:
+
+| Field | Description |
+| ----- | ----------- |
+| `project` | Raw Claude project directory basename from `~/.claude/projects`. |
+| `project_path_guess` | Best-effort unmangled path guess, or `null` when the directory name is not in Claude's path-mangled form. This is lossy when path segments contain literal hyphens, so use `project` as the stable identity. |
+
+All-project responses include `_meta.projects_scanned`. Scoped `--file` searches may include `_meta.related_projects` for detected worktree project directories and may include `_meta.warning` when matching file hits exist in the scoped project but none are writes:
+
+```json
+{
+  "_meta": {
+    "total": 3,
+    "returned": 3,
+    "hasMore": false,
+    "warning": "No matching file write was found in this project. The file creator may be in another Claude project; try --all-projects --operation write."
+  }
+}
+```
+
+---
+
 ### `subagents <session>`
 
 List subagents spawned during a session. Reads metadata from companion `.meta.json` files and counts JSONL lines for each subagent.
@@ -504,6 +587,16 @@ cc-session-tool files DA2738E3 --operation edit
 
 # Chronological log of all file accesses
 cc-session-tool files DA2738E3 --group-by turn
+```
+
+### Find which session wrote a file
+
+```bash
+# Current project only
+cc-session-tool search --file src/auth.ts --operation write
+
+# Any Claude project or worktree
+cc-session-tool search --all-projects --file src/auth.ts --operation write
 ```
 
 ### Token consumption comparison

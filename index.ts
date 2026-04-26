@@ -138,6 +138,14 @@ export type FileAccess = {
   errored: boolean;
 };
 
+export type ProjectRef = {
+  project: string;
+  claude_dir: string;
+  project_path_guess: string | null;
+};
+
+export type SearchOperation = FileAccess['operation'];
+
 export type FileEntry = {
   path: string;
   operations: string[];
@@ -190,11 +198,46 @@ export type SearchMatch = {
   branch: string | null;
   timestamp: string | null;
   slug: string | null;
+  project?: string;
+  project_path_guess?: string | null;
   matches: {
     tools: string[];      // distinct tool names that matched --tool
     files: string[];      // distinct file paths that matched --file
+    operations?: SearchOperation[];
     turns: number[];      // union of all turn numbers where any filter matched
   };
+};
+
+export type SearchMeta = ResponseMeta & {
+  projects_scanned?: number;
+  project?: string;
+  related_projects?: ProjectRef[];
+  warning?: string;
+};
+
+export type SearchArgs = {
+  tool?: string;
+  file?: string;
+  text?: string;
+  bash?: string;
+  branch?: string;
+  after?: string;
+  before?: string;
+  since?: string;
+  operation?: SearchOperation;
+};
+
+export type ScanProjectOptions = {
+  claudeDir: string;
+  projectRef?: ProjectRef;
+  includeProjectFields: boolean;
+  afterCutoff: string | null;
+  args: SearchArgs;
+};
+
+export type ProjectScanResult = {
+  matches: SearchMatch[];
+  fileMatchesWithoutWrite: number;
 };
 
 // ============================================================================
@@ -210,6 +253,7 @@ export const ERROR_CODES = {
 } as const;
 
 type ErrorCode = keyof typeof ERROR_CODES;
+const SEARCH_OPERATIONS: SearchOperation[] = ['read', 'edit', 'write', 'grep', 'glob'];
 
 // ============================================================================
 // Response Helpers
@@ -279,10 +323,40 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
  * Convert an absolute project path to the Claude projects directory.
  * /Users/jane/foo → ~/.claude/projects/-Users-jane-foo
  */
-export function resolveClaudeProjectDir(projectPath: string): string {
+export function claudeProjectsRoot(): string {
+  return join(homedir(), '.claude', 'projects');
+}
+
+export function mangleProjectPath(projectPath: string): string {
   const stripped = projectPath.startsWith('/') ? projectPath.slice(1) : projectPath;
-  const dirName = '-' + stripped.replace(/\//g, '-');
-  const claudeDir = join(homedir(), '.claude', 'projects', dirName);
+  return '-' + stripped.replace(/\//g, '-');
+}
+
+export function projectPathGuessFromClaudeProject(projectName: string): string | null {
+  if (!projectName.startsWith('-')) return null;
+  return '/' + projectName.slice(1).replace(/-/g, '/');
+}
+
+export function listClaudeProjectRefs(): ProjectRef[] {
+  const root = claudeProjectsRoot();
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .map(d => ({
+      project: d.name,
+      claude_dir: join(root, d.name),
+      project_path_guess: projectPathGuessFromClaudeProject(d.name),
+    }));
+}
+
+export function findRelatedProjectRefs(projectPath: string, refs: ProjectRef[]): ProjectRef[] {
+  const normalized = projectPath.replace(/\/+$/, '');
+  const worktreeProjectPrefix = `${mangleProjectPath(join(normalized, '.claude', 'worktrees'))}-`;
+  return refs.filter(ref => ref.project.startsWith(worktreeProjectPrefix));
+}
+
+export function resolveClaudeProjectDir(projectPath: string): string {
+  const claudeDir = join(claudeProjectsRoot(), mangleProjectPath(projectPath));
   if (!existsSync(claudeDir)) {
     throw cliError('NOT_FOUND', `Claude project directory not found: ${claudeDir}`);
   }
@@ -541,7 +615,7 @@ export function determineOutcome(resultInfo: { is_error?: boolean; content?: str
 }
 
 /** Extract the file path from a tool_use block's input, if applicable. */
-export function extractFilePath(toolName: string, input: Record<string, unknown>): { path: string; operation: string } | null {
+export function extractFilePath(toolName: string, input: Record<string, unknown>): { path: string; operation: SearchOperation } | null {
   const inp = input as Record<string, any>;
   switch (toolName) {
     case 'Read':
@@ -1306,6 +1380,132 @@ function truncateEntryContent(entry: SessionEntry, maxLen: number): void {
   }
 }
 
+export async function scanProjectForSearch(options: ScanProjectOptions): Promise<ProjectScanResult> {
+  const { claudeDir, projectRef, includeProjectFields, afterCutoff, args } = options;
+  const files = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl'));
+  const matches: SearchMatch[] = [];
+  let fileMatchesWithoutWrite = 0;
+
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < files.length; i += BATCH_SIZE) {
+    const batch = files.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(batch.map(async (f) => {
+      try {
+        const filePath = join(claudeDir, f);
+        const sessionId = f.replace('.jsonl', '');
+        const text = await Bun.file(filePath).text();
+
+        const { branch, timestamp, slug } = extractSessionMetadata(text);
+
+        if (args.branch && branch !== args.branch) return null;
+        if (afterCutoff) {
+          if (!timestamp || timestamp < afterCutoff) return null;
+        }
+        if (args.before) {
+          if (!timestamp || timestamp > args.before) return null;
+        }
+
+        const entries = await parseSessionLines(filePath);
+        const uaEntries = userAssistantEntries(entries);
+
+        const matchedTools = new Set<string>();
+        const matchedFiles = new Set<string>();
+        const matchedOperations = new Set<SearchOperation>();
+        const matchedTurns = new Set<number>();
+
+        const toolQuery = args.tool?.toLowerCase();
+        const fileQuery = args.file?.toLowerCase();
+        const textQuery = args.text?.toLowerCase();
+        const bashQuery = args.bash?.toLowerCase();
+        const operationQuery = args.operation;
+
+        let toolHit = !toolQuery;
+        let fileHit = !fileQuery;
+        let textHit = !textQuery;
+        let bashHit = !bashQuery;
+
+        for (let ei = 0; ei < uaEntries.length; ei++) {
+          const entry = uaEntries[ei]!;
+          const turnNum = ei + 1;
+          const content = entry.message?.content;
+          if (!Array.isArray(content)) continue;
+
+          for (const block of content as ContentBlock[]) {
+            if (toolQuery && block.type === 'tool_use' && block.name) {
+              if (block.name.toLowerCase().includes(toolQuery)) {
+                matchedTools.add(block.name);
+                matchedTurns.add(turnNum);
+                toolHit = true;
+              }
+            }
+
+            if (fileQuery && block.type === 'tool_use' && block.name) {
+              const fileInfo = extractFilePath(block.name, block.input ?? {});
+              if (fileInfo && fileInfo.path.toLowerCase().includes(fileQuery)) {
+                if (fileInfo.operation !== 'write') fileMatchesWithoutWrite++;
+                if (!operationQuery || fileInfo.operation === operationQuery) {
+                  matchedFiles.add(fileInfo.path);
+                  matchedOperations.add(fileInfo.operation);
+                  matchedTurns.add(turnNum);
+                  fileHit = true;
+                }
+              }
+            }
+
+            if (textQuery && entry.type === 'assistant') {
+              if (block.type === 'text' && block.text && block.text.toLowerCase().includes(textQuery)) {
+                matchedTurns.add(turnNum);
+                textHit = true;
+              }
+              if (block.type === 'thinking' && block.thinking && block.thinking.toLowerCase().includes(textQuery)) {
+                matchedTurns.add(turnNum);
+                textHit = true;
+              }
+            }
+
+            if (bashQuery && block.type === 'tool_use' && block.name === 'Bash') {
+              const command = (block.input as Record<string, any>)?.command;
+              if (typeof command === 'string' && command.toLowerCase().includes(bashQuery)) {
+                matchedTurns.add(turnNum);
+                bashHit = true;
+              }
+            }
+          }
+        }
+
+        if (!toolHit || !fileHit || !textHit || !bashHit) return null;
+
+        const match: SearchMatch = {
+          session_id: sessionId,
+          branch,
+          timestamp,
+          slug,
+          matches: {
+            tools: Array.from(matchedTools),
+            files: Array.from(matchedFiles),
+            turns: Array.from(matchedTurns).sort((a, b) => a - b),
+          },
+        };
+
+        if (matchedOperations.size > 0) {
+          match.matches.operations = Array.from(matchedOperations);
+        }
+        if (includeProjectFields && projectRef) {
+          match.project = projectRef.project;
+          match.project_path_guess = projectRef.project_path_guess;
+        }
+
+        return match;
+      } catch {
+        return null;
+      }
+    }));
+    matches.push(...batchResults.filter((r): r is SearchMatch => r !== null));
+  }
+
+  return { matches, fileMatchesWithoutWrite };
+}
+
 // ============================================================================
 // Search Command
 // ============================================================================
@@ -1314,6 +1514,7 @@ const searchCommand = defineCommand({
   meta: { name: 'search', description: 'Find sessions matching structured queries' },
   args: {
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    'all-projects': { type: 'boolean', description: 'Search all Claude project directories', default: false },
     tool: { type: 'string', description: 'Sessions using a specific tool (case-insensitive substring)' },
     file: { type: 'string', description: 'Sessions that touched a file (substring match on path)' },
     text: { type: 'string', description: 'Search in assistant text and thinking content (case-insensitive substring)' },
@@ -1322,10 +1523,13 @@ const searchCommand = defineCommand({
     after: { type: 'string', description: 'Sessions after DATE (ISO 8601)' },
     before: { type: 'string', description: 'Sessions before DATE (ISO 8601)' },
     since: { type: 'string', description: 'Sessions from the last duration (e.g. 1d, 2h, 1w)' },
+    operation: { type: 'string', description: 'With --file, filter by operation: read/edit/write/grep/glob' },
     last: { type: 'string', description: 'Return only the last N matches' },
   },
   async run({ args }) {
     try {
+      const SCOPED_FILE_WRITE_WARNING = 'No matching file write was found in this project. The file creator may be in another Claude project; try --all-projects --operation write.';
+
       // Validate at least one search filter is provided
       if (!args.tool && !args.file && !args.text && !args.bash) {
         throw cliError('INVALID_ARGS', 'At least one search filter is required (--tool, --file, --text, or --bash)');
@@ -1336,127 +1540,77 @@ const searchCommand = defineCommand({
         throw cliError('INVALID_ARGS', '--since and --after are mutually exclusive');
       }
 
-      const projectPath = args.project || process.cwd();
-      const claudeDir = resolveClaudeProjectDir(projectPath);
+      if (args.operation && !args.file) {
+        throw cliError('INVALID_ARGS', '--operation requires --file');
+      }
+      if (args.operation && !SEARCH_OPERATIONS.includes(args.operation as SearchOperation)) {
+        throw cliError('INVALID_ARGS', '--operation must be one of: read, edit, write, grep, glob');
+      }
+
       const afterCutoff = args.since ? parseSince(args.since) : args.after ?? null;
       const lastN = parseIntArg(args.last, '--last');
       if (lastN != null && lastN <= 0) {
         throw cliError('INVALID_ARGS', '--last must be a positive integer');
       }
 
-      // WU-2: Session scanning with metadata filters
-      const files = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl'));
+      const searchArgs: SearchArgs = {
+        tool: args.tool,
+        file: args.file,
+        text: args.text,
+        bash: args.bash,
+        branch: args.branch,
+        after: args.after,
+        before: args.before,
+        since: args.since,
+        operation: args.operation as SearchOperation | undefined,
+      };
+
+      const allProjects = Boolean(args['all-projects']);
       const results: SearchMatch[] = [];
+      let projectsScanned: number | undefined;
+      let scopedFileMatchesWithoutWrite = 0;
+      let scopedRelatedProjects: ProjectRef[] | undefined;
 
-      const BATCH_SIZE = 50;
-      for (let i = 0; i < files.length; i += BATCH_SIZE) {
-        const batch = files.slice(i, i + BATCH_SIZE);
-        const batchResults = await Promise.all(batch.map(async (f) => {
-          try {
-            const filePath = join(claudeDir, f);
-            const sessionId = f.replace('.jsonl', '');
-            const text = await Bun.file(filePath).text();
-
-            const { branch, timestamp, slug } = extractSessionMetadata(text);
-
-            // Apply metadata filters to skip non-matching sessions early
-            if (args.branch && branch !== args.branch) return null;
-            if (afterCutoff) {
-              if (!timestamp || timestamp < afterCutoff) return null;
+      if (allProjects) {
+        const refs = listClaudeProjectRefs();
+        projectsScanned = refs.length;
+        const PROJECT_BATCH_SIZE = 10;
+        for (let i = 0; i < refs.length; i += PROJECT_BATCH_SIZE) {
+          const batch = refs.slice(i, i + PROJECT_BATCH_SIZE);
+          const scanResults = await Promise.all(batch.map(async (projectRef) => {
+            try {
+              return await scanProjectForSearch({
+                claudeDir: projectRef.claude_dir,
+                projectRef,
+                includeProjectFields: true,
+                afterCutoff,
+                args: searchArgs,
+              });
+            } catch {
+              return null;
             }
-            if (args.before) {
-              if (!timestamp || timestamp > args.before) return null;
-            }
-
-            // Parse full session for content filtering
-            const entries = await parseSessionLines(filePath);
-            const uaEntries = userAssistantEntries(entries);
-
-            // WU-3: Content search filters with AND semantics
-            const matchedTools = new Set<string>();
-            const matchedFiles = new Set<string>();
-            const matchedTurns = new Set<number>();
-
-            const toolQuery = args.tool?.toLowerCase();
-            const fileQuery = args.file?.toLowerCase();
-            const textQuery = args.text?.toLowerCase();
-            const bashQuery = args.bash?.toLowerCase();
-
-            // Per-filter hit booleans for AND semantics
-            // A filter that wasn't provided is considered satisfied (true)
-            let toolHit = !toolQuery;
-            let fileHit = !fileQuery;
-            let textHit = !textQuery;
-            let bashHit = !bashQuery;
-
-            for (let ei = 0; ei < uaEntries.length; ei++) {
-              const entry = uaEntries[ei]!;
-              const turnNum = ei + 1;
-              const content = entry.message?.content;
-              if (!Array.isArray(content)) continue;
-
-              for (const block of content as ContentBlock[]) {
-                // --tool: match tool_use block names (case-insensitive substring)
-                if (toolQuery && block.type === 'tool_use' && block.name) {
-                  if (block.name.toLowerCase().includes(toolQuery)) {
-                    matchedTools.add(block.name);
-                    matchedTurns.add(turnNum);
-                    toolHit = true;
-                  }
-                }
-
-                // --file: match file paths from extractFilePath on tool_use blocks
-                if (fileQuery && block.type === 'tool_use' && block.name) {
-                  const fileInfo = extractFilePath(block.name, block.input ?? {});
-                  if (fileInfo && fileInfo.path.toLowerCase().includes(fileQuery)) {
-                    matchedFiles.add(fileInfo.path);
-                    matchedTurns.add(turnNum);
-                    fileHit = true;
-                  }
-                }
-
-                // --text: match text and thinking blocks in assistant entries only
-                if (textQuery && entry.type === 'assistant') {
-                  if (block.type === 'text' && block.text && block.text.toLowerCase().includes(textQuery)) {
-                    matchedTurns.add(turnNum);
-                    textHit = true;
-                  }
-                  if (block.type === 'thinking' && block.thinking && block.thinking.toLowerCase().includes(textQuery)) {
-                    matchedTurns.add(turnNum);
-                    textHit = true;
-                  }
-                }
-
-                // --bash: match Bash tool_use block command inputs
-                if (bashQuery && block.type === 'tool_use' && block.name === 'Bash') {
-                  const command = (block.input as Record<string, any>)?.command;
-                  if (typeof command === 'string' && command.toLowerCase().includes(bashQuery)) {
-                    matchedTurns.add(turnNum);
-                    bashHit = true;
-                  }
-                }
-              }
-            }
-
-            // AND semantics: session matches only if ALL provided filters have hits
-            if (!toolHit || !fileHit || !textHit || !bashHit) return null;
-
-            return {
-              session_id: sessionId,
-              branch,
-              timestamp,
-              slug,
-              matches: {
-                tools: Array.from(matchedTools),
-                files: Array.from(matchedFiles),
-                turns: Array.from(matchedTurns).sort((a, b) => a - b),
-              },
-            } satisfies SearchMatch;
-          } catch {
-            return null; // skip unreadable files
+          }));
+          for (const result of scanResults) {
+            if (result) results.push(...result.matches);
           }
-        }));
-        results.push(...batchResults.filter((r): r is SearchMatch => r !== null));
+        }
+      } else {
+        const projectPath = args.project || process.cwd();
+        const claudeDir = resolveClaudeProjectDir(projectPath);
+        const { matches, fileMatchesWithoutWrite } = await scanProjectForSearch({
+          claudeDir,
+          includeProjectFields: false,
+          afterCutoff,
+          args: searchArgs,
+        });
+        scopedFileMatchesWithoutWrite = fileMatchesWithoutWrite;
+        if (args.file) {
+          const relatedProjects = findRelatedProjectRefs(projectPath, listClaudeProjectRefs());
+          if (relatedProjects.length > 0) {
+            scopedRelatedProjects = relatedProjects;
+          }
+        }
+        results.push(...matches);
       }
 
       // Sort newest first; null timestamps sort to end
@@ -1470,7 +1624,24 @@ const searchCommand = defineCommand({
       // Apply --last limit after sorting
       const total = results.length;
       const returned = lastN != null ? results.slice(0, lastN) : results;
-      output(success(returned, meta(total, returned.length)));
+      const responseMeta: SearchMeta = meta(total, returned.length);
+      if (projectsScanned != null) {
+        responseMeta.projects_scanned = projectsScanned;
+      }
+      if (scopedRelatedProjects) {
+        responseMeta.related_projects = scopedRelatedProjects;
+      }
+      if (
+        !allProjects &&
+        args.file &&
+        !args.operation &&
+        total > 0 &&
+        scopedFileMatchesWithoutWrite > 0 &&
+        !results.some(result => result.matches.operations?.includes('write'))
+      ) {
+        responseMeta.warning = SCOPED_FILE_WRITE_WARNING;
+      }
+      output(success(returned, responseMeta));
     } catch (err: unknown) {
       handleCommandError(err);
     }

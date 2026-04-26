@@ -40,10 +40,12 @@ Single-file CLI (`index.ts`) using `citty` for command parsing. All types, helpe
 | `tokens` | Per-turn token usage timeline (optional cumulative mode) |
 | `messages` | Filtered, truncated message content by role/type/turn |
 | `slice` | Raw entries for a turn range |
-| `search` | Find sessions matching structured queries (tool, file, text, bash filters) |
+| `search` | Find sessions matching structured queries (tool, file, text, bash filters), including explicit all-project file search |
 | `subagents` | List subagents for a session with metadata |
 
 All session-scoped commands accept a positional session identifier (UUID, UUID prefix, or slug) and an optional `--project` flag (defaults to CWD). Subagent sessions can be targeted using colon notation: `<session>:<agent-id>` (e.g., `DA2738E3:a8361bc`).
+
+The `search` command is project-scoped by default. Use `search --all-projects` to scan every top-level Claude project directory under `~/.claude/projects`, including worktree sessions. Use `search --file <pattern> --operation <read|edit|write|grep|glob>` to bind file-operation filtering to the same matching file access; all-project result rows include `project` and `project_path_guess`.
 
 ### Session Resolution
 
