@@ -418,7 +418,7 @@ cc-session-tool slice <session> --turn <N|N-M> [--project <path>] [--max-content
 Find sessions matching structured filters. By default, search is scoped to one Claude project directory, derived from `--project <path>` or the current working directory.
 
 ```bash
-cc-session-tool search [--project <path>] [--all-projects] (--tool <name> | --file <path> | --text <text> | --bash <text>) [--operation <op>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>]
+cc-session-tool search [--project <path>] [--all-projects] [--tool <name>] [--file <path>] [--text <text>] [--bash <text>] [--operation <op>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>]
 ```
 
 | Option           | Default | Description |
@@ -436,7 +436,7 @@ cc-session-tool search [--project <path>] [--all-projects] (--tool <name> | --fi
 | `--since`        | —       | Sessions from the last duration: `30m`, `2h`, `1d`, `1w` (mutually exclusive with `--after`). |
 | `--last`         | all     | Return only the N most recent matches after sorting newest first. |
 
-At least one of `--tool`, `--file`, `--text`, or `--bash` is required. Multiple filters use AND semantics. `--operation` is valid only with `--file`, and it is tied to the same matching file access, not any other file access in the session.
+At least one of `--tool`, `--file`, `--text`, or `--bash` is required. You may provide more than one; multiple filters use AND semantics. `--operation` is valid only with `--file`, and it is tied to the same matching file access, not any other file access in the session.
 
 **Examples:**
 
