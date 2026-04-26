@@ -33,23 +33,27 @@ Single-file CLI (`index.ts`) using `citty` for command parsing. All types, helpe
 
 | Command | Purpose |
 |---------|---------|
-| `list` | Index all sessions with metadata (branch, timestamp, slug) |
+| `list` | Index sessions with metadata; supports `--all-projects --project-glob` for audits |
 | `shape` | Turn-by-turn skeleton with summary stats (tool counts, duration, first edit) |
 | `tools` | Tool call log with condensed input summaries and outcomes |
 | `files` | Files touched in a session, grouped by path or turn |
 | `tokens` | Per-turn token usage timeline (optional cumulative mode) |
 | `messages` | Filtered, truncated message content by role/type/turn |
 | `slice` | Raw entries for a turn range |
-| `search` | Find sessions matching structured queries (tool, file, text, bash filters), including explicit all-project file search |
+| `search` | Find sessions matching structured queries (tool, input, file, text, bash filters), scoped to the logical project plus associated Claude worktrees by default |
 | `subagents` | List subagents for a session with metadata |
 
-All session-scoped commands accept a positional session identifier (UUID, UUID prefix, or slug) and an optional `--project` flag (defaults to CWD). Subagent sessions can be targeted using colon notation: `<session>:<agent-id>` (e.g., `DA2738E3:a8361bc`).
+All session-scoped commands accept a positional session identifier (UUID, UUID prefix, or slug) and an optional `--project` flag (defaults to CWD). They also accept `--claude-project <project>` for stable follow-up from search/list rows that expose raw Claude project basenames through `project` or `session_ref.project`; do not use `project_path_guess` as a follow-up handle. `--project` and `--claude-project` are mutually exclusive. Subagent sessions can be targeted using colon notation: `<session>:<agent-id>` (e.g., `DA2738E3:a8361bc`).
 
-The `search` command is project-scoped by default. Use `search --all-projects` to scan every top-level Claude project directory under `~/.claude/projects`, including worktree sessions. Use `search --file <pattern> --operation <read|edit|write|grep|glob>` to bind file-operation filtering to the same matching file access; all-project result rows include `project` and `project_path_guess`.
+The `search` command is agent-first and worktree-aware by default. A scoped search from the logical project checkout includes associated Claude-managed worktree transcript directories and compares absolute main-tree file queries to worktree-local accesses by shared project-relative identity. Use `search --file <absolute-main-tree-path> --operation write` as the primary workflow for finding worktree writes to the same logical file; use `--all-projects` for broad audits, not routine worktree lookup.
+
+Use `search --file <path> --operation <read|edit|write|grep|glob>` to bind file-operation filtering to the same matching file access. Use `--origin` to return the earliest matching transcript write evidence for a file; this is transcript evidence, not VCS creation history. Use `--sort session-newest|match-earliest|match-newest|project` for deterministic ordering.
+
+Use `search --tool <name> --input-match <pattern>` to match raw structured tool inputs, including values omitted or truncated in `input_summary`. Add `--aggregate count-per-session` for per-session audit counts. `--project-glob` is valid only with `--all-projects` on `search` and `list`; it matches raw Claude project basenames and display-only `project_path_guess` strings, not filesystem files.
 
 ### Session Resolution
 
-Sessions are resolved in order: exact UUID filename match, UUID prefix match, then slug search (first 8KB of each JSONL file). Ambiguous matches are errors. Session input is validated against `[a-zA-Z0-9-]` and agent IDs against `[a-zA-Z0-9_-]` to prevent path traversal.
+Sessions are resolved in order within the selected Claude project directory: exact UUID filename match, UUID prefix match, then slug search (first 8KB of each JSONL file). Ambiguous matches are errors. Session input is validated against `[a-zA-Z0-9-]`, agent IDs against `[a-zA-Z0-9_-]`, and `--claude-project` as a basename only to prevent path traversal.
 
 **Subagent targeting:** Use colon notation `<session>:<agent-id>` to address a subagent session (e.g., `DA2738E3:a8361bc`). The session part is resolved normally, then the subagent file is located at `<session-dir>/subagents/agent-<agent-id>.jsonl`. Agent IDs allow underscores: `[a-zA-Z0-9_-]+`. All session-scoped commands except `subagents` support this notation. The `subagents` command lists available agent IDs for a given session.
 
@@ -59,6 +63,7 @@ Sessions are resolved in order: exact UUID filename match, UUID prefix match, th
 2. Distinct exit codes: 0=success, 1=format/terminated, 2=invalid args/ID, 3=not found
 3. Errors are thrown via `cliError(code, msg)` and caught at the command handler level
 4. Content truncation uses `"...[truncated, N chars]"` suffix
+5. `project_path_guess` is display metadata only; raw `project` / `session_ref.project` is the stable Claude project identity for follow-up commands.
 
 ### Testing
 

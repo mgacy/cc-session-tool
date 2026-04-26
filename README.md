@@ -31,7 +31,13 @@ All commands except `list` require a `<session>` argument. Three forms are accep
 | UUID prefix | `DA2738E3`                             | Prefix match (must be unambiguous)                     |
 | Slug        | `snuggly-floating-barto`               | Search across all `.jsonl` files (must be unambiguous) |
 
-All session commands accept `--project <path>` to specify the project directory (defaults to CWD).
+All session commands accept `--project <path>` to specify the project directory (defaults to CWD). They also accept `--claude-project <project>` when you need to target a raw Claude project directory basename returned by `search` or `list --all-projects`. `--project` and `--claude-project` are mutually exclusive.
+
+Use `--claude-project` for stable follow-up from cross-project or worktree search results:
+
+```bash
+cc-session-tool shape DA2738E3 --claude-project -workspace-app
+```
 
 **Subagent targeting:** Append `:<agent-id>` to a session identifier in any session-scoped command (except `subagents`) to target a subagent session (e.g., `DA2738E3:a8361bc` or `snuggly-floating-barto:a8361bc`). The parent session is resolved normally, then the subagent file is located at `<session-dir>/subagents/agent-<agent-id>.jsonl`. Use the `subagents` command to discover available agent IDs.
 
@@ -53,12 +59,14 @@ All commands use consistent turn numbering:
 Index all sessions by reading metadata from the first few lines of each file.
 
 ```bash
-cc-session-tool list [--project <path>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>] [--min-lines <n>] [--include-subagents]
+cc-session-tool list [--project <path>] [--all-projects] [--project-glob <pattern>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>] [--min-lines <n>] [--include-subagents]
 ```
 
 | Option        | Default | Description                                                    |
 | ------------- | ------- | -------------------------------------------------------------- |
 | `--branch`    | all     | Filter by git branch name                                      |
+| `--all-projects` | false | List sessions from every top-level Claude project directory under `~/.claude/projects`. |
+| `--project-glob` | —     | With `--all-projects`, filter by raw Claude project basename or display-only `project_path_guess`. Supports `*` and `?`. |
 | `--after`     | —       | Sessions after ISO 8601 date (mutually exclusive with `--since`) |
 | `--before`    | —       | Sessions before ISO 8601 date                                  |
 | `--since`     | —       | Sessions from the last duration: `30m`, `2h`, `1d`, `1w` (mutually exclusive with `--after`) |
@@ -66,7 +74,7 @@ cc-session-tool list [--project <path>] [--branch <name>] [--after <date>] [--be
 | `--min-lines` | 0       | Sessions with at least N lines                                 |
 | `--include-subagents` | false | Include `subagent_count` per session                    |
 
-**Output:** Sessions sorted by timestamp (newest first). When `--include-subagents` is set, each session includes a `subagent_count` field; otherwise the field is omitted entirely. Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated.
+**Output:** Sessions sorted by timestamp (newest first). When `--include-subagents` is set, each session includes a `subagent_count` field; otherwise the field is omitted entirely. Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated. With `--all-projects`, rows include `project`, `project_path_guess`, and `project_role`, and `_meta.included_projects` records the selected Claude project contexts.
 
 ```json
 {
@@ -92,7 +100,7 @@ cc-session-tool list [--project <path>] [--branch <name>] [--after <date>] [--be
 Turn-by-turn skeleton with summary stats. Compresses a full session into a table of contents.
 
 ```bash
-cc-session-tool shape <session> [--project <path>]
+cc-session-tool shape <session> [--project <path> | --claude-project <project>]
 ```
 
 **Output:**
@@ -152,7 +160,7 @@ cc-session-tool shape <session> [--project <path>]
 Tool call log with condensed input summaries and outcome detection.
 
 ```bash
-cc-session-tool tools <session> [--project <path>] [--name <tool>] [--failed] [--turn <N|N-M>]
+cc-session-tool tools <session> [--project <path> | --claude-project <project>] [--name <tool>] [--failed] [--turn <N|N-M>]
 ```
 
 **Output:**
@@ -218,7 +226,7 @@ cc-session-tool tools <session> [--project <path>] [--name <tool>] [--failed] [-
 Files touched in a session, grouped by file path or chronologically by turn.
 
 ```bash
-cc-session-tool files <session> [--project <path>] [--group-by <file|turn>] [--turn <N|N-M>] [--operation <op>]
+cc-session-tool files <session> [--project <path> | --claude-project <project>] [--group-by <file|turn>] [--turn <N|N-M>] [--operation <op>]
 ```
 
 | Option        | Default | Description                                        |
@@ -238,13 +246,13 @@ cc-session-tool files <session> [--project <path>] [--group-by <file|turn>] [--t
     "group_by": "file",
     "files": [
       {
-        "path": "/Users/me/project/src/auth.ts",
+        "path": "/workspace/project/src/auth.ts",
         "operations": ["read", "edit"],
         "turns": [6, 8, 12, 18],
         "errored": false
       },
       {
-        "path": "/Users/me/project/src/auth.test.ts",
+        "path": "/workspace/project/src/auth.test.ts",
         "operations": ["read", "write"],
         "turns": [10, 22],
         "errored": false
@@ -265,8 +273,8 @@ cc-session-tool files <session> [--project <path>] [--group-by <file|turn>] [--t
     "agent_id": null,
     "group_by": "turn",
     "accesses": [
-      { "path": "/Users/me/project/src/auth.ts", "operation": "read", "turn": 6, "errored": false },
-      { "path": "/Users/me/project/src/auth.ts", "operation": "edit", "turn": 8, "errored": true }
+      { "path": "/workspace/project/src/auth.ts", "operation": "read", "turn": 6, "errored": false },
+      { "path": "/workspace/project/src/auth.ts", "operation": "edit", "turn": 8, "errored": true }
     ]
   },
   "_meta": { "total": 2, "returned": 2, "hasMore": false }
@@ -287,7 +295,7 @@ cc-session-tool files <session> [--project <path>] [--group-by <file|turn>] [--t
 Per-turn token usage from assistant entries.
 
 ```bash
-cc-session-tool tokens <session> [--project <path>] [--cumulative]
+cc-session-tool tokens <session> [--project <path> | --claude-project <project>] [--cumulative]
 ```
 
 **Output:**
@@ -347,7 +355,7 @@ cc-session-tool tokens <session> [--project <path>] [--cumulative]
 Filtered, truncated message content for drilling into specific parts of a session.
 
 ```bash
-cc-session-tool messages <session> [--project <path>] [--role <user|assistant>] [--type <block_type>] [--turn <N|N-M>] [--max-content <chars>]
+cc-session-tool messages <session> [--project <path> | --claude-project <project>] [--role <user|assistant>] [--type <block_type>] [--turn <N|N-M>] [--max-content <chars>]
 ```
 
 | Option          | Default | Description                                                         |
@@ -398,7 +406,7 @@ cc-session-tool messages <session> [--project <path>] [--role <user|assistant>] 
 Raw entries for a turn range. The escape hatch for getting full content of specific turns.
 
 ```bash
-cc-session-tool slice <session> --turn <N|N-M> [--project <path>] [--max-content <chars>]
+cc-session-tool slice <session> --turn <N|N-M> [--project <path> | --claude-project <project>] [--max-content <chars>]
 ```
 
 | Option          | Description                                           |
@@ -415,28 +423,35 @@ cc-session-tool slice <session> --turn <N|N-M> [--project <path>] [--max-content
 
 ### `search`
 
-Find sessions matching structured filters. By default, search is scoped to one Claude project directory, derived from `--project <path>` or the current working directory.
+Find sessions matching structured filters. By default, search is scoped to the logical project derived from `--project <path>` or the current working directory, and it also includes associated Claude-managed worktree transcript directories. This agent-first default means a query from the main checkout can find work performed from a Claude worktree without `--all-projects`.
 
 ```bash
-cc-session-tool search [--project <path>] [--all-projects] [--tool <name>] [--file <path>] [--text <text>] [--bash <text>] [--operation <op>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>]
+cc-session-tool search [--project <path>] [--all-projects] [--project-glob <pattern>] [--tool <name>] [--input-match <text>] [--file <path>] [--text <text>] [--bash <text>] [--operation <op>] [--origin] [--sort <mode>] [--aggregate count-per-session] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>]
 ```
 
 | Option           | Default | Description |
 | ---------------- | ------- | ----------- |
-| `--project`      | CWD     | Project path for scoped search. Ignored as a scope limit when `--all-projects` is set. |
-| `--all-projects` | false   | Search every top-level Claude project directory under `~/.claude/projects`. |
+| `--project`      | CWD     | Logical project path for scoped search. Scoped searches include associated Claude worktrees by default. Ignored as a scope limit when `--all-projects` is set. |
+| `--all-projects` | false   | Search every top-level Claude project directory under `~/.claude/projects` for broad audits. |
+| `--project-glob` | —       | With `--all-projects`, filter by raw Claude project basename or display-only `project_path_guess`. Supports `*` and `?`. |
 | `--tool`         | —       | Match tool names by case-insensitive substring. |
+| `--input-match`  | —       | Match raw structured tool input by case-insensitive substring, including fields omitted or truncated by `input_summary`. |
 | `--file`         | —       | Match touched file paths by substring. |
 | `--operation`    | all     | With `--file`, filter by matching file operation: `read`, `edit`, `write`, `grep`, `glob`. |
+| `--origin`       | false   | With `--file`, return earliest matching transcript write evidence. Implies `--operation write` and defaults to one result. |
+| `--sort`         | `session-newest` | Sort matches by `session-newest`, `match-earliest`, `match-newest`, or `project`. |
+| `--aggregate`    | `none`  | `count-per-session` returns per-session tool-input counts. Requires `--tool` or `--input-match`. |
 | `--text`         | —       | Match assistant text and thinking by case-insensitive substring. |
 | `--bash`         | —       | Match Bash command inputs by case-insensitive substring. |
 | `--branch`       | all     | Filter by git branch name. |
 | `--after`        | —       | Sessions after ISO 8601 date (mutually exclusive with `--since`). |
 | `--before`       | —       | Sessions before ISO 8601 date. |
 | `--since`        | —       | Sessions from the last duration: `30m`, `2h`, `1d`, `1w` (mutually exclusive with `--after`). |
-| `--last`         | all     | Return only the N most recent matches after sorting newest first. |
+| `--last`         | all     | Return only the N matches after sorting. With `--origin`, defaults to 1 unless set. |
 
-At least one of `--tool`, `--file`, `--text`, or `--bash` is required. You may provide more than one; multiple filters use AND semantics. `--operation` is valid only with `--file`, and it is tied to the same matching file access, not any other file access in the session.
+At least one of `--tool`, `--input-match`, `--file`, `--text`, or `--bash` is required. You may provide more than one; multiple filters use AND semantics. `--operation` is valid only with `--file`, and it is tied to the same matching file access, not any other file access in the session.
+
+For absolute `--file` queries inside the logical project, search compares by project-relative identity before substring matching. For example, `/workspace/app/src/auth.ts` in the main checkout matches `/workspace/app/.claude/worktrees/feature-a/src/auth.ts` from a related Claude worktree as the same logical file `src/auth.ts`. If both sides normalize to logical paths and they differ, search does not fall back to substring matching.
 
 **Examples:**
 
@@ -444,11 +459,17 @@ At least one of `--tool`, `--file`, `--text`, or `--bash` is required. You may p
 # Search the current project for sessions that touched auth.ts
 cc-session-tool search --file auth.ts
 
-# Find sessions that wrote auth.ts in any Claude project, including worktrees
-cc-session-tool search --all-projects --file auth.ts --operation write
+# From the main checkout, find worktree sessions that wrote the same logical file
+cc-session-tool search --file /workspace/app/src/auth.ts --operation write
 
-# Search all projects for recent Bash usage
-cc-session-tool search --all-projects --bash "bun test" --since 1d --last 5
+# Find the earliest transcript write for a file
+cc-session-tool search --file /workspace/app/src/auth.ts --origin
+
+# Search all selected Claude project identities for recent Bash usage
+cc-session-tool search --all-projects --project-glob "*app*" --bash "bun test" --since 1d --last 5
+
+# Audit raw Bash inputs, including long commands beyond the condensed summary
+cc-session-tool search --tool Bash --input-match "bun test" --aggregate count-per-session
 ```
 
 **Output:**
@@ -464,7 +485,17 @@ cc-session-tool search --all-projects --bash "bun test" --since 1d --last 5
       "slug": "snuggly-floating-barto",
       "matches": {
         "tools": ["Read", "Edit"],
-        "files": ["/Users/me/project/src/auth.ts"],
+        "files": ["/workspace/app/src/auth.ts"],
+        "normalized_files": ["src/auth.ts"],
+        "file_evidence": [
+          {
+            "rawPath": "/workspace/app/.claude/worktrees/feature-a/src/auth.ts",
+            "logicalPath": "src/auth.ts",
+            "operation": "edit",
+            "turn": 8,
+            "timestamp": "2026-03-07T22:34:10.000Z"
+          }
+        ],
         "operations": ["read", "edit"],
         "turns": [6, 8]
       }
@@ -474,23 +505,72 @@ cc-session-tool search --all-projects --bash "bun test" --since 1d --last 5
 }
 ```
 
-When `--all-projects` is set, each result row also includes:
+With `--aggregate count-per-session`, `data` is a per-session summary instead of full match rows:
+
+```json
+{
+  "ok": true,
+  "data": [
+    {
+      "session_id": "DA2738E3-...",
+      "branch": "feature/auth",
+      "timestamp": "2026-03-07T22:31:26.359Z",
+      "slug": "snuggly-floating-barto",
+      "counts": { "tool_inputs": 3 },
+      "sample_matches": [
+        { "tool": "Bash", "input_summary": "bun test index.test.ts", "turn": 9 }
+      ]
+    }
+  ],
+  "_meta": { "total": 1, "returned": 1, "hasMore": false }
+}
+```
+
+Scoped responses include `_meta.included_projects`, showing the main project and associated worktree Claude project contexts that were scanned. Worktree or all-project result rows can include:
 
 | Field | Description |
 | ----- | ----------- |
 | `project` | Raw Claude project directory basename from `~/.claude/projects`. |
-| `project_path_guess` | Best-effort unmangled path guess, or `null` when the directory name is not in Claude's path-mangled form. This is lossy when path segments contain literal hyphens, so use `project` as the stable identity. |
+| `project_path_guess` | Best-effort unmangled path guess, or `null` when the directory name is not in Claude's path-mangled form. This is display-only and lossy when path segments contain literal hyphens. |
+| `project_role` | `main`, `worktree`, or `global`. |
+| `session_ref` | Stable follow-up identity: `{ "session_id": "...", "project": "<raw Claude project basename>" }`. |
 
-All-project responses include `_meta.projects_scanned`. Scoped `--file` searches may include `_meta.related_projects` for detected worktree project directories and may include `_meta.warning` when matching file hits exist in the scoped project but none are writes:
+Use `session_ref.project` with `--claude-project` rather than relying on `project_path_guess`:
+
+```bash
+cc-session-tool tools DA2738E3 --claude-project -workspace-app--claude-worktrees-feature-a
+```
+
+All-project responses also include `_meta.projects_scanned`. `--project-glob` matches Claude project identity fields, not filesystem globs over project files.
+
+`--origin` reports the earliest matching transcript write evidence that satisfies the filters. It is not VCS creation history.
 
 ```json
 {
-  "_meta": {
-    "total": 3,
-    "returned": 3,
-    "hasMore": false,
-    "warning": "No matching file write was found in this project. The file creator may be in another Claude project; try --all-projects --operation write."
-  }
+  "ok": true,
+  "data": [
+    {
+      "session_id": "DA2738E3-...",
+      "session_ref": {
+        "session_id": "DA2738E3-...",
+        "project": "-workspace-app--claude-worktrees-feature-a"
+      },
+      "matches": {
+        "files": ["/workspace/app/.claude/worktrees/feature-a/src/auth.ts"],
+        "file_evidence": [
+          {
+            "rawPath": "/workspace/app/.claude/worktrees/feature-a/src/auth.ts",
+            "logicalPath": "src/auth.ts",
+            "operation": "write",
+            "turn": 6,
+            "timestamp": "2026-03-07T22:33:00.000Z"
+          }
+        ],
+        "turns": [6]
+      }
+    }
+  ],
+  "_meta": { "total": 1, "returned": 1, "hasMore": false }
 }
 ```
 
@@ -501,7 +581,7 @@ All-project responses include `_meta.projects_scanned`. Scoped `--file` searches
 List subagents spawned during a session. Reads metadata from companion `.meta.json` files and counts JSONL lines for each subagent.
 
 ```bash
-cc-session-tool subagents <session> [--project <path>]
+cc-session-tool subagents <session> [--project <path> | --claude-project <project>]
 ```
 
 **Output:**
@@ -545,6 +625,9 @@ cc-session-tool list --since 1d
 
 # Last 3 sessions on a specific branch
 cc-session-tool list --branch feature/auth --last 3
+
+# Recent sessions across selected Claude project identities
+cc-session-tool list --all-projects --project-glob "*app*" --last 5
 ```
 
 ### Navigation analysis before first edit
@@ -592,11 +675,14 @@ cc-session-tool files DA2738E3 --group-by turn
 ### Find which session wrote a file
 
 ```bash
-# Current project only
-cc-session-tool search --file src/auth.ts --operation write
+# Current logical project, including associated Claude worktrees
+cc-session-tool search --file /workspace/app/src/auth.ts --operation write
 
-# Any Claude project or worktree
-cc-session-tool search --all-projects --file src/auth.ts --operation write
+# Earliest matching transcript write with file evidence
+cc-session-tool search --file /workspace/app/src/auth.ts --origin
+
+# Broad audit across selected Claude project identities
+cc-session-tool search --all-projects --project-glob "*app*" --file src/auth.ts --operation write
 ```
 
 ### Token consumption comparison

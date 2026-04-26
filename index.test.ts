@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
-import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -9,6 +9,11 @@ import {
   resolveClaudeProjectDir, resolveSessionFile, resolveSession, parseSessionLines, userAssistantEntries,
   claudeProjectsRoot, findRelatedProjectRefs, listClaudeProjectRefs, listSubagents,
   mangleProjectPath, mapConcurrent, projectPathGuessFromClaudeProject,
+  buildScopedSearchScope, isPathWithinOrEqual, listSearchTargetsForContext,
+  normalizePathForContainment, parseSessionText, pathContainmentCandidates,
+  scanProjectContexts, buildSearchSessionContext, extractSessionCwd, normalizeFileAccess,
+  normalizeFileQuery, matchFileAccess, projectMatchesGlob, selectProjectContexts,
+  stableJsonStringify, toolInputMatches,
 } from './index.ts';
 
 // ============================================================================
@@ -177,6 +182,15 @@ describe('inputSummary', () => {
   test('unknown tool uses JSON.stringify', () => {
     const result = inputSummary('Custom', { foo: 'bar' });
     expect(result).toContain('foo');
+  });
+});
+
+describe('toolInputMatches', () => {
+  test('uses stable JSON serialization for structured inputs', () => {
+    const left = stableJsonStringify({ b: 2, a: { d: 4, c: 3 } });
+    const right = stableJsonStringify({ a: { c: 3, d: 4 }, b: 2 });
+    expect(left).toBe(right);
+    expect(toolInputMatches({ b: 2, a: { d: 4, c: 'Stable JSON Marker' } }, '"c":"stable json marker"')).toBe(true);
   });
 });
 
@@ -406,6 +420,285 @@ describe('Claude project discovery helpers', () => {
     expect(related.project_path_guess).not.toStartWith(`${projectPath}/.claude/worktrees/`);
     expect(findRelatedProjectRefs(projectPath, refs)).toEqual([related]);
   });
+
+  test('isPathWithinOrEqual is separator-safe', () => {
+    expect(isPathWithinOrEqual('/tmp/repo/file.ts', '/tmp/repo')).toBe(true);
+    expect(isPathWithinOrEqual('/tmp/repo', '/tmp/repo')).toBe(true);
+    expect(isPathWithinOrEqual('/tmp/repo2/file.ts', '/tmp/repo')).toBe(false);
+  });
+
+  test('normalizePathForContainment removes trailing slashes', () => {
+    expect(normalizePathForContainment('/tmp/example/')).toBe('/tmp/example');
+  });
+
+  test('pathContainmentCandidates preserves lexical path when realpath is unavailable', () => {
+    expect(pathContainmentCandidates('/tmp/no-such-cc-session-tool-path')).toContain('/tmp/no-such-cc-session-tool-path');
+  });
+
+  test('buildScopedSearchScope returns main context only when worktrees are excluded', () => {
+    const unique = `cc-session-tool-scope-main-${Date.now()}`;
+    const root = join(tmpdir(), unique, '.claude', 'projects');
+    const projectPath = join(tmpdir(), unique, 'repo');
+    const claudeDir = join(root, mangleProjectPath(projectPath));
+    const worktreeProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
+
+    mkdirSync(claudeDir, { recursive: true });
+    mkdirSync(join(root, worktreeProject), { recursive: true });
+
+    try {
+      const scope = buildScopedSearchScope({ projectPath, claudeProjectsRoot: root, includeWorktrees: false });
+      expect(scope.projectRoot).toBe(normalizePathForContainment(projectPath));
+      expect(scope.projects).toHaveLength(1);
+      expect(scope.projects[0]).toEqual({
+        role: 'main',
+        projectRoot: projectPath,
+        worktreeRoot: null,
+        projectRef: {
+          project: mangleProjectPath(projectPath),
+          claude_dir: claudeDir,
+          project_path_guess: projectPath,
+        },
+      });
+    } finally {
+      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+    }
+  });
+
+  test('buildScopedSearchScope includes related hyphenated worktree refs without reverse-mangling', () => {
+    const unique = `cc-session-tool-scope-worktree-${Date.now()}`;
+    const root = join(tmpdir(), unique, '.claude', 'projects');
+    const projectPath = join(tmpdir(), unique, 'cc-session-tool', 'cc-session-tool');
+    const mainProject = mangleProjectPath(projectPath);
+    const worktreeProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
+    const siblingProject = mangleProjectPath(join(tmpdir(), unique, 'cc-session-tool-other'));
+
+    mkdirSync(join(root, mainProject), { recursive: true });
+    mkdirSync(join(root, worktreeProject), { recursive: true });
+    mkdirSync(join(root, siblingProject), { recursive: true });
+
+    try {
+      const scope = buildScopedSearchScope({ projectPath, claudeProjectsRoot: root, includeWorktrees: true });
+      expect(scope.projects.map(context => context.role)).toEqual(['main', 'worktree']);
+      expect(scope.projects[1]!.projectRef.project).toBe(worktreeProject);
+      expect(scope.projects[1]!.worktreeRoot).toBe(projectPathGuessFromClaudeProject(worktreeProject));
+      expect(scope.projects[1]!.worktreeRoot).not.toStartWith(`${projectPath}/.claude/worktrees/`);
+    } finally {
+      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+    }
+  });
+
+  test('buildScopedSearchScope tolerates a missing Claude projects root after main project resolves', () => {
+    const unique = `cc-session-tool-scope-missing-root-${Date.now()}`;
+    const root = join(tmpdir(), unique, '.claude', 'projects');
+    const projectPath = join(tmpdir(), unique, 'repo');
+    mkdirSync(join(root, mangleProjectPath(projectPath)), { recursive: true });
+
+    try {
+      const scope = buildScopedSearchScope({
+        projectPath,
+        claudeProjectsRoot: root,
+        includeWorktrees: true,
+      });
+      expect(scope.projects).toHaveLength(1);
+    } finally {
+      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+    }
+  });
+
+  test('listSearchTargetsForContext includes context on targets', () => {
+    const unique = `cc-session-tool-target-context-${Date.now()}`;
+    const root = join(tmpdir(), unique, '.claude', 'projects');
+    const projectPath = join(tmpdir(), unique, 'repo');
+    const claudeDir = join(root, mangleProjectPath(projectPath));
+    const session = '11111111-2222-3333-4444-555555555555';
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(join(claudeDir, `${session}.jsonl`), JSON.stringify({ type: 'user' }) + '\n');
+
+    try {
+      const context = buildScopedSearchScope({ projectPath, claudeProjectsRoot: root, includeWorktrees: false }).projects[0]!;
+      const targets = listSearchTargetsForContext(context);
+      expect(targets).toHaveLength(1);
+      expect(targets[0]).toEqual({
+        filePath: join(claudeDir, `${session}.jsonl`),
+        sessionId: session,
+        context,
+        projectRef: context.projectRef,
+      });
+    } finally {
+      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+    }
+  });
+
+  test('scanProjectContexts skips missing Claude project directories', async () => {
+    const context = {
+      role: 'global' as const,
+      projectRoot: null,
+      worktreeRoot: null,
+      projectRef: {
+        project: '-tmp-missing-project',
+        claude_dir: join(tmpdir(), `cc-session-tool-missing-${Date.now()}`),
+        project_path_guess: '/tmp/missing/project',
+      },
+    };
+
+    const result = await scanProjectContexts([context], { tool: 'Read' }, null);
+    expect(result).toEqual({ matches: [], fileMatchesWithoutWrite: 0 });
+  });
+
+  test('projectMatchesGlob supports wildcards and escapes regex metacharacters', () => {
+    const ref = {
+      project: '-tmp-cc-session-tool-[literal]-project',
+      claude_dir: '/tmp/claude/projects/-tmp-cc-session-tool-[literal]-project',
+      project_path_guess: '/tmp/cc-session-tool/[literal]/project',
+    };
+
+    expect(projectMatchesGlob(ref, '*[literal]-project')).toBe(true);
+    expect(projectMatchesGlob(ref, '*[literal]*')).toBe(true);
+    expect(projectMatchesGlob(ref, '*literal.-project')).toBe(false);
+  });
+
+  test('selectProjectContexts filters all-project contexts and reports skipped projects', () => {
+    const unique = `cc-session-tool-selection-${Date.now()}`;
+    const root = join(tmpdir(), unique, '.claude', 'projects');
+    const projectA = '/tmp/project-alpha';
+    const projectB = '/tmp/project-beta';
+    const projectADir = mangleProjectPath(projectA);
+    const projectBDir = mangleProjectPath(projectB);
+
+    mkdirSync(join(root, projectADir), { recursive: true });
+    mkdirSync(join(root, projectBDir), { recursive: true });
+
+    try {
+      const selection = selectProjectContexts({
+        mode: 'all-projects',
+        claudeProjectsRoot: root,
+        projectGlob: '*alpha',
+      });
+      expect(selection.contexts.map(context => context.projectRef.project)).toEqual([projectADir]);
+      expect(selection.includedProjects).toEqual([{
+        project: projectADir,
+        project_path_guess: projectPathGuessFromClaudeProject(projectADir),
+        project_role: 'global',
+      }]);
+      expect(selection.skippedProjects).toEqual([{
+        project: projectBDir,
+        project_path_guess: projectPathGuessFromClaudeProject(projectBDir),
+        project_role: 'global',
+      }]);
+    } finally {
+      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+    }
+  });
+
+  test('extractSessionCwd returns the first transcript cwd', () => {
+    expect(extractSessionCwd([
+      { type: 'summary' },
+      { type: 'user', cwd: '/tmp/repo/.claude/worktrees/feature-a' },
+      { type: 'assistant', cwd: '/tmp/other' },
+    ])).toBe('/tmp/repo/.claude/worktrees/feature-a');
+  });
+
+  test('logical file matching equates main-tree queries with transcript cwd worktree accesses', () => {
+    const projectRoot = '/tmp/repo';
+    const worktreeRoot = '/tmp/repo/.claude/worktrees/feature-a';
+    const context = buildSearchSessionContext({
+      role: 'worktree',
+      projectRoot,
+      worktreeRoot: null,
+      projectRef: {
+        project: mangleProjectPath(worktreeRoot),
+        claude_dir: '/tmp/claude',
+        project_path_guess: null,
+      },
+    }, [{ type: 'user', cwd: worktreeRoot }]);
+
+    const query = normalizeFileQuery('/tmp/repo/.claude-tracking/009/plan.md', context);
+    const access = normalizeFileAccess('/tmp/repo/.claude/worktrees/feature-a/.claude-tracking/009/plan.md', 'write', context);
+
+    expect(query.logicalPath).toBe('.claude-tracking/009/plan.md');
+    expect(access.logicalPath).toBe('.claude-tracking/009/plan.md');
+    expect(matchFileAccess(query, access)).toEqual({
+      matched: true,
+      matchedBy: 'logical',
+      logicalPath: '.claude-tracking/009/plan.md',
+    });
+  });
+
+  test('logical file matching uses realpath candidates for supplied project roots', () => {
+    const unique = `cc-session-tool-realpath-${Date.now()}`;
+    const root = join(tmpdir(), unique);
+    const realProject = join(root, 'real-project');
+    const linkedProject = join(root, 'linked-project');
+    mkdirSync(realProject, { recursive: true });
+    symlinkSync(realProject, linkedProject);
+
+    try {
+      const context = buildSearchSessionContext({
+        role: 'main',
+        projectRoot: linkedProject,
+        worktreeRoot: null,
+        projectRef: {
+          project: mangleProjectPath(linkedProject),
+          claude_dir: '/tmp/claude',
+          project_path_guess: linkedProject,
+        },
+      }, []);
+
+      const query = normalizeFileQuery(join(realProject, 'src', 'index.ts'), context);
+      expect(query.logicalPath).toBe('src/index.ts');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('logical file matching is separator-safe and blocks substring fallback for absolute logical queries', () => {
+    const context = buildSearchSessionContext({
+      role: 'main',
+      projectRoot: '/tmp/repo',
+      worktreeRoot: null,
+      projectRef: {
+        project: '-tmp-repo',
+        claude_dir: '/tmp/claude',
+        project_path_guess: '/tmp/repo',
+      },
+    }, []);
+
+    const query = normalizeFileQuery('/tmp/repo/src/file.ts', context);
+    const siblingAccess = normalizeFileAccess('/tmp/repo2/src/file.ts', 'write', context);
+    const differentLogicalAccess = normalizeFileAccess('/tmp/repo/src/file.ts.bak', 'write', context);
+
+    expect(query.logicalPath).toBe('src/file.ts');
+    expect(siblingAccess.logicalPath).toBeNull();
+    expect(matchFileAccess(query, siblingAccess).matched).toBe(false);
+    expect(matchFileAccess(query, differentLogicalAccess)).toEqual({
+      matched: false,
+      matchedBy: 'logical',
+      logicalPath: null,
+    });
+  });
+
+  test('non-normalizable file queries retain substring matching', () => {
+    const context = buildSearchSessionContext({
+      role: 'main',
+      projectRoot: '/tmp/repo',
+      worktreeRoot: null,
+      projectRef: {
+        project: '-tmp-repo',
+        claude_dir: '/tmp/claude',
+        project_path_guess: '/tmp/repo',
+      },
+    }, []);
+
+    const query = normalizeFileQuery('src/file.ts', context);
+    const access = normalizeFileAccess('/tmp/repo/src/file.ts', 'read', context);
+
+    expect(query.logicalPath).toBeNull();
+    expect(matchFileAccess(query, access)).toEqual({
+      matched: true,
+      matchedBy: 'substring',
+      logicalPath: 'src/file.ts',
+    });
+  });
 });
 
 // ============================================================================
@@ -480,10 +773,11 @@ const FIXTURE_CLAUDE_PROJECTS_ROOT = claudeProjectsRoot(FIXTURE_HOME);
 const FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project');
 const SECOND_FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project-worktree');
 const RELATED_PROJECT = join(tmpdir(), `ccsessionrelated${Date.now()}`);
+const RELATED_WORKTREE_ROOT = join(RELATED_PROJECT, '.claude', 'worktrees', 'feature');
 const fakeDirName = mangleProjectPath(FAKE_PROJECT);
 const secondFakeDirName = mangleProjectPath(SECOND_FAKE_PROJECT);
 const relatedDirName = mangleProjectPath(RELATED_PROJECT);
-const relatedWorktreeDirName = mangleProjectPath(join(RELATED_PROJECT, '.claude', 'worktrees', 'feature'));
+const relatedWorktreeDirName = mangleProjectPath(RELATED_WORKTREE_ROOT);
 const CLAUDE_DIR = join(
   FIXTURE_CLAUDE_PROJECTS_ROOT,
   fakeDirName,
@@ -508,6 +802,9 @@ const SESSION_ID_4 = 'dddddddd-1111-2222-3333-444444444444';
 const SESSION_ID_5 = 'eeeeeeee-1111-2222-3333-444444444444';
 const SESSION_ID_6 = 'ffffffaa-1111-2222-3333-444444444444';
 const SESSION_ID_7 = 'ffffffee-1111-2222-3333-444444444444';
+const SESSION_ID_8 = 'ffffffbb-1111-2222-3333-444444444444';
+const SESSION_ID_9 = 'ffffffcc-1111-2222-3333-444444444444';
+const SESSION_ID_10 = 'ffffffdd-1111-2222-3333-444444444444';
 const CROSS_PROJECT_FILE = 'cross-project-fixture-target.ts';
 const RELATED_PROJECT_FILE = 'related-origin-warning.ts';
 const LATE_SLUG_FIRST_LINE = JSON.stringify({
@@ -570,7 +867,7 @@ function makeFixtureLines(): string[] {
       message: {
         role: 'assistant',
         content: [
-          { type: 'tool_use', name: 'Edit', id: 'tool_2', input: { file_path: '/a/b/hello.ts', old_string: 'old', new_string: 'new' } },
+          { type: 'tool_use', name: 'Edit', id: 'tool_2', input: { file_path: '/a/b/hello.ts', old_string: 'legacy raw old marker', new_string: 'new raw replacement marker' } },
         ],
         usage: { input_tokens: 200, output_tokens: 30, cache_read_input_tokens: 150, cache_creation_input_tokens: 10 },
       },
@@ -700,7 +997,10 @@ beforeAll(() => {
       timestamp: '2026-03-02T10:01:00.000Z',
       message: {
         role: 'assistant',
-        content: [{ type: 'text', text: 'Response from second session' }],
+        content: [
+          { type: 'tool_use', name: 'TodoWrite', id: 'tool_todo_1', input: { todos: [{ status: 'pending', content: 'stable json audit marker' }] } },
+          { type: 'text', text: 'Response from second session' },
+        ],
         usage: { input_tokens: 50, output_tokens: 25 },
       },
     }),
@@ -738,10 +1038,10 @@ beforeAll(() => {
       message: {
         role: 'assistant',
         content: [
-          { type: 'tool_use', name: 'Bash', id: 'tool_bash_1', input: { command: 'npm install express' } },
+          { type: 'tool_use', name: 'Bash', id: 'tool_bash_1', input: { command: `npm install express ${'x'.repeat(90)} raw-bash-marker-after-summary` } },
           { type: 'tool_use', name: 'Read', id: 'tool_read_1', input: { file_path: '/workspace/hello.ts' } },
           { type: 'tool_use', name: 'Read', id: 'tool_cross_read_1', input: { file_path: `/workspace/${CROSS_PROJECT_FILE}` } },
-          { type: 'tool_use', name: 'Write', id: 'tool_write_1', input: { file_path: '/workspace/other.ts', content: 'export const other = true;' } },
+          { type: 'tool_use', name: 'Write', id: 'tool_write_1', input: { file_path: '/workspace/other.ts', content: 'export const other = true; // raw write content marker' } },
         ],
         usage: { input_tokens: 60, output_tokens: 15 },
       },
@@ -789,7 +1089,7 @@ beforeAll(() => {
       message: {
         role: 'assistant',
         content: [
-          { type: 'tool_use', name: 'Write', id: 'tool_cross_write_1', input: { file_path: `/worktree/${CROSS_PROJECT_FILE}`, content: 'export const crossProject = true;' } },
+          { type: 'tool_use', name: 'Write', id: 'tool_cross_write_1', input: { file_path: `/worktree/${CROSS_PROJECT_FILE}`, content: 'export const crossProject = true; // cross audit content marker' } },
         ],
         usage: { input_tokens: 60, output_tokens: 15 },
       },
@@ -820,6 +1120,115 @@ beforeAll(() => {
     }),
   ];
   writeFileSync(join(RELATED_CLAUDE_DIR, `${SESSION_ID_7}.jsonl`), relatedProjectLines.join('\n') + '\n');
+
+  const relatedWorktreeWriterLines = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: SESSION_ID_8,
+      timestamp: '2026-03-08T10:00:00.000Z',
+      gitBranch: 'feature-worktree',
+      version: '2.1.0',
+      cwd: RELATED_WORKTREE_ROOT,
+      slug: 'related-worktree-writer',
+      message: { role: 'user', content: 'Write equivalent file from worktree' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-08T10:01:00.000Z',
+      cwd: RELATED_WORKTREE_ROOT,
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Write', id: 'tool_related_worktree_write_1', input: { file_path: join(RELATED_WORKTREE_ROOT, RELATED_PROJECT_FILE), content: 'export const related = true;' } },
+          { type: 'tool_use', name: 'Bash', id: 'tool_related_worktree_bash_1', input: { command: 'bun test related' } },
+        ],
+        usage: { input_tokens: 60, output_tokens: 15 },
+      },
+    }),
+  ];
+  writeFileSync(join(RELATED_WORKTREE_CLAUDE_DIR, `${SESSION_ID_8}.jsonl`), relatedWorktreeWriterLines.join('\n') + '\n');
+
+  const relatedWorktreeSubagentDir = join(RELATED_WORKTREE_CLAUDE_DIR, SESSION_ID_8, 'subagents');
+  mkdirSync(relatedWorktreeSubagentDir, { recursive: true });
+  const relatedWorktreeSubagentLines = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: SESSION_ID_8,
+      timestamp: '2026-03-08T10:10:00.000Z',
+      gitBranch: 'feature-worktree',
+      version: '2.1.0',
+      cwd: RELATED_WORKTREE_ROOT,
+      message: { role: 'user', content: 'Inspect the worktree follow-up session' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-08T10:11:00.000Z',
+      cwd: RELATED_WORKTREE_ROOT,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Worktree follow-up subagent response' }],
+        usage: { input_tokens: 30, output_tokens: 10 },
+      },
+    }),
+  ];
+  writeFileSync(join(relatedWorktreeSubagentDir, `agent-${SUBAGENT_ID}.jsonl`), relatedWorktreeSubagentLines.join('\n') + '\n');
+  writeFileSync(join(relatedWorktreeSubagentDir, `agent-${SUBAGENT_ID}.meta.json`), JSON.stringify({
+    agentType: 'worktree-agent',
+    description: 'Worktree subagent',
+  }));
+
+  const relatedWorktreeSameBasenameLines = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: SESSION_ID_9,
+      timestamp: '2026-03-08T11:00:00.000Z',
+      gitBranch: 'feature-worktree',
+      version: '2.1.0',
+      cwd: RELATED_WORKTREE_ROOT,
+      slug: 'related-worktree-same-basename',
+      message: { role: 'user', content: 'Read target but write another same-named file' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-08T11:01:00.000Z',
+      cwd: RELATED_WORKTREE_ROOT,
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Read', id: 'tool_related_worktree_read_1', input: { file_path: join(RELATED_WORKTREE_ROOT, RELATED_PROJECT_FILE) } },
+          { type: 'tool_use', name: 'Write', id: 'tool_related_worktree_write_2', input: { file_path: join(RELATED_WORKTREE_ROOT, 'nested', RELATED_PROJECT_FILE), content: 'export const nested = true;' } },
+        ],
+        usage: { input_tokens: 60, output_tokens: 15 },
+      },
+    }),
+  ];
+  writeFileSync(join(RELATED_WORKTREE_CLAUDE_DIR, `${SESSION_ID_9}.jsonl`), relatedWorktreeSameBasenameLines.join('\n') + '\n');
+
+  const relatedWorktreeEarlierOriginLines = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: SESSION_ID_10,
+      timestamp: '2026-03-09T10:00:00.000Z',
+      gitBranch: 'feature-worktree',
+      version: '2.1.0',
+      cwd: RELATED_WORKTREE_ROOT,
+      slug: 'related-worktree-earliest-origin',
+      message: { role: 'user', content: 'Write equivalent file from a later session with older tool evidence' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-06T09:01:00.000Z',
+      cwd: RELATED_WORKTREE_ROOT,
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Write', id: 'tool_related_worktree_write_3', input: { file_path: join(RELATED_WORKTREE_ROOT, RELATED_PROJECT_FILE), content: 'export const earlierOrigin = true;' } },
+        ],
+        usage: { input_tokens: 60, output_tokens: 15 },
+      },
+    }),
+  ];
+  writeFileSync(join(RELATED_WORKTREE_CLAUDE_DIR, `${SESSION_ID_10}.jsonl`), relatedWorktreeEarlierOriginLines.join('\n') + '\n');
 });
 
 afterAll(() => {
@@ -933,6 +1342,52 @@ describe('list integration', () => {
     expect(result.ok).toBe(false);
     expect(result.error.code).toBe('INVALID_ARGS');
     expect(result.error.message).toContain('mutually exclusive');
+  });
+
+  test('--all-projects lists sessions with project metadata', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--all-projects']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBeGreaterThanOrEqual(4);
+    expect(result._meta.included_projects).toContainEqual({
+      project: secondFakeDirName,
+      project_path_guess: projectPathGuessFromClaudeProject(secondFakeDirName),
+      project_role: 'global',
+    });
+    const secondary = result.data.find((s: any) => s.session_id === SESSION_ID_6);
+    expect(secondary).toBeDefined();
+    expect(secondary.project).toBe(secondFakeDirName);
+    expect(secondary.project_path_guess).toBe(projectPathGuessFromClaudeProject(secondFakeDirName));
+    expect(secondary.project_role).toBe('global');
+  });
+
+  test('list --all-projects --project-glob filters selected and skipped projects', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--all-projects', '--project-glob', '*fake-project-worktree']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBe(1);
+    expect(result._meta.included_projects).toEqual([{
+      project: secondFakeDirName,
+      project_path_guess: projectPathGuessFromClaudeProject(secondFakeDirName),
+      project_role: 'global',
+    }]);
+    expect(result._meta.skipped_projects).toContainEqual({
+      project: fakeDirName,
+      project_path_guess: projectPathGuessFromClaudeProject(fakeDirName),
+      project_role: 'global',
+    });
+    expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_6]);
+  });
+
+  test('list --project-glob without --all-projects returns invalid args', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--project-glob', '*fake*', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+    expect(result.error.message).toContain('--project-glob requires --all-projects');
   });
 });
 
@@ -1133,6 +1588,34 @@ describe('userAssistantEntries', () => {
 // ============================================================================
 // parseSessionLines
 // ============================================================================
+
+describe('parseSessionText', () => {
+  test('skips malformed lines and returns valid ones', () => {
+    const entries = parseSessionText([
+      'not valid json',
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'hi' } }),
+      '{ broken',
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [] } }),
+    ].join('\n') + '\n');
+    expect(entries.length).toBe(2);
+    expect(entries[0]!.type).toBe('user');
+    expect(entries[1]!.type).toBe('assistant');
+  });
+
+  test('throws FORMAT_ERROR when text has only malformed lines', () => {
+    try {
+      parseSessionText('not json\nalso not json\n');
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.errorCode).toBe('FORMAT_ERROR');
+      expect(err.message).toContain('no valid entries');
+    }
+  });
+
+  test('returns empty array for empty text', () => {
+    expect(parseSessionText('\n\n')).toEqual([]);
+  });
+});
 
 describe('parseSessionLines', () => {
   test('skips malformed lines and returns valid ones', async () => {
@@ -1808,13 +2291,43 @@ describe('search integration', () => {
     expect(result._meta.projects_scanned).toBeGreaterThanOrEqual(2);
   });
 
-  test('scoped --file warns when matching results contain no writes', async () => {
+  test('search --all-projects --project-glob filters selected and skipped projects', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--all-projects', '--project-glob', '*fake-project-worktree', '--file', CROSS_PROJECT_FILE]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBe(1);
+    expect(result._meta.included_projects).toEqual([{
+      project: secondFakeDirName,
+      project_path_guess: projectPathGuessFromClaudeProject(secondFakeDirName),
+      project_role: 'global',
+    }]);
+    expect(result._meta.skipped_projects).toContainEqual({
+      project: fakeDirName,
+      project_path_guess: projectPathGuessFromClaudeProject(fakeDirName),
+      project_role: 'global',
+    });
+    expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_6]);
+    expect(result.data[0].project).toBe(secondFakeDirName);
+    expect(result.data[0].project_role).toBeUndefined();
+  });
+
+  test('search --project-glob without --all-projects returns invalid args', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--project-glob', '*fake*', '--file', CROSS_PROJECT_FILE, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+    expect(result.error.message).toContain('--project-glob requires --all-projects');
+  });
+
+  test('scoped --file omits old cross-project warning when matching results contain no writes', async () => {
     const { exitCode, stdout } = await runCli(['search', '--file', CROSS_PROJECT_FILE, '--project', FAKE_PROJECT]);
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result.data.length).toBeGreaterThan(0);
-    expect(result._meta.warning).toBe('No matching file write was found in this project. The file creator may be in another Claude project; try --all-projects --operation write.');
+    expect(result._meta).not.toHaveProperty('warning');
   });
 
   test('scoped --file omits warning for empty results', async () => {
@@ -1859,14 +2372,141 @@ describe('search integration', () => {
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result.data.find((s: any) => s.session_id === SESSION_ID_7)).toBeDefined();
-    expect(result._meta.related_projects).toEqual([
+    expect(result._meta.included_projects).toEqual([
+      {
+        project: relatedDirName,
+        project_path_guess: RELATED_PROJECT,
+        project_role: 'main',
+      },
       {
         project: relatedWorktreeDirName,
-        claude_dir: RELATED_WORKTREE_CLAUDE_DIR,
         project_path_guess: projectPathGuessFromClaudeProject(relatedWorktreeDirName),
+        project_role: 'worktree',
       },
     ]);
-    expect(result._meta.warning).toBe('No matching file write was found in this project. The file creator may be in another Claude project; try --all-projects --operation write.');
+    expect(result._meta).not.toHaveProperty('related_projects');
+    expect(result._meta).not.toHaveProperty('warning');
+  });
+
+  test('scoped absolute main-path file search finds equivalent worktree writer without --all-projects', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--operation', 'write', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+
+    const writer = result.data.find((s: any) => s.session_id === SESSION_ID_8);
+    expect(writer).toBeDefined();
+    expect(writer.matches.files).toEqual([join(RELATED_WORKTREE_ROOT, RELATED_PROJECT_FILE)]);
+    expect(writer.matches.normalized_files).toEqual([RELATED_PROJECT_FILE]);
+    expect(writer.matches.operations).toEqual(['write']);
+    expect(writer.project).toBe(relatedWorktreeDirName);
+    expect(writer.project_role).toBe('worktree');
+    expect(writer.session_ref).toEqual({
+      session_id: SESSION_ID_8,
+      project: relatedWorktreeDirName,
+    });
+  });
+
+  test('scoped --tool search includes associated worktree sessions by default', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'Bash', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+
+    const worktreeMatch = result.data.find((s: any) => s.session_id === SESSION_ID_8);
+    expect(worktreeMatch).toBeDefined();
+    expect(worktreeMatch.project).toBe(relatedWorktreeDirName);
+    expect(worktreeMatch.project_role).toBe('worktree');
+  });
+
+  test('logical file operation binding rejects writes to same basename at a different logical path', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--operation', 'write', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.find((s: any) => s.session_id === SESSION_ID_8)).toBeDefined();
+    expect(result.data.find((s: any) => s.session_id === SESSION_ID_9)).toBeUndefined();
+  });
+
+  test('file search includes per-access evidence for matching file accesses', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--operation', 'write', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+
+    const writer = result.data.find((s: any) => s.session_id === SESSION_ID_8);
+    expect(writer.matches.file_evidence).toEqual([{
+      rawPath: join(RELATED_WORKTREE_ROOT, RELATED_PROJECT_FILE),
+      logicalPath: RELATED_PROJECT_FILE,
+      operation: 'write',
+      turn: 2,
+      timestamp: '2026-03-08T10:01:00.000Z',
+    }]);
+  });
+
+  test('--origin implies write matching and returns the earliest matching write evidence by default', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--origin', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_10]);
+    expect(result._meta.total).toBeGreaterThan(1);
+    expect(result._meta.returned).toBe(1);
+    expect(result._meta.hasMore).toBe(true);
+    expect(result.data[0].matches.operations).toEqual(['write']);
+    expect(result.data[0].matches.file_evidence[0]).toMatchObject({
+      rawPath: join(RELATED_WORKTREE_ROOT, RELATED_PROJECT_FILE),
+      logicalPath: RELATED_PROJECT_FILE,
+      operation: 'write',
+      timestamp: '2026-03-06T09:01:00.000Z',
+    });
+  });
+
+  test('--origin honors --last after earliest-write ordering', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--origin', '--last', '2', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_10, SESSION_ID_8]);
+    expect(result._meta.returned).toBe(2);
+  });
+
+  test('--origin still applies additional candidate filters before earliest-write ordering', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--origin', '--text', 'response', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data).toEqual([]);
+  });
+
+  test('--sort match-earliest and match-newest order by matching file evidence', async () => {
+    const earliest = parseOutput((await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--operation', 'write', '--sort', 'match-earliest', '--project', RELATED_PROJECT])).stdout);
+    expect(earliest.ok).toBe(true);
+    expect(earliest.data.map((s: any) => s.session_id).slice(0, 2)).toEqual([SESSION_ID_10, SESSION_ID_8]);
+
+    const newest = parseOutput((await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--operation', 'write', '--sort', 'match-newest', '--project', RELATED_PROJECT])).stdout);
+    expect(newest.ok).toBe(true);
+    expect(newest.data.map((s: any) => s.session_id).slice(0, 2)).toEqual([SESSION_ID_8, SESSION_ID_10]);
+  });
+
+  test('--sort project orders merged all-project results by raw project identity', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--all-projects', '--file', CROSS_PROJECT_FILE, '--sort', 'project']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((s: any) => s.session_id).slice(0, 2)).toEqual([SESSION_ID_4, SESSION_ID_6]);
+  });
+
+  test('--origin rejects invalid combinations', async () => {
+    const invalidOperation = parseOutput((await runCli(['search', '--file', RELATED_PROJECT_FILE, '--origin', '--operation', 'read', '--project', RELATED_PROJECT])).stdout);
+    expect(invalidOperation.ok).toBe(false);
+    expect(invalidOperation.error.code).toBe('INVALID_ARGS');
+    expect(invalidOperation.error.message).toContain('--origin implies --operation write');
+
+    const invalidSort = parseOutput((await runCli(['search', '--file', RELATED_PROJECT_FILE, '--origin', '--sort', 'match-newest', '--project', RELATED_PROJECT])).stdout);
+    expect(invalidSort.ok).toBe(false);
+    expect(invalidSort.error.code).toBe('INVALID_ARGS');
+    expect(invalidSort.error.message).toContain('--origin uses --sort match-earliest');
   });
 
   test('--operation without --file returns INVALID_ARGS', async () => {
@@ -1910,6 +2550,124 @@ describe('search integration', () => {
     const match = result.data.find((s: any) => s.session_id === SESSION_ID_4);
     expect(match).toBeDefined();
     expect(match.matches.turns.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('--input-match searches raw Bash commands beyond input summary truncation', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'Bash', '--input-match', 'raw-bash-marker-after-summary', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((s: any) => s.session_id)).toContain(SESSION_ID_4);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID_4);
+    expect(match.matches.tools).toEqual(['Bash']);
+    expect(match.matches.tool_inputs).toEqual([{
+      tool: 'Bash',
+      input_summary: expect.not.stringContaining('raw-bash-marker-after-summary'),
+      turn: 2,
+    }]);
+  });
+
+  test('--input-match searches raw file paths and content fields', async () => {
+    const editResult = parseOutput((await runCli(['search', '--tool', 'Edit', '--input-match', 'legacy raw old marker', '--project', FAKE_PROJECT])).stdout);
+    expect(editResult.ok).toBe(true);
+    expect(editResult.data.map((s: any) => s.session_id)).toContain(SESSION_ID);
+    expect(editResult.data.find((s: any) => s.session_id === SESSION_ID).matches.tool_inputs[0]).toEqual({
+      tool: 'Edit',
+      input_summary: "file='hello.ts' old=(21 chars) new=(26 chars)",
+      turn: 4,
+    });
+
+    const writeResult = parseOutput((await runCli(['search', '--tool', 'Write', '--input-match', 'raw write content marker', '--project', FAKE_PROJECT])).stdout);
+    expect(writeResult.ok).toBe(true);
+    expect(writeResult.data.map((s: any) => s.session_id)).toContain(SESSION_ID_4);
+  });
+
+  test('--input-match uses stable JSON serialization for other tool inputs', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'TodoWrite', '--input-match', '"content":"stable json audit marker"', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_2]);
+    expect(result.data[0].matches.tool_inputs).toEqual([{
+      tool: 'TodoWrite',
+      input_summary: expect.stringContaining('stable json audit marker'),
+      turn: 2,
+    }]);
+  });
+
+  test('--input-match composes with branch and time filters', async () => {
+    const matching = parseOutput((await runCli(['search', '--input-match', 'raw write content marker', '--branch', 'main', '--after', '2026-03-04T00:00:00.000Z', '--project', FAKE_PROJECT])).stdout);
+    expect(matching.ok).toBe(true);
+    expect(matching.data.map((s: any) => s.session_id)).toContain(SESSION_ID_4);
+
+    const excluded = parseOutput((await runCli(['search', '--input-match', 'raw write content marker', '--branch', 'feature', '--project', FAKE_PROJECT])).stdout);
+    expect(excluded.ok).toBe(true);
+    expect(excluded.data).toEqual([]);
+  });
+
+  test('scoped --input-match includes associated worktree sessions by default', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'Write', '--input-match', 'earlierOrigin', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const worktreeMatch = result.data.find((s: any) => s.session_id === SESSION_ID_10);
+    expect(worktreeMatch).toBeDefined();
+    expect(worktreeMatch.project).toBe(relatedWorktreeDirName);
+    expect(worktreeMatch.project_role).toBe('worktree');
+  });
+
+  test('--all-projects --project-glob supports input-match audits', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--all-projects', '--project-glob', '*fake-project-worktree', '--tool', 'Write', '--input-match', 'cross audit content marker']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBe(1);
+    expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_6]);
+    expect(result.data[0].project).toBe(secondFakeDirName);
+  });
+
+  test('--aggregate count-per-session returns counts and sample matches', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'Read', '--aggregate', 'count-per-session', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const aggregate = result.data.find((s: any) => s.session_id === SESSION_ID_4);
+    expect(aggregate).toEqual({
+      session_id: SESSION_ID_4,
+      branch: 'main',
+      timestamp: '2026-03-04T10:00:00.000Z',
+      slug: 'bash-test-session',
+      counts: { tool_inputs: 2 },
+      sample_matches: [
+        { tool: 'Read', input_summary: "file='hello.ts'", turn: 2 },
+        { tool: 'Read', input_summary: "file='cross-project-fixture-target.ts'", turn: 2 },
+      ],
+    });
+  });
+
+  test('--aggregate count-per-session composes with input-match', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'Write', '--input-match', 'raw write content marker', '--aggregate', 'count-per-session', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((s: any) => s.session_id)).toContain(SESSION_ID_4);
+    const aggregate = result.data.find((s: any) => s.session_id === SESSION_ID_4);
+    expect(aggregate.counts.tool_inputs).toBe(1);
+    expect(aggregate.sample_matches).toEqual([
+      { tool: 'Write', input_summary: "file='other.ts' (54 chars)", turn: 2 },
+    ]);
+  });
+
+  test('--aggregate rejects invalid usage', async () => {
+    const withoutToolInput = parseOutput((await runCli(['search', '--file', 'hello.ts', '--aggregate', 'count-per-session', '--project', FAKE_PROJECT])).stdout);
+    expect(withoutToolInput.ok).toBe(false);
+    expect(withoutToolInput.error.code).toBe('INVALID_ARGS');
+    expect(withoutToolInput.error.message).toContain('--aggregate requires --tool or --input-match');
+
+    const invalidMode = parseOutput((await runCli(['search', '--tool', 'Read', '--aggregate', 'totals', '--project', FAKE_PROJECT])).stdout);
+    expect(invalidMode.ok).toBe(false);
+    expect(invalidMode.error.code).toBe('INVALID_ARGS');
+    expect(invalidMode.error.message).toContain('--aggregate must be count-per-session');
   });
 
   test('--tool Grep --branch main combines content + metadata filters', async () => {
@@ -2086,6 +2844,138 @@ describe('subagents integration', () => {
     expect(result.ok).toBe(false);
     expect(result.error.code).toBe('NOT_FOUND');
   });
+});
+
+// ============================================================================
+// --claude-project session follow-up integration
+// ============================================================================
+
+describe('--claude-project session follow-up integration', () => {
+  test('worktree search hit exposes stable session_ref identity', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--operation', 'write', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    const writer = result.data.find((s: any) => s.session_id === SESSION_ID_8);
+    expect(writer).toBeDefined();
+    expect(writer.project).toBe(relatedWorktreeDirName);
+    expect(writer.project_path_guess).toBe(projectPathGuessFromClaudeProject(relatedWorktreeDirName));
+    expect(writer.session_ref).toEqual({
+      session_id: SESSION_ID_8,
+      project: relatedWorktreeDirName,
+    });
+  });
+
+  test('shape resolves a worktree session with --claude-project', async () => {
+    const { exitCode, stdout } = await runCli(['shape', SESSION_ID_8, '--claude-project', relatedWorktreeDirName]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_8);
+    expect(result.data.summary.tool_calls.Write).toBe(1);
+    expect(result.data.summary.tool_calls.Bash).toBe(1);
+  });
+
+  test('tools resolves a worktree session with --claude-project', async () => {
+    const { exitCode, stdout } = await runCli(['tools', SESSION_ID_8, '--claude-project', relatedWorktreeDirName]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_8);
+    expect(result.data.tool_calls.map((call: any) => call.tool)).toEqual(['Write', 'Bash']);
+  });
+
+  test('files resolves a worktree session with --claude-project', async () => {
+    const { exitCode, stdout } = await runCli(['files', SESSION_ID_8, '--claude-project', relatedWorktreeDirName]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_8);
+    expect(result.data.files.map((file: any) => file.path)).toEqual([join(RELATED_WORKTREE_ROOT, RELATED_PROJECT_FILE)]);
+  });
+
+  test('messages resolves a worktree session with --claude-project', async () => {
+    const { exitCode, stdout } = await runCli(['messages', SESSION_ID_8, '--claude-project', relatedWorktreeDirName]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_8);
+    expect(result.data.messages.length).toBe(2);
+  });
+
+  test('tokens resolves a worktree session with --claude-project', async () => {
+    const { exitCode, stdout } = await runCli(['tokens', SESSION_ID_8, '--claude-project', relatedWorktreeDirName]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_8);
+    expect(result.data.totals.input).toBe(60);
+    expect(result.data.totals.output).toBe(15);
+  });
+
+  test('slice resolves a worktree session with --claude-project', async () => {
+    const { exitCode, stdout } = await runCli(['slice', SESSION_ID_8, '--claude-project', relatedWorktreeDirName, '--turn', '1-2']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_8);
+    expect(result.data.entries.length).toBe(2);
+  });
+
+  test('subagents resolves a worktree session with --claude-project', async () => {
+    const { exitCode, stdout } = await runCli(['subagents', SESSION_ID_8, '--claude-project', relatedWorktreeDirName]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_8);
+    expect(result.data.subagents).toEqual([
+      {
+        agent_id: SUBAGENT_ID,
+        agent_type: 'worktree-agent',
+        description: 'Worktree subagent',
+        lines: 2,
+        timestamp: '2026-03-08T10:10:00.000Z',
+      },
+    ]);
+  });
+
+  test('invalid --claude-project basename returns INVALID_ARGS', async () => {
+    const { exitCode, stdout } = await runCli(['shape', SESSION_ID_8, '--claude-project', '.']);
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+    expect(result.error.message).toContain('--claude-project');
+  });
+
+  test('path traversal in --claude-project returns INVALID_ARGS', async () => {
+    const { exitCode, stdout } = await runCli(['shape', SESSION_ID_8, '--claude-project', '../project']);
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+    expect(result.error.message).toContain('--claude-project');
+  });
+
+  const conflictingCommandArgs = [
+    ['shape', SESSION_ID_8],
+    ['tools', SESSION_ID_8],
+    ['files', SESSION_ID_8],
+    ['messages', SESSION_ID_8],
+    ['tokens', SESSION_ID_8],
+    ['slice', SESSION_ID_8, '--turn', '1-2'],
+    ['subagents', SESSION_ID_8],
+  ];
+
+  for (const commandArgs of conflictingCommandArgs) {
+    test(`${commandArgs[0]} rejects --project with --claude-project`, async () => {
+      const { exitCode, stdout } = await runCli([...commandArgs, '--project', RELATED_PROJECT, '--claude-project', relatedWorktreeDirName]);
+      expect(exitCode).toBe(2);
+      const result = parseOutput(stdout);
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('INVALID_ARGS');
+      expect(result.error.message).toContain('mutually exclusive');
+    });
+  }
 });
 
 // ============================================================================

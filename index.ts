@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 import { defineCommand, runMain } from 'citty';
 import { homedir } from 'os';
-import { join, basename } from 'path';
-import { readdirSync, existsSync } from 'fs';
+import { join, basename, dirname, resolve, relative, isAbsolute } from 'path';
+import { readdirSync, existsSync, realpathSync } from 'fs';
 
 export const VERSION = '0.1.0';
 
@@ -68,6 +68,9 @@ export type ListSession = {
   lines: number;
   slug: string | null;
   subagent_count?: number;
+  project?: string;
+  project_path_guess?: string | null;
+  project_role?: SearchProjectRole;
 };
 
 export type ShapeRow = {
@@ -146,6 +149,53 @@ export type ProjectRef = {
 
 export type SearchOperation = FileAccess['operation'];
 
+export type SearchProjectRole = 'main' | 'worktree' | 'global';
+
+export type PublicProjectRef = {
+  project: string;
+  project_path_guess: string | null;
+  project_role: SearchProjectRole;
+};
+
+export type SearchProjectContext = {
+  role: SearchProjectRole;
+  projectRoot: string | null;
+  worktreeRoot: string | null;
+  projectRef: ProjectRef;
+};
+
+export type SearchSessionContext = SearchProjectContext & {
+  sessionCwd: string | null;
+  normalizedProjectRoots: string[];
+  normalizedWorktreeRoots: string[];
+};
+
+export type NormalizedFileQuery = {
+  raw: string;
+  rawLower: string;
+  logicalPath: string | null;
+};
+
+export type NormalizedFileAccess = {
+  rawPath: string;
+  operation: SearchOperation;
+  logicalPath: string | null;
+};
+
+export type FileMatchResult = {
+  matched: boolean;
+  matchedBy: 'logical' | 'substring';
+  logicalPath: string | null;
+};
+
+export type FileMatchEvidence = {
+  rawPath: string;
+  logicalPath: string | null;
+  operation: SearchOperation;
+  turn: number;
+  timestamp: string | null;
+};
+
 export type FileEntry = {
   path: string;
   operations: string[];
@@ -200,18 +250,51 @@ export type SearchMatch = {
   slug: string | null;
   project?: string;
   project_path_guess?: string | null;
+  project_role?: SearchProjectRole;
+  session_ref?: {
+    session_id: string;
+    project: string;
+  };
   matches: {
     tools: string[];      // distinct tool names that matched --tool
     files: string[];      // distinct file paths that matched --file
+    normalized_files?: string[];
+    file_evidence?: FileMatchEvidence[];
     operations?: SearchOperation[];
+    tool_inputs?: ToolInputMatch[];
     turns: number[];      // union of all turn numbers where any filter matched
   };
+};
+
+export type SearchSortMode = 'session-newest' | 'match-earliest' | 'match-newest' | 'project';
+export type SearchAggregateMode = 'none' | 'count-per-session';
+
+export type ToolInputMatch = {
+  tool: string;
+  input_summary: string;
+  turn: number;
+};
+
+export type SearchAggregateResult = {
+  session_id: string;
+  branch: string | null;
+  timestamp: string | null;
+  slug: string | null;
+  project?: string;
+  project_path_guess?: string | null;
+  project_role?: SearchProjectRole;
+  counts: {
+    tool_inputs: number;
+  };
+  sample_matches: ToolInputMatch[];
 };
 
 export type SearchMeta = ResponseMeta & {
   projects_scanned?: number;
   project?: string;
   related_projects?: ProjectRef[];
+  included_projects?: PublicProjectRef[];
+  skipped_projects?: PublicProjectRef[];
   warning?: string;
 };
 
@@ -220,6 +303,7 @@ export type SearchArgs = {
   file?: string;
   text?: string;
   bash?: string;
+  inputMatch?: string;
   branch?: string;
   after?: string;
   before?: string;
@@ -230,12 +314,49 @@ export type SearchArgs = {
 export type SearchTarget = {
   filePath: string;
   sessionId: string;
+  context?: SearchProjectContext;
   projectRef?: ProjectRef;
 };
+
+export type SearchScopeOptions = {
+  projectPath: string;
+  claudeProjectsRoot?: string;
+  includeWorktrees: boolean;
+};
+
+export type SearchScope = {
+  projectRoot: string;
+  projects: SearchProjectContext[];
+};
+
+export type ProjectSelectionMode = 'scoped' | 'scoped-with-worktrees' | 'all-projects';
+
+export type ProjectSelectionOptions = {
+  mode: ProjectSelectionMode;
+  projectPath?: string;
+  projectGlob?: string;
+  claudeProjectsRoot?: string;
+};
+
+export type ProjectSelection = {
+  contexts: SearchProjectContext[];
+  includedProjects: PublicProjectRef[];
+  skippedProjects: PublicProjectRef[];
+};
+
+export type SessionProjectSelector =
+  | { kind: 'projectPath'; projectPath: string }
+  | { kind: 'claudeProject'; project: string };
 
 export type SearchScanResult = {
   matches: SearchMatch[];
   fileMatchesWithoutWrite: number;
+};
+
+export type ListMeta = ResponseMeta & {
+  projects_scanned?: number;
+  included_projects?: PublicProjectRef[];
+  skipped_projects?: PublicProjectRef[];
 };
 
 // ============================================================================
@@ -252,6 +373,7 @@ export const ERROR_CODES = {
 
 type ErrorCode = keyof typeof ERROR_CODES;
 const SEARCH_OPERATIONS: SearchOperation[] = ['read', 'edit', 'write', 'grep', 'glob'];
+const SEARCH_SORT_MODES: SearchSortMode[] = ['session-newest', 'match-earliest', 'match-newest', 'project'];
 const SEARCH_SCAN_CONCURRENCY = 50;
 
 // ============================================================================
@@ -348,10 +470,223 @@ export function listClaudeProjectRefs(root = claudeProjectsRoot()): ProjectRef[]
     }));
 }
 
+function stripTrailingSlashes(input: string): string {
+  return input.replace(/\/+$/, '') || '/';
+}
+
+export function normalizePathForContainment(input: string): string {
+  return stripTrailingSlashes(resolve(input));
+}
+
+export function isPathWithinOrEqual(pathname: string, root: string): boolean {
+  const normalizedPath = normalizePathForContainment(pathname);
+  const normalizedRoot = normalizePathForContainment(root);
+  const rel = relative(normalizedRoot, normalizedPath);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+export function pathContainmentCandidates(pathname: string): string[] {
+  const candidates = new Set<string>([normalizePathForContainment(pathname)]);
+  try {
+    candidates.add(normalizePathForContainment(realpathSync.native(pathname)));
+  } catch {
+    // Missing fixture paths are common in transcript tests; keep the lexical candidate.
+  }
+  let existingAncestor = normalizePathForContainment(pathname);
+  const missingSegments: string[] = [];
+  while (!existsSync(existingAncestor)) {
+    const parent = dirname(existingAncestor);
+    if (parent === existingAncestor) break;
+    missingSegments.unshift(basename(existingAncestor));
+    existingAncestor = parent;
+  }
+  if (existsSync(existingAncestor)) {
+    try {
+      candidates.add(normalizePathForContainment(join(realpathSync.native(existingAncestor), ...missingSegments)));
+    } catch {
+      // Keep the candidates collected so far.
+    }
+  }
+  return Array.from(candidates);
+}
+
+function uniqueNormalizedCandidates(paths: Array<string | null | undefined>): string[] {
+  const candidates = new Set<string>();
+  for (const pathname of paths) {
+    if (!pathname || !isAbsolute(pathname)) continue;
+    for (const candidate of pathContainmentCandidates(pathname)) {
+      candidates.add(candidate);
+    }
+  }
+  return Array.from(candidates);
+}
+
+function normalizeLogicalRelativePath(pathname: string): string {
+  return pathname.split('/').filter(part => part.length > 0).join('/');
+}
+
+function logicalPathForAbsolutePath(pathname: string, roots: string[]): string | null {
+  if (!isAbsolute(pathname)) return null;
+  const orderedRoots = [...roots].sort((a, b) => b.length - a.length);
+  for (const candidate of pathContainmentCandidates(pathname)) {
+    for (const root of orderedRoots) {
+      if (!isPathWithinOrEqual(candidate, root)) continue;
+      const rel = relative(root, candidate);
+      if (!rel || rel.startsWith('..') || isAbsolute(rel)) continue;
+      return normalizeLogicalRelativePath(rel);
+    }
+  }
+  return null;
+}
+
+export function extractSessionCwd(entries: SessionEntry[]): string | null {
+  for (const entry of entries) {
+    if (typeof entry.cwd === 'string' && entry.cwd.trim()) return entry.cwd;
+  }
+  return null;
+}
+
+export function buildSearchSessionContext(context: SearchProjectContext, entries: SessionEntry[]): SearchSessionContext {
+  const sessionCwd = extractSessionCwd(entries);
+  return {
+    ...context,
+    sessionCwd,
+    normalizedProjectRoots: uniqueNormalizedCandidates([context.projectRoot]),
+    normalizedWorktreeRoots: uniqueNormalizedCandidates([context.worktreeRoot, context.role === 'worktree' ? sessionCwd : null]),
+  };
+}
+
+export function normalizeFileQuery(raw: string, context: SearchSessionContext): NormalizedFileQuery {
+  const logicalPath = isAbsolute(raw)
+    ? logicalPathForAbsolutePath(raw, context.normalizedProjectRoots)
+    : null;
+  return {
+    raw,
+    rawLower: raw.toLowerCase(),
+    logicalPath,
+  };
+}
+
+export function normalizeFileAccess(
+  rawPath: string,
+  operation: SearchOperation,
+  context: SearchSessionContext,
+): NormalizedFileAccess {
+  const roots = [...context.normalizedProjectRoots, ...context.normalizedWorktreeRoots];
+  const logicalPath = isAbsolute(rawPath)
+    ? logicalPathForAbsolutePath(rawPath, roots)
+    : null;
+  return { rawPath, operation, logicalPath };
+}
+
+export function matchFileAccess(query: NormalizedFileQuery, access: NormalizedFileAccess): FileMatchResult {
+  if (query.logicalPath != null) {
+    const matched = access.logicalPath === query.logicalPath;
+    return {
+      matched,
+      matchedBy: 'logical',
+      logicalPath: matched ? access.logicalPath : null,
+    };
+  }
+
+  return {
+    matched: access.rawPath.toLowerCase().includes(query.rawLower),
+    matchedBy: 'substring',
+    logicalPath: access.logicalPath,
+  };
+}
+
 export function findRelatedProjectRefs(projectPath: string, refs: ProjectRef[]): ProjectRef[] {
   const normalized = projectPath.replace(/\/+$/, '');
   const worktreeProjectPrefix = `${mangleProjectPath(join(normalized, '.claude', 'worktrees'))}-`;
   return refs.filter(ref => ref.project.startsWith(worktreeProjectPrefix));
+}
+
+export function buildScopedSearchScope(options: SearchScopeOptions): SearchScope {
+  const projectRoot = normalizePathForContainment(options.projectPath);
+  const root = options.claudeProjectsRoot ?? claudeProjectsRoot();
+  const mainProjectRef: ProjectRef = {
+    project: mangleProjectPath(options.projectPath),
+    claude_dir: resolveClaudeProjectDir(options.projectPath, root),
+    project_path_guess: options.projectPath,
+  };
+  const projects: SearchProjectContext[] = [{
+    role: 'main',
+    projectRoot: options.projectPath,
+    worktreeRoot: null,
+    projectRef: mainProjectRef,
+  }];
+
+  if (options.includeWorktrees) {
+    for (const ref of findRelatedProjectRefs(options.projectPath, listClaudeProjectRefs(root))) {
+      projects.push({
+        role: 'worktree',
+        projectRoot: options.projectPath,
+        worktreeRoot: ref.project_path_guess,
+        projectRef: ref,
+      });
+    }
+  }
+
+  return { projectRoot, projects };
+}
+
+function publicProjectRef(context: SearchProjectContext): PublicProjectRef {
+  return {
+    project: context.projectRef.project,
+    project_path_guess: context.projectRef.project_path_guess,
+    project_role: context.role,
+  };
+}
+
+function globToRegExp(glob: string): RegExp {
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  const pattern = escaped.replace(/\*/g, '.*').replace(/\?/g, '.');
+  return new RegExp(`^${pattern}$`);
+}
+
+export function projectMatchesGlob(ref: ProjectRef, glob: string): boolean {
+  const regex = globToRegExp(glob);
+  return regex.test(ref.project) || Boolean(ref.project_path_guess && regex.test(ref.project_path_guess));
+}
+
+export function selectProjectContexts(options: ProjectSelectionOptions): ProjectSelection {
+  const root = options.claudeProjectsRoot ?? claudeProjectsRoot();
+
+  if (options.mode === 'all-projects') {
+    const included: SearchProjectContext[] = [];
+    const skipped: SearchProjectContext[] = [];
+    for (const projectRef of listClaudeProjectRefs(root)) {
+      const context: SearchProjectContext = {
+        role: 'global',
+        projectRoot: projectRef.project_path_guess,
+        worktreeRoot: null,
+        projectRef,
+      };
+      if (options.projectGlob && !projectMatchesGlob(projectRef, options.projectGlob)) {
+        skipped.push(context);
+      } else {
+        included.push(context);
+      }
+    }
+    return {
+      contexts: included,
+      includedProjects: included.map(publicProjectRef),
+      skippedProjects: skipped.map(publicProjectRef),
+    };
+  }
+
+  const projectPath = options.projectPath || process.cwd();
+  const scope = buildScopedSearchScope({
+    projectPath,
+    claudeProjectsRoot: root,
+    includeWorktrees: options.mode === 'scoped-with-worktrees',
+  });
+  return {
+    contexts: scope.projects,
+    includedProjects: scope.projects.map(publicProjectRef),
+    skippedProjects: [],
+  };
 }
 
 export function resolveClaudeProjectDir(projectPath: string, root = claudeProjectsRoot()): string {
@@ -360,6 +695,67 @@ export function resolveClaudeProjectDir(projectPath: string, root = claudeProjec
     throw cliError('NOT_FOUND', `Claude project directory not found: ${claudeDir}`);
   }
   return claudeDir;
+}
+
+function validateClaudeProjectBasename(project: string): void {
+  if (
+    !project ||
+    project === '.' ||
+    project === '..' ||
+    project.includes('/') ||
+    project.includes('\\') ||
+    basename(project) !== project
+  ) {
+    throw cliError('INVALID_ARGS', '--claude-project must be a Claude project directory basename');
+  }
+}
+
+function readRawStringOption(name: string): string | undefined {
+  const longName = `--${name}`;
+  const withEquals = `${longName}=`;
+  for (let i = 2; i < process.argv.length; i++) {
+    const arg = process.argv[i]!;
+    if (arg.startsWith(withEquals)) {
+      return arg.slice(withEquals.length);
+    }
+    if (arg === longName) {
+      const value = process.argv[i + 1];
+      return value && !value.startsWith('--') ? value : undefined;
+    }
+  }
+  return undefined;
+}
+
+export function resolveClaudeProjectDirFromSelector(
+  selector: SessionProjectSelector,
+  root = claudeProjectsRoot(),
+): string {
+  if (selector.kind === 'projectPath') {
+    return resolveClaudeProjectDir(selector.projectPath, root);
+  }
+
+  validateClaudeProjectBasename(selector.project);
+  const claudeDir = join(root, selector.project);
+  if (!existsSync(claudeDir)) {
+    throw cliError('NOT_FOUND', `Claude project directory not found: ${claudeDir}`);
+  }
+  return claudeDir;
+}
+
+function sessionProjectSelectorFromArgs(args: {
+  project?: string;
+  'claude-project'?: string;
+}): SessionProjectSelector {
+  const claudeProject = readRawStringOption('claude-project') ?? (
+    typeof args['claude-project'] === 'string' ? args['claude-project'] : undefined
+  );
+  if (args.project && claudeProject) {
+    throw cliError('INVALID_ARGS', '--project and --claude-project are mutually exclusive');
+  }
+  if (claudeProject) {
+    return { kind: 'claudeProject', project: claudeProject };
+  }
+  return { kind: 'projectPath', projectPath: args.project || process.cwd() };
 }
 
 /**
@@ -489,8 +885,7 @@ export async function resolveSessionFile(claudeDir: string, input: string): Prom
 }
 
 /** Parse a JSONL session file into an array of entries. Skips malformed lines. */
-export async function parseSessionLines(filePath: string): Promise<SessionEntry[]> {
-  const text = await Bun.file(filePath).text();
+export function parseSessionText(text: string): SessionEntry[] {
   const entries: SessionEntry[] = [];
   let nonEmptyCount = 0;
   for (const line of text.split('\n')) {
@@ -512,6 +907,11 @@ export async function parseSessionLines(filePath: string): Promise<SessionEntry[
   return entries;
 }
 
+/** Parse a JSONL session file into an array of entries. Skips malformed lines. */
+export async function parseSessionLines(filePath: string): Promise<SessionEntry[]> {
+  return parseSessionText(await Bun.file(filePath).text());
+}
+
 /** Filter to user/assistant entries only. */
 export function userAssistantEntries(entries: SessionEntry[]): SessionEntry[] {
   return entries.filter(e => e.type === 'user' || e.type === 'assistant');
@@ -524,8 +924,16 @@ export type ResolvedSession = {
   entries: SessionEntry[];
 };
 
-export async function resolveSession(args: { session: string; project?: string; claudeProjectsRoot?: string }): Promise<ResolvedSession> {
-  const claudeDir = resolveClaudeProjectDir(args.project || process.cwd(), args.claudeProjectsRoot);
+export async function resolveSession(args: {
+  session: string;
+  project?: string;
+  'claude-project'?: string;
+  claudeProjectsRoot?: string;
+}): Promise<ResolvedSession> {
+  const claudeDir = resolveClaudeProjectDirFromSelector(
+    sessionProjectSelectorFromArgs(args),
+    args.claudeProjectsRoot,
+  );
   const { filePath, sessionId, agentId } = await resolveSessionFile(claudeDir, args.session);
   const allEntries = await parseSessionLines(filePath);
   const entries = userAssistantEntries(allEntries);
@@ -583,6 +991,22 @@ export function inputSummary(name: string, input: Record<string, unknown>): stri
     default:
       return JSON.stringify(inp).slice(0, 80);
   }
+}
+
+export function stableJsonStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJsonStringify).join(',')}]`;
+
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, entryValue]) => entryValue !== undefined)
+    .sort(([a], [b]) => a.localeCompare(b));
+  return `{${entries
+    .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableJsonStringify(entryValue)}`)
+    .join(',')}}`;
+}
+
+export function toolInputMatches(input: Record<string, unknown>, query: string): boolean {
+  return stableJsonStringify(input).toLowerCase().includes(query.toLowerCase());
 }
 
 /** Determine outcome from a tool_result. */
@@ -816,10 +1240,77 @@ export function buildResultLookup(entries: SessionEntry[]): Map<string, ToolResu
 // List Command
 // ============================================================================
 
+async function listSessionsForContext(
+  context: SearchProjectContext,
+  args: {
+    branch?: string;
+    before?: string;
+    'include-subagents'?: boolean;
+  },
+  afterCutoff: string | null,
+  minLines: number,
+  includeProjectFields: boolean,
+): Promise<ListSession[]> {
+  const files = readdirSync(context.projectRef.claude_dir).filter(f => f.endsWith('.jsonl'));
+  const sessions: ListSession[] = [];
+
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < files.length; i += BATCH_SIZE) {
+    const batch = files.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(batch.map(async (f) => {
+      try {
+        const filePath = join(context.projectRef.claude_dir, f);
+        const sessionId = f.replace('.jsonl', '');
+        const text = await Bun.file(filePath).text();
+        const lineCount = text.split('\n').filter(l => l.trim()).length;
+
+        if (minLines > 0 && lineCount < minLines) return null;
+
+        const { branch, timestamp, version, slug } = extractSessionMetadata(text);
+
+        if (args.branch && branch !== args.branch) return null;
+        if (afterCutoff) {
+          if (!timestamp || timestamp < afterCutoff) return null;
+        }
+        if (args.before) {
+          if (!timestamp || timestamp > args.before) return null;
+        }
+
+        const session: ListSession = { session_id: sessionId, branch, timestamp, version, lines: lineCount, slug };
+        if (includeProjectFields) {
+          session.project = context.projectRef.project;
+          session.project_path_guess = context.projectRef.project_path_guess;
+          session.project_role = context.role;
+        }
+        if (args['include-subagents']) {
+          try {
+            const subagentDir = join(context.projectRef.claude_dir, sessionId, 'subagents');
+            if (existsSync(subagentDir)) {
+              session.subagent_count = readdirSync(subagentDir).filter(isSubagentFile).length;
+            } else {
+              session.subagent_count = 0;
+            }
+          } catch {
+            session.subagent_count = 0;
+          }
+        }
+        return session;
+      } catch {
+        return null; // skip unreadable files
+      }
+    }));
+    sessions.push(...results.filter((r): r is ListSession => r !== null));
+  }
+
+  return sessions;
+}
+
 const listCommand = defineCommand({
   meta: { name: 'list', description: 'Index all sessions (metadata only)' },
   args: {
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    'all-projects': { type: 'boolean', description: 'List sessions from all Claude project directories', default: false },
+    'project-glob': { type: 'string', description: 'Filter --all-projects by Claude project identity glob' },
     branch: { type: 'string', description: 'Filter by git branch' },
     after: { type: 'string', description: 'Sessions after DATE (ISO 8601)' },
     before: { type: 'string', description: 'Sessions before DATE (ISO 8601)' },
@@ -831,8 +1322,12 @@ const listCommand = defineCommand({
   async run({ args }) {
     try {
       const projectPath = args.project || process.cwd();
-      const claudeDir = resolveClaudeProjectDir(projectPath);
       const minLines = parseIntArg(args['min-lines'], '--min-lines') ?? 0;
+      const allProjects = Boolean(args['all-projects']);
+
+      if (args['project-glob'] && !allProjects) {
+        throw cliError('INVALID_ARGS', '--project-glob requires --all-projects');
+      }
 
       if (args.since && args.after) {
         throw cliError('INVALID_ARGS', '--since and --after are mutually exclusive');
@@ -844,52 +1339,19 @@ const listCommand = defineCommand({
         throw cliError('INVALID_ARGS', '--last must be a positive integer');
       }
 
-      const files = readdirSync(claudeDir).filter(f => f.endsWith('.jsonl'));
       const sessions: ListSession[] = [];
+      const selection = selectProjectContexts({
+        mode: allProjects ? 'all-projects' : 'scoped',
+        projectPath,
+        projectGlob: args['project-glob'],
+      });
 
-      // Process files in parallel batches
-      const BATCH_SIZE = 50;
-      for (let i = 0; i < files.length; i += BATCH_SIZE) {
-        const batch = files.slice(i, i + BATCH_SIZE);
-        const results = await Promise.all(batch.map(async (f) => {
-          try {
-            const filePath = join(claudeDir, f);
-            const sessionId = f.replace('.jsonl', '');
-            const text = await Bun.file(filePath).text();
-            const lineCount = text.split('\n').filter(l => l.trim()).length;
-
-            if (minLines > 0 && lineCount < minLines) return null;
-
-            const { branch, timestamp, version, slug } = extractSessionMetadata(text);
-
-            // Apply filters
-            if (args.branch && branch !== args.branch) return null;
-            if (afterCutoff) {
-              if (!timestamp || timestamp < afterCutoff) return null;
-            }
-            if (args.before) {
-              if (!timestamp || timestamp > args.before) return null;
-            }
-
-            const session: ListSession = { session_id: sessionId, branch, timestamp, version, lines: lineCount, slug };
-            if (args['include-subagents']) {
-              try {
-                const subagentDir = join(claudeDir, sessionId, 'subagents');
-                if (existsSync(subagentDir)) {
-                  session.subagent_count = readdirSync(subagentDir).filter(isSubagentFile).length;
-                } else {
-                  session.subagent_count = 0;
-                }
-              } catch {
-                session.subagent_count = 0;
-              }
-            }
-            return session;
-          } catch {
-            return null; // skip unreadable files
-          }
-        }));
-        sessions.push(...results.filter((r): r is ListSession => r !== null));
+      for (const context of selection.contexts) {
+        try {
+          sessions.push(...await listSessionsForContext(context, args, afterCutoff, minLines, allProjects));
+        } catch {
+          if (!allProjects) throw cliError('NOT_FOUND', `Claude project directory not found: ${context.projectRef.claude_dir}`);
+        }
       }
 
       // Sort newest first
@@ -903,7 +1365,13 @@ const listCommand = defineCommand({
       // Apply --last limit after sorting
       const total = sessions.length;
       const returned = lastN != null ? sessions.slice(0, lastN) : sessions;
-      output(success(returned, meta(total, returned.length)));
+      const responseMeta: ListMeta = meta(total, returned.length);
+      if (allProjects) {
+        responseMeta.projects_scanned = selection.contexts.length;
+        responseMeta.included_projects = selection.includedProjects;
+        responseMeta.skipped_projects = selection.skippedProjects;
+      }
+      output(success(returned, responseMeta));
     } catch (err: unknown) {
       handleCommandError(err);
     }
@@ -919,6 +1387,7 @@ const tokensCommand = defineCommand({
   args: {
     session: { type: 'positional', description: 'Session ID (UUID, prefix, or slug)', required: true },
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    'claude-project': { type: 'string', description: 'Raw Claude project directory basename' },
     cumulative: { type: 'boolean', description: 'Show running totals', default: false },
   },
   async run({ args }) {
@@ -977,6 +1446,7 @@ const shapeCommand = defineCommand({
   args: {
     session: { type: 'positional', description: 'Session ID (UUID, prefix, or slug)', required: true },
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    'claude-project': { type: 'string', description: 'Raw Claude project directory basename' },
   },
   async run({ args }) {
     try {
@@ -1080,6 +1550,7 @@ const toolsCommand = defineCommand({
   args: {
     session: { type: 'positional', description: 'Session ID (UUID, prefix, or slug)', required: true },
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    'claude-project': { type: 'string', description: 'Raw Claude project directory basename' },
     name: { type: 'string', description: 'Filter by tool name' },
     failed: { type: 'boolean', description: 'Show only failed/empty outcomes', default: false },
     turn: { type: 'string', description: 'Filter by turn N or N-M' },
@@ -1141,6 +1612,7 @@ const filesCommand = defineCommand({
   args: {
     session: { type: 'positional', description: 'Session ID (UUID, prefix, or slug)', required: true },
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    'claude-project': { type: 'string', description: 'Raw Claude project directory basename' },
     'group-by': { type: 'string', description: "Group by 'file' (default) or 'turn'" },
     turn: { type: 'string', description: 'Filter by turn N or N-M' },
     operation: { type: 'string', description: 'Filter by operation (read/edit/write/grep/glob)' },
@@ -1227,6 +1699,7 @@ const messagesCommand = defineCommand({
   args: {
     session: { type: 'positional', description: 'Session ID (UUID, prefix, or slug)', required: true },
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    'claude-project': { type: 'string', description: 'Raw Claude project directory basename' },
     role: { type: 'string', description: 'Filter by role (user or assistant)' },
     type: { type: 'string', description: 'Filter by content block type' },
     turn: { type: 'string', description: 'Filter by turn N or N-M' },
@@ -1318,6 +1791,7 @@ const sliceCommand = defineCommand({
   args: {
     session: { type: 'positional', description: 'Session ID (UUID, prefix, or slug)', required: true },
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    'claude-project': { type: 'string', description: 'Raw Claude project directory basename' },
     turn: { type: 'string', description: 'Turn range N or N-M (required)', required: true },
     'max-content': { type: 'string', description: 'Truncate content blocks to N chars' },
   },
@@ -1389,6 +1863,17 @@ export function listSearchTargetsForProject(claudeDir: string, projectRef?: Proj
     }));
 }
 
+export function listSearchTargetsForContext(context: SearchProjectContext): SearchTarget[] {
+  return readdirSync(context.projectRef.claude_dir)
+    .filter(f => f.endsWith('.jsonl'))
+    .map(f => ({
+      filePath: join(context.projectRef.claude_dir, f),
+      sessionId: f.replace('.jsonl', ''),
+      context,
+      projectRef: context.projectRef,
+    }));
+}
+
 export async function mapConcurrent<T, R>(
   items: T[],
   concurrency: number,
@@ -1431,24 +1916,31 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
       if (!timestamp || timestamp > args.before) return { match: null, fileMatchesWithoutWrite };
     }
 
-    const entries = await parseSessionLines(target.filePath);
+    const entries = parseSessionText(text);
     const uaEntries = userAssistantEntries(entries);
+    const sessionContext = target.context ? buildSearchSessionContext(target.context, entries) : null;
 
     const matchedTools = new Set<string>();
     const matchedFiles = new Set<string>();
+    const matchedNormalizedFiles = new Set<string>();
+    const matchedFileEvidence: FileMatchEvidence[] = [];
     const matchedOperations = new Set<SearchOperation>();
+    const matchedToolInputs: ToolInputMatch[] = [];
     const matchedTurns = new Set<number>();
 
     const toolQuery = args.tool?.toLowerCase();
-    const fileQuery = args.file?.toLowerCase();
+    const fileQuery = args.file && sessionContext ? normalizeFileQuery(args.file, sessionContext) : null;
+    const rawFileQuery = args.file?.toLowerCase();
     const textQuery = args.text?.toLowerCase();
     const bashQuery = args.bash?.toLowerCase();
+    const inputQuery = args.inputMatch?.toLowerCase();
     const operationQuery = args.operation;
 
     let toolHit = !toolQuery;
     let fileHit = !fileQuery;
     let textHit = !textQuery;
     let bashHit = !bashQuery;
+    let inputHit = !inputQuery;
 
     for (let ei = 0; ei < uaEntries.length; ei++) {
       const entry = uaEntries[ei]!;
@@ -1465,12 +1957,47 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
           }
         }
 
-        if (fileQuery && block.type === 'tool_use' && block.name) {
+        if ((toolQuery || inputQuery) && block.type === 'tool_use' && block.name) {
+          const input = block.input ?? {};
+          const nameMatches = !toolQuery || block.name.toLowerCase().includes(toolQuery);
+          const inputMatches = !inputQuery || toolInputMatches(input, inputQuery);
+          if (nameMatches && inputMatches) {
+            matchedToolInputs.push({
+              tool: block.name,
+              input_summary: inputSummary(block.name, input),
+              turn: turnNum,
+            });
+            matchedTools.add(block.name);
+            matchedTurns.add(turnNum);
+            if (toolQuery) toolHit = true;
+            if (inputQuery) inputHit = true;
+          }
+        }
+
+        if ((fileQuery || rawFileQuery) && block.type === 'tool_use' && block.name) {
           const fileInfo = extractFilePath(block.name, block.input ?? {});
-          if (fileInfo && fileInfo.path.toLowerCase().includes(fileQuery)) {
+          const access = fileInfo && sessionContext
+            ? normalizeFileAccess(fileInfo.path, fileInfo.operation, sessionContext)
+            : null;
+          const fileMatch = fileInfo && fileQuery && access
+            ? matchFileAccess(fileQuery, access)
+            : {
+                matched: Boolean(fileInfo && rawFileQuery && fileInfo.path.toLowerCase().includes(rawFileQuery)),
+                matchedBy: 'substring' as const,
+                logicalPath: null,
+              };
+          if (fileInfo && fileMatch.matched) {
             if (fileInfo.operation !== 'write') fileMatchesWithoutWrite++;
             if (!operationQuery || fileInfo.operation === operationQuery) {
               matchedFiles.add(fileInfo.path);
+              if (fileMatch.logicalPath) matchedNormalizedFiles.add(fileMatch.logicalPath);
+              matchedFileEvidence.push({
+                rawPath: fileInfo.path,
+                logicalPath: fileMatch.logicalPath,
+                operation: fileInfo.operation,
+                turn: turnNum,
+                timestamp: entry.timestamp ?? null,
+              });
               matchedOperations.add(fileInfo.operation);
               matchedTurns.add(turnNum);
               fileHit = true;
@@ -1499,7 +2026,7 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
       }
     }
 
-    if (!toolHit || !fileHit || !textHit || !bashHit) return { match: null, fileMatchesWithoutWrite };
+    if (!toolHit || !fileHit || !textHit || !bashHit || !inputHit) return { match: null, fileMatchesWithoutWrite };
 
     const match: SearchMatch = {
       session_id: target.sessionId,
@@ -1516,9 +2043,27 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
     if (matchedOperations.size > 0) {
       match.matches.operations = Array.from(matchedOperations);
     }
-    if (target.projectRef) {
-      match.project = target.projectRef.project;
-      match.project_path_guess = target.projectRef.project_path_guess;
+    if (matchedNormalizedFiles.size > 0) {
+      match.matches.normalized_files = Array.from(matchedNormalizedFiles);
+    }
+    if (matchedFileEvidence.length > 0) {
+      match.matches.file_evidence = matchedFileEvidence;
+    }
+    if (matchedToolInputs.length > 0) {
+      match.matches.tool_inputs = matchedToolInputs;
+    }
+    const projectRef = target.context?.projectRef ?? target.projectRef;
+    const exposeProjectRef = target.context ? target.context.role !== 'main' : Boolean(target.projectRef);
+    if (projectRef && exposeProjectRef) {
+      match.project = projectRef.project;
+      match.project_path_guess = projectRef.project_path_guess;
+      match.session_ref = {
+        session_id: target.sessionId,
+        project: projectRef.project,
+      };
+    }
+    if (target.context?.role === 'worktree') {
+      match.project_role = target.context.role;
     }
 
     return { match, fileMatchesWithoutWrite };
@@ -1544,6 +2089,88 @@ export async function scanSearchTargets(targets: SearchTarget[], args: SearchArg
   return { matches, fileMatchesWithoutWrite };
 }
 
+export async function scanProjectContexts(
+  contexts: SearchProjectContext[],
+  args: SearchArgs,
+  afterCutoff: string | null,
+): Promise<SearchScanResult> {
+  const targets: SearchTarget[] = [];
+  for (const context of contexts) {
+    try {
+      targets.push(...listSearchTargetsForContext(context));
+    } catch {
+      // Preserve search's tolerant handling of unreadable Claude project directories.
+    }
+  }
+  return scanSearchTargets(targets, args, afterCutoff);
+}
+
+function compareNullableTimestamp(a: string | null | undefined, b: string | null | undefined, direction: 'asc' | 'desc'): number {
+  if (!a && !b) return 0;
+  if (!a) return 1;
+  if (!b) return -1;
+  return direction === 'asc' ? a.localeCompare(b) : b.localeCompare(a);
+}
+
+function sortedEvidenceTimestamps(match: SearchMatch): string[] {
+  return (match.matches.file_evidence ?? [])
+    .map(evidence => evidence.timestamp)
+    .filter((timestamp): timestamp is string => Boolean(timestamp))
+    .sort();
+}
+
+function matchTimestamp(match: SearchMatch, mode: 'earliest' | 'newest'): string | null {
+  const timestamps = sortedEvidenceTimestamps(match);
+  if (timestamps.length === 0) return match.timestamp;
+  return mode === 'earliest' ? timestamps[0]! : timestamps[timestamps.length - 1]!;
+}
+
+export function sortSearchMatches(matches: SearchMatch[], mode: SearchSortMode): SearchMatch[] {
+  return matches.sort((a, b) => {
+    if (mode === 'match-earliest') {
+      const byMatch = compareNullableTimestamp(matchTimestamp(a, 'earliest'), matchTimestamp(b, 'earliest'), 'asc');
+      if (byMatch !== 0) return byMatch;
+      return compareNullableTimestamp(a.timestamp, b.timestamp, 'desc');
+    }
+
+    if (mode === 'match-newest') {
+      const byMatch = compareNullableTimestamp(matchTimestamp(a, 'newest'), matchTimestamp(b, 'newest'), 'desc');
+      if (byMatch !== 0) return byMatch;
+      return compareNullableTimestamp(a.timestamp, b.timestamp, 'desc');
+    }
+
+    if (mode === 'project') {
+      const projectA = a.project ?? '';
+      const projectB = b.project ?? '';
+      const byProject = projectA.localeCompare(projectB);
+      if (byProject !== 0) return byProject;
+      return compareNullableTimestamp(a.timestamp, b.timestamp, 'desc');
+    }
+
+    return compareNullableTimestamp(a.timestamp, b.timestamp, 'desc');
+  });
+}
+
+export function aggregateSearchMatches(matches: SearchMatch[], mode: SearchAggregateMode): SearchAggregateResult[] {
+  if (mode === 'none') return [];
+  return matches.map(match => {
+    const result: SearchAggregateResult = {
+      session_id: match.session_id,
+      branch: match.branch,
+      timestamp: match.timestamp,
+      slug: match.slug,
+      counts: {
+        tool_inputs: match.matches.tool_inputs?.length ?? 0,
+      },
+      sample_matches: (match.matches.tool_inputs ?? []).slice(0, 5),
+    };
+    if (match.project !== undefined) result.project = match.project;
+    if (match.project_path_guess !== undefined) result.project_path_guess = match.project_path_guess;
+    if (match.project_role !== undefined) result.project_role = match.project_role;
+    return result;
+  });
+}
+
 // ============================================================================
 // Search Command
 // ============================================================================
@@ -1553,7 +2180,9 @@ const searchCommand = defineCommand({
   args: {
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
     'all-projects': { type: 'boolean', description: 'Search all Claude project directories', default: false },
+    'project-glob': { type: 'string', description: 'Filter --all-projects by Claude project identity glob' },
     tool: { type: 'string', description: 'Sessions using a specific tool (case-insensitive substring)' },
+    'input-match': { type: 'string', description: 'Sessions with raw structured tool input containing a case-insensitive substring' },
     file: { type: 'string', description: 'Sessions that touched a file (substring match on path)' },
     text: { type: 'string', description: 'Search in assistant text and thinking content (case-insensitive substring)' },
     bash: { type: 'string', description: 'Search in Bash command inputs (case-insensitive substring)' },
@@ -1562,15 +2191,16 @@ const searchCommand = defineCommand({
     before: { type: 'string', description: 'Sessions before DATE (ISO 8601)' },
     since: { type: 'string', description: 'Sessions from the last duration (e.g. 1d, 2h, 1w)' },
     operation: { type: 'string', description: 'With --file, filter by operation: read/edit/write/grep/glob' },
+    origin: { type: 'boolean', description: 'With --file, return earliest matching write evidence', default: false },
+    sort: { type: 'string', description: 'Sort mode: session-newest, match-earliest, match-newest, project' },
+    aggregate: { type: 'string', description: 'Aggregate mode: count-per-session' },
     last: { type: 'string', description: 'Return only the last N matches' },
   },
   async run({ args }) {
     try {
-      const SCOPED_FILE_WRITE_WARNING = 'No matching file write was found in this project. The file creator may be in another Claude project; try --all-projects --operation write.';
-
       // Validate at least one search filter is provided
-      if (!args.tool && !args.file && !args.text && !args.bash) {
-        throw cliError('INVALID_ARGS', 'At least one search filter is required (--tool, --file, --text, or --bash)');
+      if (!args.tool && !args['input-match'] && !args.file && !args.text && !args.bash) {
+        throw cliError('INVALID_ARGS', 'At least one search filter is required (--tool, --input-match, --file, --text, or --bash)');
       }
 
       // Validate --since and --after mutual exclusivity
@@ -1584,6 +2214,30 @@ const searchCommand = defineCommand({
       if (args.operation && !SEARCH_OPERATIONS.includes(args.operation as SearchOperation)) {
         throw cliError('INVALID_ARGS', '--operation must be one of: read, edit, write, grep, glob');
       }
+      const sortMode = (args.sort ?? 'session-newest') as SearchSortMode;
+      if (!SEARCH_SORT_MODES.includes(sortMode)) {
+        throw cliError('INVALID_ARGS', '--sort must be one of: session-newest, match-earliest, match-newest, project');
+      }
+      const aggregateMode = (args.aggregate ?? 'none') as SearchAggregateMode;
+      if (aggregateMode !== 'none' && aggregateMode !== 'count-per-session') {
+        throw cliError('INVALID_ARGS', '--aggregate must be count-per-session');
+      }
+      if (aggregateMode !== 'none' && !args.tool && !args['input-match']) {
+        throw cliError('INVALID_ARGS', '--aggregate requires --tool or --input-match');
+      }
+
+      const origin = Boolean(args.origin);
+      if (origin) {
+        if (!args.file) {
+          throw cliError('INVALID_ARGS', '--origin requires --file');
+        }
+        if (args.operation && args.operation !== 'write') {
+          throw cliError('INVALID_ARGS', '--origin implies --operation write');
+        }
+        if (args.sort && args.sort !== 'match-earliest') {
+          throw cliError('INVALID_ARGS', '--origin uses --sort match-earliest');
+        }
+      }
 
       const afterCutoff = args.since ? parseSince(args.since) : args.after ?? null;
       const lastN = parseIntArg(args.last, '--last');
@@ -1593,6 +2247,7 @@ const searchCommand = defineCommand({
 
       const searchArgs: SearchArgs = {
         tool: args.tool,
+        inputMatch: args['input-match'],
         file: args.file,
         text: args.text,
         bash: args.bash,
@@ -1600,72 +2255,41 @@ const searchCommand = defineCommand({
         after: args.after,
         before: args.before,
         since: args.since,
-        operation: args.operation as SearchOperation | undefined,
+        operation: origin ? 'write' : args.operation as SearchOperation | undefined,
       };
 
       const allProjects = Boolean(args['all-projects']);
       const results: SearchMatch[] = [];
-      let projectsScanned: number | undefined;
-      let scopedFileMatchesWithoutWrite = 0;
-      let scopedRelatedProjects: ProjectRef[] | undefined;
-
-      if (allProjects) {
-        const refs = listClaudeProjectRefs();
-        projectsScanned = refs.length;
-        const targets: SearchTarget[] = [];
-        for (const projectRef of refs) {
-          try {
-            targets.push(...listSearchTargetsForProject(projectRef.claude_dir, projectRef));
-          } catch {
-            // Match the existing all-project behavior: skip unreadable project directories.
-          }
-        }
-        const scanResult = await scanSearchTargets(targets, searchArgs, afterCutoff);
-        results.push(...scanResult.matches);
-      } else {
-        const projectPath = args.project || process.cwd();
-        const claudeDir = resolveClaudeProjectDir(projectPath);
-        const targets = listSearchTargetsForProject(claudeDir);
-        const { matches, fileMatchesWithoutWrite } = await scanSearchTargets(targets, searchArgs, afterCutoff);
-        scopedFileMatchesWithoutWrite = fileMatchesWithoutWrite;
-        if (args.file) {
-          const relatedProjects = findRelatedProjectRefs(projectPath, listClaudeProjectRefs());
-          if (relatedProjects.length > 0) {
-            scopedRelatedProjects = relatedProjects;
-          }
-        }
-        results.push(...matches);
+      if (args['project-glob'] && !allProjects) {
+        throw cliError('INVALID_ARGS', '--project-glob requires --all-projects');
       }
 
-      // Sort newest first; null timestamps sort to end
-      results.sort((a, b) => {
-        if (!a.timestamp && !b.timestamp) return 0;
-        if (!a.timestamp) return 1;
-        if (!b.timestamp) return -1;
-        return b.timestamp.localeCompare(a.timestamp);
+      const selection = selectProjectContexts({
+        mode: allProjects ? 'all-projects' : 'scoped-with-worktrees',
+        projectPath: args.project || process.cwd(),
+        projectGlob: args['project-glob'],
       });
+      const scanResult = await scanProjectContexts(selection.contexts, searchArgs, afterCutoff);
+      results.push(...scanResult.matches);
+
+      sortSearchMatches(results, origin ? 'match-earliest' : sortMode);
 
       // Apply --last limit after sorting
       const total = results.length;
-      const returned = lastN != null ? results.slice(0, lastN) : results;
+      const resultLimit = origin ? lastN ?? 1 : lastN;
+      const returned = resultLimit != null ? results.slice(0, resultLimit) : results;
       const responseMeta: SearchMeta = meta(total, returned.length);
-      if (projectsScanned != null) {
-        responseMeta.projects_scanned = projectsScanned;
+      if (allProjects) {
+        responseMeta.projects_scanned = selection.contexts.length;
+        responseMeta.included_projects = selection.includedProjects;
+        responseMeta.skipped_projects = selection.skippedProjects;
+      } else {
+        responseMeta.included_projects = selection.includedProjects;
       }
-      if (scopedRelatedProjects) {
-        responseMeta.related_projects = scopedRelatedProjects;
-      }
-      if (
-        !allProjects &&
-        args.file &&
-        !args.operation &&
-        total > 0 &&
-        scopedFileMatchesWithoutWrite > 0 &&
-        !results.some(result => result.matches.operations?.includes('write'))
-      ) {
-        responseMeta.warning = SCOPED_FILE_WRITE_WARNING;
-      }
-      output(success(returned, responseMeta));
+      output(success(
+        aggregateMode === 'count-per-session' ? aggregateSearchMatches(returned, aggregateMode) : returned,
+        responseMeta,
+      ));
     } catch (err: unknown) {
       handleCommandError(err);
     }
@@ -1681,6 +2305,7 @@ const subagentsCommand = defineCommand({
   args: {
     session: { type: 'positional', description: 'Parent session ID', required: true },
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    'claude-project': { type: 'string', description: 'Raw Claude project directory basename' },
   },
   async run({ args }) {
     try {
@@ -1688,7 +2313,7 @@ const subagentsCommand = defineCommand({
       if (args.session.includes(':')) {
         throw cliError('INVALID_ARGS', 'subagents command takes a parent session ID, not a subagent reference');
       }
-      const claudeDir = resolveClaudeProjectDir(args.project || process.cwd());
+      const claudeDir = resolveClaudeProjectDirFromSelector(sessionProjectSelectorFromArgs(args));
       const { sessionId } = await resolveSessionFile(claudeDir, args.session);
       const subagents = await listSubagents(claudeDir, sessionId);
       const result: SubagentsResult = { session_id: sessionId, subagents };
