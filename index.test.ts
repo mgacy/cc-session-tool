@@ -2,6 +2,7 @@ import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { basename, join } from 'path';
 import { tmpdir } from 'os';
+import { randomUUID } from 'crypto';
 import {
   ERROR_CODES, success, failure, CliError, isCliError,
   parseTurnRange, truncateContent, inputSummary, determineOutcome, parseIntArg,
@@ -19,9 +20,16 @@ import {
 } from './index.ts';
 import {
   applyTruncationPolicy,
+  buildSessionSummary,
   contentBlocksForEntry,
+  countNonEmptyLines,
+  extractSessionIntent,
   extractSessionMetadata as extractTranscriptSessionMetadata,
+  parseSessionLines as parseTranscriptSessionLines,
+  parseSessionText as parseTranscriptSessionText,
   normalizedBlocks,
+  resolveByIdOrSlug as resolveTranscriptByIdOrSlug,
+  resolveSessionFile as resolveTranscriptSessionFile,
   resolveSessionWithText,
 } from './src/transcript.ts';
 import {
@@ -43,6 +51,10 @@ import {
   type SearchMeta,
 } from './src/search.ts';
 
+function uniqueTempName(prefix: string): string {
+  return `${prefix}-${randomUUID()}`;
+}
+
 // ============================================================================
 // Search Module Primitives
 // ============================================================================
@@ -55,16 +67,17 @@ describe('search matcher primitives', () => {
     expect(testTextMatcher(null, 'anything')).toBe(true);
   });
 
-  test('regex matcher is case-insensitive and rejects invalid patterns', () => {
+  test('regex matcher is case-sensitive and rejects invalid patterns', () => {
     const matcher = parseRegexMatcher('foo\\s+bar', '--text-regex');
-    expect(testTextMatcher(matcher, 'FOO   bar')).toBe(true);
+    expect(testTextMatcher(matcher, 'foo   bar')).toBe(true);
+    expect(testTextMatcher(matcher, 'FOO   bar')).toBe(false);
     expect(() => parseRegexMatcher('[', '--text-regex')).toThrow('Invalid --text-regex regex');
   });
 
   test('snippetForMatch centers around substring and regex matches', () => {
     const value = '0123456789abcdefghijKLMNOPQRSTuvwxyz';
     expect(snippetForMatch(value, parseSubstringMatcher('KLM')!, 10)).toContain('KLM');
-    expect(snippetForMatch(value, parseRegexMatcher('mnop', '--sample')!, 12)).toBe('ijKLMNOPQRST');
+    expect(snippetForMatch(value, parseRegexMatcher('MNOP', '--sample')!, 12)).toBe('ijKLMNOPQRST');
   });
 
   test('parseCounterArgs handles repeated substring and regex counters', () => {
@@ -556,7 +569,7 @@ describe('Claude project discovery helpers', () => {
   });
 
   test('listClaudeProjectRefs returns directories and skips files', () => {
-    const unique = `cc-session-tool-project-refs-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-project-refs');
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const dirProject = `-${unique}-dir`;
     const worktreeProject = `-${unique}-worktree`;
@@ -668,7 +681,7 @@ describe('Claude project discovery helpers', () => {
   });
 
   test('buildScopedSearchScope returns main context only when worktrees are excluded', () => {
-    const unique = `cc-session-tool-scope-main-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-scope-main');
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const projectPath = join(tmpdir(), unique, 'repo');
     const claudeDir = join(root, mangleProjectPath(projectPath));
@@ -697,7 +710,7 @@ describe('Claude project discovery helpers', () => {
   });
 
   test('buildScopedSearchScope includes both related hyphenated worktree refs without reverse-mangling', () => {
-    const unique = `cc-session-tool-scope-worktree-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-scope-worktree');
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const projectPath = join(tmpdir(), unique, 'cc-session-tool', 'cc-session-tool');
     const mainProject = mangleProjectPath(projectPath);
@@ -725,7 +738,7 @@ describe('Claude project discovery helpers', () => {
   });
 
   test('buildScopedSearchScope tolerates a missing Claude projects root after main project resolves', () => {
-    const unique = `cc-session-tool-scope-missing-root-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-scope-missing-root');
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const projectPath = join(tmpdir(), unique, 'repo');
     mkdirSync(join(root, mangleProjectPath(projectPath)), { recursive: true });
@@ -743,7 +756,7 @@ describe('Claude project discovery helpers', () => {
   });
 
   test('listSearchTargetsForContext includes context on targets', () => {
-    const unique = `cc-session-tool-target-context-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-target-context');
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const projectPath = join(tmpdir(), unique, 'repo');
     const claudeDir = join(root, mangleProjectPath(projectPath));
@@ -773,7 +786,7 @@ describe('Claude project discovery helpers', () => {
       worktreeRoot: null,
       projectRef: {
         project: '-tmp-missing-project',
-        claude_dir: join(tmpdir(), `cc-session-tool-missing-${Date.now()}`),
+        claude_dir: join(tmpdir(), uniqueTempName('cc-session-tool-missing')),
         project_path_guess: '/tmp/missing/project',
       },
     };
@@ -795,7 +808,7 @@ describe('Claude project discovery helpers', () => {
   });
 
   test('selectProjectContexts filters all-project contexts and reports skipped projects', () => {
-    const unique = `cc-session-tool-selection-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-selection');
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const projectA = '/tmp/project-alpha';
     const projectB = '/tmp/project-beta';
@@ -1078,7 +1091,7 @@ describe('Claude project discovery helpers', () => {
   });
 
   test('logical file matching uses realpath candidates for supplied project roots', () => {
-    const unique = `cc-session-tool-realpath-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-realpath');
     const root = join(tmpdir(), unique);
     const realProject = join(root, 'real-project');
     const linkedProject = join(root, 'linked-project');
@@ -1105,7 +1118,7 @@ describe('Claude project discovery helpers', () => {
   });
 
   test('canonical file matching equates symlinked main and worktree paths', () => {
-    const unique = `cc-session-tool-canonical-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-canonical');
     const root = join(tmpdir(), unique);
     const projectRoot = join(root, 'repo');
     const worktreeRoot = join(projectRoot, '.claude', 'worktrees', 'feature-a');
@@ -1303,7 +1316,7 @@ describe('resolveClaudeProjectDir', () => {
   });
 
   test('resolves against an explicit Claude projects root', () => {
-    const unique = `cc-session-tool-resolve-root-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-resolve-root');
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const projectPath = join(tmpdir(), unique, 'project');
     const claudeDir = join(root, mangleProjectPath(projectPath));
@@ -1317,7 +1330,7 @@ describe('resolveClaudeProjectDir', () => {
   });
 
   test('resolves project paths with trailing slashes to the same Claude directory', () => {
-    const unique = `cc-session-tool-resolve-trailing-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-resolve-trailing');
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const projectPath = join(tmpdir(), unique, 'project');
     const claudeDir = join(root, mangleProjectPath(projectPath));
@@ -1351,12 +1364,12 @@ describe('CLI', () => {
 // Integration Tests with Fixture Data
 // ============================================================================
 
-const FIXTURE_DIR = join(tmpdir(), `cc-session-test-${Date.now()}`);
+const FIXTURE_DIR = join(tmpdir(), uniqueTempName('cc-session-test'));
 const FIXTURE_HOME = join(FIXTURE_DIR, 'home');
 const FIXTURE_CLAUDE_PROJECTS_ROOT = claudeProjectsRoot(FIXTURE_HOME);
 const FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project');
 const SECOND_FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project-worktree');
-const RELATED_PROJECT = join(tmpdir(), `ccsessionrelated${Date.now()}`);
+const RELATED_PROJECT = join(tmpdir(), `ccsessionrelated${randomUUID().replace(/-/g, '')}`);
 const RELATED_WORKTREE_ROOT = join(RELATED_PROJECT, '.claude', 'worktrees', 'feature');
 const fakeDirName = mangleProjectPath(FAKE_PROJECT);
 const secondFakeDirName = mangleProjectPath(SECOND_FAKE_PROJECT);
@@ -1951,7 +1964,7 @@ function parseOutput(stdout: string) {
 
 describe('scanSearchTarget', () => {
   test('no-context file filters require a matching raw file access', async () => {
-    const unique = `cc-session-tool-no-context-search-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-no-context-search');
     const root = join(tmpdir(), unique);
     const sessionId = '11111111-2222-3333-4444-555555555555';
     const sessionFile = join(root, `${sessionId}.jsonl`);
@@ -2659,6 +2672,118 @@ describe('transcript module foundation', () => {
     expect(result.metadata.branch).toBe('main');
   });
 
+  test('transcript parser and line counter handle empty, malformed, and valid rows', async () => {
+    expect(parseTranscriptSessionText('')).toEqual([]);
+    expect(() => parseTranscriptSessionText('not json\n')).toThrow('Session file contains no valid entries');
+    expect(countNonEmptyLines('\n one \n\n two')).toBe(2);
+
+    const filePath = join(CLAUDE_DIR, 'transcript-module-parse.jsonl');
+    writeFileSync(filePath, [
+      '',
+      'not json',
+      JSON.stringify({ type: 'user', message: { content: 'valid row' } }),
+      JSON.stringify({ nope: true }),
+    ].join('\n'));
+
+    expect(await parseTranscriptSessionLines(filePath)).toEqual([
+      { type: 'user', message: { content: 'valid row' } },
+    ]);
+  });
+
+  test('transcript intent extraction includes slug, first prompt token, and first message', () => {
+    const intents = extractSessionIntent([
+      { type: 'assistant', message: { content: 'ignored assistant first' } },
+      { type: 'user', message: { content: '/plan install packages' } },
+    ], { slug: 'module-slug' });
+
+    expect(intents).toEqual([
+      { source: 'slug', value: 'module-slug' },
+      { source: 'first_prompt', value: '/plan' },
+      { source: 'first_message', value: '/plan install packages' },
+    ]);
+  });
+
+  test('transcript resolver handles prefix, slug, ambiguity, missing, and subagent targets', async () => {
+    expect(await resolveTranscriptByIdOrSlug(CLAUDE_DIR, SESSION_ID.slice(0, 8)))
+      .toBe(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`));
+    expect(await resolveTranscriptByIdOrSlug(CLAUDE_DIR, 'late-slug-test'))
+      .toBe(join(CLAUDE_DIR, `${SESSION_ID_5}.jsonl`));
+
+    await expect(resolveTranscriptByIdOrSlug(CLAUDE_DIR, 'test-slug-fixture'))
+      .rejects.toThrow('Ambiguous slug');
+    await expect(resolveTranscriptByIdOrSlug(CLAUDE_DIR, 'no-such-session'))
+      .rejects.toThrow('No session found');
+    await expect(resolveTranscriptByIdOrSlug(CLAUDE_DIR, '../bad'))
+      .rejects.toThrow('Invalid session ID');
+
+    expect(await resolveTranscriptSessionFile(CLAUDE_DIR, `${SESSION_ID}:${SUBAGENT_ID}`)).toEqual({
+      filePath: join(CLAUDE_DIR, SESSION_ID, 'subagents', `agent-${SUBAGENT_ID}.jsonl`),
+      sessionId: SESSION_ID,
+      agentId: SUBAGENT_ID,
+    });
+    await expect(resolveTranscriptSessionFile(CLAUDE_DIR, `${SESSION_ID}:bad/id`))
+      .rejects.toThrow('Invalid agent ID');
+    await expect(resolveTranscriptSessionFile(CLAUDE_DIR, `${SESSION_ID}:missing`))
+      .rejects.toThrow('No subagent');
+  });
+
+  test('buildSessionSummary computes snippets, timing, tool counts, file counts, and subagents', () => {
+    const longPrompt = 'x'.repeat(450);
+    const summary = buildSessionSummary({
+      sessionId: SESSION_ID,
+      agentId: null,
+      lineCount: 4,
+      metadata: {
+        branch: 'main',
+        timestamp: '2026-01-01T00:00:00.000Z',
+        version: '1.0.0',
+        slug: 'summary-slug',
+        model: 'claude-sonnet-4-5',
+      },
+      subagents: [{ agent_id: SUBAGENT_ID, agent_type: 'worker', description: 'does work', lines: 5, timestamp: '2026-01-01T00:00:04.000Z' }],
+      entries: [
+        { type: 'system', timestamp: '2026-01-01T00:00:00.000Z' },
+        { type: 'user', timestamp: '2026-01-01T00:00:01.000Z', message: { content: longPrompt } },
+        {
+          type: 'assistant',
+          timestamp: '2026-01-01T00:00:03.000Z',
+          message: {
+            content: [
+              { type: 'tool_use', name: 'Read', id: 'read_1', input: { file_path: 'a.ts' } },
+              { type: 'tool_use', name: 'Edit', id: 'edit_1', input: { file_path: 'a.ts' } },
+              { type: 'tool_use', name: 'Write', id: 'write_1', input: { file_path: 'b.ts' } },
+              { type: 'tool_use', name: 'Grep', id: 'grep_1', input: { path: 'src' } },
+              { type: 'tool_use', name: 'Glob', id: 'glob_1', input: { path: 'src' } },
+              { type: 'tool_use', name: 'Bash', id: 'bash_1', input: { command: 'bun test' } },
+              { type: 'text', text: 'done' },
+            ],
+          },
+        },
+      ],
+    });
+
+    expect(summary).toMatchObject({
+      session_id: SESSION_ID,
+      agent_id: null,
+      branch: 'main',
+      model: 'claude-sonnet-4-5',
+      started_at: '2026-01-01T00:00:00.000Z',
+      ended_at: '2026-01-01T00:00:03.000Z',
+      duration_ms: 3000,
+      turn_count: 2,
+      lines: 4,
+      slug: 'summary-slug',
+      last_assistant_text: { turn: 2, snippet: 'done' },
+      tool_counts: { Read: 1, Edit: 1, Write: 1, Grep: 1, Glob: 1, Bash: 1 },
+      files_touched: { read: 1, edit: 1, write: 1, grep: 1, glob: 1 },
+      subagents: [{ agent_id: SUBAGENT_ID, agent_type: 'worker', description: 'does work', lines: 5, timestamp: '2026-01-01T00:00:04.000Z' }],
+    });
+    expect(summary.first_user_prompt).toEqual({
+      turn: 1,
+      snippet: `${'x'.repeat(400)}...[truncated, 450 chars]`,
+    });
+  });
+
   test('applyTruncationPolicy centralizes per-kind max character behavior', () => {
     expect(applyTruncationPolicy('hello world', { textMaxChars: 5 }, 'text'))
       .toBe('hello...[truncated, 11 chars]');
@@ -2671,7 +2796,7 @@ describe('transcript module foundation', () => {
 
 describe('project-selection module foundation', () => {
   test('module project scope helpers preserve existing target shape', () => {
-    const unique = `cc-session-tool-module-target-${Date.now()}`;
+    const unique = uniqueTempName('cc-session-tool-module-target');
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const projectPath = join(tmpdir(), unique, 'repo');
     const claudeDir = join(root, mangleProjectPathModule(projectPath));

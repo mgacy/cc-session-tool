@@ -23,7 +23,7 @@ bun run build
 
 ### Session Identifiers
 
-All commands except `list` require a `<session>` argument. Three forms are accepted:
+Session-scoped commands require a `<session>` argument; `list` and `projects` do not. Three forms are accepted:
 
 | Form        | Example                                | Resolution                                             |
 | ----------- | -------------------------------------- | ------------------------------------------------------ |

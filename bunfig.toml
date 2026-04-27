@@ -1,0 +1,5 @@
+[test]
+# index.ts is validated by spawned CLI integration tests. Bun's coverage runner
+# does not attribute child-process execution back to the parent test process, so
+# coverage gating focuses on the modules exercised in-process.
+coveragePathIgnorePatterns = ["index.ts"]

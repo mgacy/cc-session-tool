@@ -186,7 +186,7 @@ export function parseRegexMatcher(raw: string | undefined, flagName: string): Te
     return {
       raw,
       mode: 'regex',
-      regex: new RegExp(raw, 'i'),
+      regex: new RegExp(raw),
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
