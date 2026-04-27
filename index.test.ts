@@ -1,6 +1,6 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { basename, join } from 'path';
 import { tmpdir } from 'os';
 import {
   ERROR_CODES, success, failure, CliError, isCliError,
@@ -17,6 +17,207 @@ import {
   extractWorktreeStatePaths, collectObservedWorktreeRoots, absolutePathCandidatesFor,
   scanSearchTarget,
 } from './index.ts';
+import {
+  applyTruncationPolicy,
+  contentBlocksForEntry,
+  extractSessionMetadata as extractTranscriptSessionMetadata,
+  normalizedBlocks,
+  resolveSessionWithText,
+} from './src/transcript.ts';
+import {
+  buildScopedSearchScope as buildScopedSearchScopeModule,
+  listSearchTargetsForContext as listSearchTargetsForContextModule,
+  mangleProjectPath as mangleProjectPathModule,
+} from './src/project-selection.ts';
+import {
+  aggregateCounterRows,
+  attachCounterTranscriptResults,
+  bucketCounterRows,
+  evidenceTimestamps,
+  parseCounterArgs,
+  parseRegexMatcher,
+  parseSubstringMatcher,
+  snippetForMatch,
+  testTextMatcher,
+  type SearchMatch,
+  type SearchMeta,
+} from './src/search.ts';
+
+// ============================================================================
+// Search Module Primitives
+// ============================================================================
+
+describe('search matcher primitives', () => {
+  test('substring matcher is case-insensitive and null matcher passes', () => {
+    const matcher = parseSubstringMatcher('Needle');
+    expect(testTextMatcher(matcher, 'haystack needle value')).toBe(true);
+    expect(testTextMatcher(matcher, 'haystack value')).toBe(false);
+    expect(testTextMatcher(null, 'anything')).toBe(true);
+  });
+
+  test('regex matcher is case-insensitive and rejects invalid patterns', () => {
+    const matcher = parseRegexMatcher('foo\\s+bar', '--text-regex');
+    expect(testTextMatcher(matcher, 'FOO   bar')).toBe(true);
+    expect(() => parseRegexMatcher('[', '--text-regex')).toThrow('Invalid --text-regex regex');
+  });
+
+  test('snippetForMatch centers around substring and regex matches', () => {
+    const value = '0123456789abcdefghijKLMNOPQRSTuvwxyz';
+    expect(snippetForMatch(value, parseSubstringMatcher('KLM')!, 10)).toContain('KLM');
+    expect(snippetForMatch(value, parseRegexMatcher('mnop', '--sample')!, 12)).toBe('ijKLMNOPQRST');
+  });
+
+  test('parseCounterArgs handles repeated substring and regex counters', () => {
+    const counters = parseCounterArgs(['reads=Read', 'writes=Write=file'], 'bash=\\brg\\b');
+    expect(counters.map(counter => ({
+      name: counter.name,
+      source: counter.source,
+      mode: counter.matcher.mode,
+      raw: counter.matcher.raw,
+    }))).toEqual([
+      { name: 'reads', source: 'substring', mode: 'substring', raw: 'Read' },
+      { name: 'writes', source: 'substring', mode: 'substring', raw: 'Write=file' },
+      { name: 'bash', source: 'regex', mode: 'regex', raw: '\\brg\\b' },
+    ]);
+  });
+
+  test('parseCounterArgs rejects malformed and reserved counter names', () => {
+    expect(() => parseCounterArgs('missingSeparator', undefined)).toThrow('expected NAME=PATTERN');
+    expect(() => parseCounterArgs('1bad=value', undefined)).toThrow('Invalid counter name');
+    expect(() => parseCounterArgs('constructor=value', undefined)).toThrow('reserved name');
+    expect(() => parseCounterArgs(undefined, 'rx=[')).toThrow('Invalid --counter-regex rx regex');
+  });
+
+  test('evidenceTimestamps filters by kind and sorts timestamps', () => {
+    const match: SearchMatch = {
+      session_id: 's1',
+      branch: null,
+      timestamp: '2026-03-01T00:00:00.000Z',
+      slug: null,
+      model: null,
+      session_ref: { session_id: 's1', project: '-tmp-project' },
+      matches: {
+        tools: [],
+        files: [],
+        turns: [1, 2],
+        evidence: [
+          { kind: 'tool_input', turn: 1, block_index: 0, timestamp: '2026-03-03T00:00:00.000Z', tool: 'Read' },
+          { kind: 'file', turn: 2, block_index: 0, timestamp: '2026-03-02T00:00:00.000Z', rawPath: 'a.ts', operation: 'read' },
+          { kind: 'file', turn: 3, block_index: 0, timestamp: null, rawPath: 'b.ts', operation: 'write' },
+        ],
+      },
+    };
+    expect(evidenceTimestamps(match)).toEqual([
+      '2026-03-02T00:00:00.000Z',
+      '2026-03-03T00:00:00.000Z',
+    ]);
+    expect(evidenceTimestamps(match, 'file')).toEqual(['2026-03-02T00:00:00.000Z']);
+  });
+
+  test('SearchMeta contains only active search metadata fields', () => {
+    const meta: SearchMeta = {
+      total: 0,
+      returned: 0,
+      hasMore: false,
+      projects_scanned: 1,
+      included_projects: [],
+      skipped_projects: [],
+    };
+    expect(meta).not.toHaveProperty('warning');
+    expect(meta).not.toHaveProperty('related_projects');
+    expect(meta).not.toHaveProperty('project');
+  });
+
+  test('counter aggregation uses complete raw tool calls, session_ref keys, and parent rollup', () => {
+    const match: SearchMatch = {
+      session_id: 'parent-session',
+      branch: 'main',
+      timestamp: '2026-03-05T12:00:00.000Z',
+      slug: '/plan-counter-test',
+      model: 'claude-sonnet-4-5',
+      project_path_guess: '/workspace/project',
+      project_role: 'worktree',
+      session_ref: { session_id: 'parent-session', project: '-workspace-project' },
+      matches: { tools: [], files: [], turns: [], evidence: [] },
+    };
+    attachCounterTranscriptResults(match, [
+      {
+        target: { filePath: '/tmp/parent.jsonl', sessionId: 'parent-session', parentSessionId: null, agentId: null },
+        metadata: { branch: 'main', timestamp: '2026-03-05T12:00:00.000Z', version: null, slug: '/plan-counter-test', model: 'claude-sonnet-4-5' },
+        allToolCalls: [
+          { turn: 1, block_index: 0, timestamp: '2026-03-05T12:01:00.000Z', tool: 'Bash', input_summary: 'rg', rawInput: { command: 'rg .claude-tracking' }, agentId: null, parentSessionId: null, isSubagent: false },
+        ],
+      },
+      {
+        target: { filePath: '/tmp/sub.jsonl', sessionId: 'parent-session', parentSessionId: 'parent-session', agentId: 'agent_a' },
+        metadata: { branch: 'main', timestamp: null, version: null, slug: null, model: null },
+        allToolCalls: [
+          { turn: 1, block_index: 0, timestamp: null, tool: 'Bash', input_summary: 'find', rawInput: { command: 'find .claude-tracking -name implementation.md' }, agentId: 'agent_a', parentSessionId: 'parent-session', isSubagent: true },
+          { turn: 2, block_index: 0, timestamp: null, tool: 'Read', input_summary: 'file', rawInput: { file_path: '.claude-tracking/011/progress.json' }, agentId: 'agent_a', parentSessionId: 'parent-session', isSubagent: true },
+        ],
+      },
+    ]);
+
+    const counters = parseCounterArgs('tracking=.claude-tracking', 'find_cmd=^\\{\"command\":\"find');
+    const rows = aggregateCounterRows([match], counters, { explicitSelector: false, perSubagent: false, tool: 'Bash' });
+    expect(rows).toEqual([
+      expect.objectContaining({
+        session_id: 'parent-session',
+        project: '-workspace-project',
+        project_path_guess: '/workspace/project',
+        project_role: 'worktree',
+        session_ref: { session_id: 'parent-session', project: '-workspace-project' },
+        counts: { tracking: 2, find_cmd: 1 },
+        total_matches: 3,
+      }),
+    ]);
+  });
+
+  test('counter aggregation supports zero-count selectors, per-subagent rows, and buckets', () => {
+    const match: SearchMatch = {
+      session_id: 'bucket-session',
+      branch: 'main',
+      timestamp: '2026-03-08T12:00:00.000Z',
+      slug: null,
+      model: null,
+      session_ref: { session_id: 'bucket-session', project: '-workspace-bucket' },
+      matches: { tools: [], files: [], turns: [], evidence: [] },
+    };
+    attachCounterTranscriptResults(match, [
+      {
+        target: { filePath: '/tmp/parent.jsonl', sessionId: 'bucket-session', parentSessionId: null, agentId: null },
+        metadata: { branch: 'main', timestamp: '2026-03-08T12:00:00.000Z', version: null, slug: null, model: null },
+        allToolCalls: [],
+      },
+      {
+        target: { filePath: '/tmp/sub.jsonl', sessionId: 'bucket-session', parentSessionId: 'bucket-session', agentId: 'agent_b' },
+        metadata: { branch: 'main', timestamp: null, version: null, slug: null, model: null },
+        allToolCalls: [
+          { turn: 1, block_index: 0, timestamp: null, tool: 'Bash', input_summary: 'rg', rawInput: { command: 'rg bucket-marker' }, agentId: 'agent_b', parentSessionId: 'bucket-session', isSubagent: true },
+        ],
+      },
+    ]);
+
+    const counters = parseCounterArgs('marker=bucket-marker', undefined);
+    expect(aggregateCounterRows([match], counters, { explicitSelector: false, perSubagent: true }).map(row => row.agent_id)).toEqual(['agent_b']);
+
+    const rows = aggregateCounterRows([match], counters, { explicitSelector: true, perSubagent: true });
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ counts: { marker: 0 }, total_matches: 0 });
+    expect(rows[1]).toMatchObject({
+      agent_id: 'agent_b',
+      parent_session_id: 'bucket-session',
+      is_subagent: true,
+      session_ref: { session_id: 'bucket-session', project: '-workspace-bucket', agent_id: 'agent_b' },
+      counts: { marker: 1 },
+    });
+    expect(bucketCounterRows(rows, 'day')).toEqual([
+      { bucket: '2026-03-08', sessions: 1, counts: { marker: 0 }, total_matches: 0 },
+      { bucket: 'unknown', sessions: 1, counts: { marker: 1 }, total_matches: 1 },
+    ]);
+    expect(bucketCounterRows(rows, 'week')[0]!.bucket).toBe('2026-03-02');
+  });
+});
 
 // ============================================================================
 // Response Helpers
@@ -1233,6 +1434,7 @@ function makeFixtureLines(): string[] {
       slug: 'parent-subagent-test',
       message: {
         role: 'assistant',
+        model: 'claude-sonnet-4-5',
         content: [
           { type: 'thinking', thinking: 'Let me think about this carefully and determine the best approach for the user.' },
           { type: 'tool_use', name: 'Grep', id: 'tool_1', input: { pattern: 'hello', path: 'src/' } },
@@ -1382,7 +1584,7 @@ beforeAll(() => {
       gitBranch: 'feature',
       version: '2.1.0',
       slug: 'test-slug-fixture',
-      message: { role: 'user', content: 'Second session' },
+      message: { role: 'user', content: [{ type: 'text', text: 'User array content marker for text search.' }] },
     }),
     JSON.stringify({
       type: 'assistant',
@@ -1403,14 +1605,14 @@ beforeAll(() => {
     JSON.stringify({
       type: 'user', sessionId: SESSION_ID_3, timestamp: '2026-03-03T10:00:00.000Z',
       gitBranch: 'main', version: '2.1.0', slug: 'multi-block-test',
-      message: { role: 'user', content: 'Test multi-block' },
+      message: { role: 'user', content: 'Test multi-block /plan intent' },
     }),
     JSON.stringify({
       type: 'assistant', timestamp: '2026-03-03T10:01:00.000Z',
       message: {
         role: 'assistant',
         content: [
-          { type: 'thinking', thinking: 'Considering the approach...' },
+          { type: 'thinking', thinking: `Considering the approach... ${'x'.repeat(260)}` },
           { type: 'text', text: 'Here is my answer.' },
         ],
         usage: { input_tokens: 50, output_tokens: 25 },
@@ -1423,7 +1625,7 @@ beforeAll(() => {
     JSON.stringify({
       type: 'user', sessionId: SESSION_ID_4, timestamp: '2026-03-04T10:00:00.000Z',
       gitBranch: 'main', version: '2.1.0', slug: 'bash-test-session',
-      message: { role: 'user', content: 'Install express' },
+      message: { role: 'user', content: '/plan Install express' },
     }),
     JSON.stringify({
       type: 'assistant', timestamp: '2026-03-04T10:01:00.000Z',
@@ -1449,6 +1651,30 @@ beforeAll(() => {
     }),
   ];
   writeFileSync(join(CLAUDE_DIR, `${SESSION_ID_4}.jsonl`), lines4.join('\n') + '\n');
+  const counterSubagentDir = join(CLAUDE_DIR, SESSION_ID_4, 'subagents');
+  mkdirSync(counterSubagentDir, { recursive: true });
+  const counterSubagentLines = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: SESSION_ID_4,
+      timestamp: '2026-03-04T10:03:00.000Z',
+      gitBranch: 'main',
+      version: '2.1.0',
+      message: { role: 'user', content: 'Count tracking usage' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-04T10:04:00.000Z',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Bash', id: 'tool_counter_bash_1', input: { command: 'rg .claude-tracking implementation.md' } },
+        ],
+        usage: { input_tokens: 30, output_tokens: 10 },
+      },
+    }),
+  ];
+  writeFileSync(join(counterSubagentDir, `agent-counter_agent.jsonl`), counterSubagentLines.join('\n') + '\n');
 
   const lateSlugLines = [
     LATE_SLUG_FIRST_LINE,
@@ -1692,9 +1918,28 @@ function runCli(args: string[]): Promise<{ exitCode: number; stdout: string; std
       stdout: 'pipe',
       stderr: 'pipe',
     });
+    const stdoutPromise = new Response(proc.stdout).text();
+    const stderrPromise = new Response(proc.stderr).text();
     const exitCode = await proc.exited;
-    const stdout = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
+    const stdout = await stdoutPromise;
+    const stderr = await stderrPromise;
+    resolve({ exitCode, stdout, stderr });
+  });
+}
+
+function runCliHelp(args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return new Promise(async (resolve) => {
+    const proc = Bun.spawn(['bun', 'run', 'index.ts', ...args], {
+      cwd: import.meta.dir,
+      env: { ...process.env, HOME: FIXTURE_HOME, NODE_ENV: 'development' },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stdoutPromise = new Response(proc.stdout).text();
+    const stderrPromise = new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    const stdout = await stdoutPromise;
+    const stderr = await stderrPromise;
     resolve({ exitCode, stdout, stderr });
   });
 }
@@ -1836,6 +2081,66 @@ describe('list integration', () => {
     expect(result.error.message).toContain('mutually exclusive');
   });
 
+  test('scoped list includes associated worktree projects by default and exposes session_ref handles', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBe(3);
+    expect(result._meta.included_projects).toEqual([
+      {
+        project: relatedDirName,
+        project_path_guess: RELATED_PROJECT,
+        project_role: 'main',
+      },
+      {
+        project: relatedDoubleDashWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedDoubleDashWorktreeDirName),
+        project_role: 'worktree',
+      },
+      {
+        project: relatedWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedWorktreeDirName),
+        project_role: 'worktree',
+      },
+    ]);
+    const worktreeSession = result.data.find((s: any) => s.session_id === SESSION_ID_8);
+    expect(worktreeSession).toMatchObject({
+      project: relatedWorktreeDirName,
+      project_role: 'worktree',
+      session_ref: { session_id: SESSION_ID_8, project: relatedWorktreeDirName },
+    });
+  });
+
+  test('list --main-only skips associated worktree projects', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--project', RELATED_PROJECT, '--main-only']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_7]);
+    expect(result._meta).not.toHaveProperty('included_projects');
+  });
+
+  test('list intent filters inspect slug and first user message', async () => {
+    const slugMatch = parseOutput((await runCli(['list', '--project', FAKE_PROJECT, '--intent-match', 'bash-test-session'])).stdout);
+    expect(slugMatch.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_4]);
+
+    const regexMatch = parseOutput((await runCli(['list', '--project', FAKE_PROJECT, '--intent-regex', '/plan\\s+Install'])).stdout);
+    expect(regexMatch.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_4]);
+  });
+
+  test('list rejects documentation-sensitive flag conflicts', async () => {
+    const mainOnlyAllProjects = parseOutput((await runCli(['list', '--all-projects', '--main-only'])).stdout);
+    expect(mainOnlyAllProjects.ok).toBe(false);
+    expect(mainOnlyAllProjects.error.code).toBe('INVALID_ARGS');
+    expect(mainOnlyAllProjects.error.message).toContain('--main-only cannot be used with --all-projects');
+
+    const intentConflict = parseOutput((await runCli(['list', '--project', FAKE_PROJECT, '--intent-match', 'x', '--intent-regex', 'x'])).stdout);
+    expect(intentConflict.ok).toBe(false);
+    expect(intentConflict.error.code).toBe('INVALID_ARGS');
+    expect(intentConflict.error.message).toContain('--intent-match and --intent-regex are mutually exclusive');
+  });
+
   test('--all-projects lists sessions with project metadata', async () => {
     const { exitCode, stdout } = await runCli(['list', '--all-projects']);
     expect(exitCode).toBe(0);
@@ -1880,6 +2185,90 @@ describe('list integration', () => {
     expect(result.ok).toBe(false);
     expect(result.error.code).toBe('INVALID_ARGS');
     expect(result.error.message).toContain('--project-glob requires --all-projects');
+  });
+});
+
+describe('projects integration', () => {
+  test('projects --glob returns deterministic raw project summaries', async () => {
+    const { exitCode, stdout } = await runCli(['projects', '--glob', '*fake-project*']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((p: any) => p.project)).toEqual([fakeDirName, secondFakeDirName]);
+    expect(result.data[0]).toMatchObject({
+      project: fakeDirName,
+      project_path_guess: projectPathGuessFromClaudeProject(fakeDirName),
+      project_role: 'global',
+      session_count: 5,
+    });
+    expect(result.data[1]).toMatchObject({
+      project: secondFakeDirName,
+      project_path_guess: projectPathGuessFromClaudeProject(secondFakeDirName),
+      project_role: 'global',
+      session_count: 1,
+    });
+  });
+
+  test('projects --project summarizes main and associated worktree handles', async () => {
+    const { exitCode, stdout } = await runCli(['projects', '--project', RELATED_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((p: any) => p.project)).toEqual([
+      relatedDirName,
+      relatedDoubleDashWorktreeDirName,
+      relatedWorktreeDirName,
+    ]);
+    expect(result.data.find((p: any) => p.project === relatedDirName)).toMatchObject({
+      project_path_guess: RELATED_PROJECT,
+      project_role: 'main',
+      session_count: 1,
+      first_session_at: '2026-03-07T10:00:00.000Z',
+      last_session_at: '2026-03-07T10:00:00.000Z',
+    });
+    expect(result.data.find((p: any) => p.project === relatedWorktreeDirName)).toMatchObject({
+      project_role: 'worktree',
+      session_count: 5,
+    });
+  });
+});
+
+describe('help contract integration', () => {
+  test('top-level help exposes projects and stable handle contract', async () => {
+    const { exitCode, stdout, stderr } = await runCliHelp(['--help']);
+    const help = stdout + stderr;
+    expect(exitCode).toBe(0);
+    expect(help).toContain('stable raw project/session_ref handles');
+    expect(help).toContain('projects');
+  });
+
+  test('command help includes agent-facing contract phrases', async () => {
+    const listProcess = await runCliHelp(['list', '--help']);
+    const listHelp = listProcess.stdout + listProcess.stderr;
+    expect(listHelp).toContain('associated Claude worktrees by default');
+    expect(listHelp).toContain('--main-only');
+    expect(listHelp).toContain('raw Claude project basename');
+
+    const searchProcess = await runCliHelp(['search', '--help']);
+    const searchHelp = searchProcess.stdout + searchProcess.stderr;
+    expect(searchHelp).toContain('unified evidence');
+    expect(searchHelp).toContain('worktrees and subagents by default');
+    expect(searchHelp).toContain('same matching file access');
+
+    const toolsProcess = await runCliHelp(['tools', '--help']);
+    const toolsHelp = toolsProcess.stdout + toolsProcess.stderr;
+    expect(toolsHelp).toContain('raw structured inputs');
+    expect(toolsHelp).toContain('input_summary');
+
+    const projectsProcess = await runCliHelp(['projects', '--help']);
+    const projectsHelp = projectsProcess.stdout + projectsProcess.stderr;
+    expect(projectsHelp).toContain('raw project handles');
+    expect(projectsHelp).toContain('project_path_guess');
+
+    const summaryProcess = await runCliHelp(['summary', '--help']);
+    const summaryHelp = summaryProcess.stdout + summaryProcess.stderr;
+    expect(summaryHelp).toContain('session_ref.project');
+    expect(summaryHelp).toContain('--claude-project');
   });
 });
 
@@ -1935,6 +2324,47 @@ describe('shape integration', () => {
   });
 });
 
+describe('summary integration', () => {
+  test('returns one-call triage fields for a parent session without rolling up subagent activity', async () => {
+    const { exitCode, stdout } = await runCli(['summary', SESSION_ID, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta).toEqual({ total: 1, returned: 1, hasMore: false });
+    expect(result.data).toMatchObject({
+      session_id: SESSION_ID,
+      agent_id: null,
+      branch: 'main',
+      model: 'claude-sonnet-4-5',
+      started_at: '2026-03-01T10:00:00.000Z',
+      ended_at: '2026-03-01T10:05:00.000Z',
+      duration_ms: 300000,
+      turn_count: 6,
+      lines: 6,
+      slug: 'test-slug-fixture',
+      first_user_prompt: { turn: 1, snippet: 'Hello, please help me' },
+      last_assistant_text: { turn: 6, snippet: 'I see the edit failed. Let me try a different approach.' },
+      tool_counts: { Grep: 1, Edit: 1 },
+      files_touched: { read: 0, edit: 1, write: 0, grep: 1, glob: 0 },
+    });
+    expect(result.data.subagents.map((s: any) => s.agent_id)).toContain(SUBAGENT_ID);
+    expect(result.data.tool_counts).not.toHaveProperty('Task');
+  });
+
+  test('returns subagent-target summary with agent_id and no nested subagents', async () => {
+    const { exitCode, stdout } = await runCli(['summary', `${SESSION_ID}:${SUBAGENT_ID}`, '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID);
+    expect(result.data.agent_id).toBe(SUBAGENT_ID);
+    expect(result.data.turn_count).toBe(2);
+    expect(result.data.first_user_prompt).toEqual({ turn: 1, snippet: 'Subagent task' });
+    expect(result.data.last_assistant_text).toEqual({ turn: 2, snippet: 'Subagent response' });
+    expect(result.data.subagents).toEqual([]);
+  });
+});
+
 describe('tools integration', () => {
   test('returns all tool calls', async () => {
     const { stdout } = await runCli(['tools', SESSION_ID, '--project', FAKE_PROJECT]);
@@ -1952,6 +2382,48 @@ describe('tools integration', () => {
     const result = parseOutput(stdout);
     expect(result.data.tool_calls.length).toBe(1);
     expect(result.data.tool_calls[0].tool).toBe('Edit');
+  });
+
+  test('filters by --name-match', async () => {
+    const { stdout } = await runCli(['tools', SESSION_ID_4, '--project', FAKE_PROJECT, '--name-match', 'rea']);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.tool_calls.map((call: any) => call.tool)).toEqual(['Read', 'Read']);
+  });
+
+  test('filters by raw --input-match beyond input_summary', async () => {
+    const { stdout } = await runCli(['tools', SESSION_ID_4, '--project', FAKE_PROJECT, '--name', 'Bash', '--input-match', 'raw-bash-marker-after-summary']);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.tool_calls).toHaveLength(1);
+    expect(result.data.tool_calls[0]).toMatchObject({
+      tool: 'Bash',
+      input_summary: expect.not.stringContaining('raw-bash-marker-after-summary'),
+    });
+    expect(result.data.tool_calls[0]).not.toHaveProperty('raw_input');
+  });
+
+  test('filters by --input-regex over raw structured input', async () => {
+    const { stdout } = await runCli(['tools', SESSION_ID_4, '--project', FAKE_PROJECT, '--input-regex', 'raw write content marker']);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.tool_calls).toHaveLength(1);
+    expect(result.data.tool_calls[0].tool).toBe('Write');
+  });
+
+  test('rejects invalid tools regex and mutually exclusive filters', async () => {
+    const invalidRegex = parseOutput((await runCli(['tools', SESSION_ID, '--project', FAKE_PROJECT, '--input-regex', '['])).stdout);
+    expect(invalidRegex.ok).toBe(false);
+    expect(invalidRegex.error.code).toBe('INVALID_ARGS');
+    expect(invalidRegex.error.message).toContain('Invalid --input-regex regex');
+
+    const nameConflict = parseOutput((await runCli(['tools', SESSION_ID, '--project', FAKE_PROJECT, '--name', 'Read', '--name-match', 're'])).stdout);
+    expect(nameConflict.ok).toBe(false);
+    expect(nameConflict.error.code).toBe('INVALID_ARGS');
+
+    const inputConflict = parseOutput((await runCli(['tools', SESSION_ID, '--project', FAKE_PROJECT, '--input-match', 'x', '--input-regex', 'x'])).stdout);
+    expect(inputConflict.ok).toBe(false);
+    expect(inputConflict.error.code).toBe('INVALID_ARGS');
   });
 
   test('filters by --failed', async () => {
@@ -2034,6 +2506,23 @@ describe('messages integration', () => {
     const userMsg = result.data.messages.find((m: any) => m.n === 1);
     expect(userMsg.content[0].text).toContain('...[truncated,');
   });
+
+  test('single-turn text and thinking are unbounded by default while tool results remain bounded', async () => {
+    const textResult = parseOutput((await runCli(['messages', SESSION_ID_5, '--project', FAKE_PROJECT, '--turn', '1'])).stdout);
+    expect(textResult.data.messages[0].content[0].text).toBe('x'.repeat(8300));
+
+    const thinkingResult = parseOutput((await runCli(['messages', SESSION_ID_3, '--project', FAKE_PROJECT, '--turn', '2', '--type', 'thinking'])).stdout);
+    expect(thinkingResult.data.messages[0].content[0].text).toBe(`Considering the approach... ${'x'.repeat(260)}`);
+
+    const toolResult = parseOutput((await runCli(['messages', SESSION_ID_5, '--project', FAKE_PROJECT, '--turn', '1-2'])).stdout);
+    expect(toolResult.data.messages[0].content[0].text).toContain('...[truncated, 8300 chars]');
+  });
+
+  test('--max-tool-result bounds tool results independently from single-turn text', async () => {
+    const { stdout } = await runCli(['messages', SESSION_ID, '--project', FAKE_PROJECT, '--turn', '3', '--max-tool-result', '5']);
+    const result = parseOutput(stdout);
+    expect(result.data.messages[0].content[0].content).toBe('src/h...[truncated, 30 chars]');
+  });
 });
 
 describe('slice integration', () => {
@@ -2056,6 +2545,13 @@ describe('slice integration', () => {
     const thinking = blocks.find((b: any) => b.type === 'thinking');
     expect(thinking.thinking).toContain('...[truncated,');
   });
+
+  test('applies explicit slice truncation policy including zero', async () => {
+    const { stdout } = await runCli(['slice', SESSION_ID_5, '--project', FAKE_PROJECT, '--turn', '1', '--max-content', '0']);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.entries[0].message.content).toBe('...[truncated, 8300 chars]');
+  });
 });
 
 // ============================================================================
@@ -2074,6 +2570,126 @@ describe('userAssistantEntries', () => {
     expect(result.length).toBe(2);
     expect(result[0]!.type).toBe('user');
     expect(result[1]!.type).toBe('assistant');
+  });
+});
+
+// ============================================================================
+// transcript module foundation
+// ============================================================================
+
+describe('transcript module foundation', () => {
+  test('contentBlocksForEntry normalizes string-shaped content into text blocks', () => {
+    expect(contentBlocksForEntry({
+      type: 'user',
+      message: { role: 'user', content: 'plain prompt text' },
+    })).toEqual([{ type: 'text', text: 'plain prompt text' }]);
+  });
+
+  test('contentBlocksForEntry preserves array-shaped content', () => {
+    const blocks = [{ type: 'text' as const, text: 'array prompt' }];
+    expect(contentBlocksForEntry({ type: 'user', message: { content: blocks } })).toBe(blocks);
+  });
+
+  test('normalizedBlocks numbers only user and assistant turns', () => {
+    const entries = [
+      { type: 'system' as const, timestamp: '2026-01-01T00:00:00Z' },
+      { type: 'user' as const, timestamp: '2026-01-01T00:00:01Z', message: { content: 'first' } },
+      { type: 'summary' as const },
+      {
+        type: 'assistant' as const,
+        timestamp: '2026-01-01T00:00:02Z',
+        message: { content: [{ type: 'thinking' as const, thinking: 'hmm' }, { type: 'text' as const, text: 'second' }] },
+      },
+    ];
+
+    expect(normalizedBlocks(entries)).toEqual([
+      {
+        turn: 1,
+        block_index: 0,
+        role: 'user',
+        timestamp: '2026-01-01T00:00:01Z',
+        block: { type: 'text', text: 'first' },
+      },
+      {
+        turn: 2,
+        block_index: 0,
+        role: 'assistant',
+        timestamp: '2026-01-01T00:00:02Z',
+        block: { type: 'thinking', thinking: 'hmm' },
+      },
+      {
+        turn: 2,
+        block_index: 1,
+        role: 'assistant',
+        timestamp: '2026-01-01T00:00:02Z',
+        block: { type: 'text', text: 'second' },
+      },
+    ]);
+  });
+
+  test('extractSessionMetadata returns bounded model metadata from transcript module', () => {
+    const text = [
+      JSON.stringify({ type: 'system', sessionId: 's1', gitBranch: 'main', timestamp: '2026-01-01T00:00:00Z', version: '1.2.3' }),
+      JSON.stringify({ type: 'assistant', message: { model: 'claude-opus-4-1', content: [] }, slug: 'model-test' }),
+    ].join('\n');
+
+    expect(extractTranscriptSessionMetadata(text)).toEqual({
+      branch: 'main',
+      timestamp: '2026-01-01T00:00:00Z',
+      version: '1.2.3',
+      slug: 'model-test',
+      model: 'claude-opus-4-1',
+    });
+  });
+
+  test('resolveSessionWithText returns raw text, filtered entries, metadata, and line count', async () => {
+    const result = await resolveSessionWithText({
+      session: SESSION_ID,
+      project: FAKE_PROJECT,
+      claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT,
+    });
+
+    expect(result.sessionId).toBe(SESSION_ID);
+    expect(result.agentId).toBeNull();
+    expect(result.filePath).toBe(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`));
+    expect(result.text.length).toBeGreaterThan(0);
+    expect(result.allEntries.length).toBeGreaterThanOrEqual(result.entries.length);
+    expect(result.entries.every(e => e.type === 'user' || e.type === 'assistant')).toBe(true);
+    expect(result.lineCount).toBe(result.text.trim().split('\n').length);
+    expect(result.metadata.branch).toBe('main');
+  });
+
+  test('applyTruncationPolicy centralizes per-kind max character behavior', () => {
+    expect(applyTruncationPolicy('hello world', { textMaxChars: 5 }, 'text'))
+      .toBe('hello...[truncated, 11 chars]');
+    expect(applyTruncationPolicy('hello world', { textMaxChars: null }, 'text'))
+      .toBe('hello world');
+    expect(applyTruncationPolicy('abcdef', { defaultMaxChars: 3 }, 'thinking'))
+      .toBe('abc...[truncated, 6 chars]');
+  });
+});
+
+describe('project-selection module foundation', () => {
+  test('module project scope helpers preserve existing target shape', () => {
+    const unique = `cc-session-tool-module-target-${Date.now()}`;
+    const root = join(tmpdir(), unique, '.claude', 'projects');
+    const projectPath = join(tmpdir(), unique, 'repo');
+    const claudeDir = join(root, mangleProjectPathModule(projectPath));
+    const session = '11111111-2222-3333-4444-555555555555';
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(join(claudeDir, `${session}.jsonl`), JSON.stringify({ type: 'user' }) + '\n');
+
+    try {
+      const context = buildScopedSearchScopeModule({ projectPath, claudeProjectsRoot: root, includeWorktrees: false }).projects[0]!;
+      expect(listSearchTargetsForContextModule(context)).toEqual([{
+        filePath: join(claudeDir, `${session}.jsonl`),
+        sessionId: session,
+        context,
+        projectRef: context.projectRef,
+      }]);
+    } finally {
+      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+    }
   });
 });
 
@@ -2468,13 +3084,13 @@ describe('extractSessionMetadata', () => {
   test('extracts all fields from valid first entry', () => {
     const text = JSON.stringify({ type: 'system', sessionId: 's1', gitBranch: 'main', timestamp: '2025-01-01T00:00:00Z', version: '1.0' });
     const meta = extractSessionMetadata(text);
-    expect(meta).toEqual({ branch: 'main', timestamp: '2025-01-01T00:00:00Z', version: '1.0', slug: null });
+    expect(meta).toEqual({ branch: 'main', timestamp: '2025-01-01T00:00:00Z', version: '1.0', slug: null, model: null });
   });
 
   test('returns all nulls when no sessionId in first 5 lines', () => {
     const lines = Array.from({ length: 5 }, (_, i) => JSON.stringify({ type: 'user', message: { content: `msg${i}` } }));
     const meta = extractSessionMetadata(lines.join('\n'));
-    expect(meta).toEqual({ branch: null, timestamp: null, version: null, slug: null });
+    expect(meta).toEqual({ branch: null, timestamp: null, version: null, slug: null, model: null });
   });
 
   test('finds slug deeper in text via regex', () => {
@@ -2969,6 +3585,46 @@ describe('search integration', () => {
     expect(worktreeMatch.project_role).toBe('worktree');
   });
 
+  test('search includes subagent transcript text under parent session by default', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--text', 'Subagent response', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(match).toBeDefined();
+    expect(match.session_ref).toEqual({
+      session_id: SESSION_ID,
+      project: fakeDirName,
+    });
+    expect(match.matches.evidence.find((e: any) => e.kind === 'text' && e.is_subagent)).toMatchObject({
+      kind: 'text',
+      agent_id: SUBAGENT_ID,
+      parent_session_id: SESSION_ID,
+      is_subagent: true,
+      snippet: expect.stringContaining('Subagent response'),
+    });
+  });
+
+  test('search --no-subagents excludes subagent transcript matches', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--text', 'Subagent response', '--no-subagents', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.find((s: any) => s.session_id === SESSION_ID)).toBeUndefined();
+  });
+
+  test('parent and subagent evidence can satisfy one grouped search match', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'Grep', '--text', 'Subagent response', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(match).toBeDefined();
+    expect(match.matches.tools).toContain('Grep');
+    expect(match.matches.evidence.find((e: any) => e.kind === 'tool_input' && e.tool === 'Grep')).toBeDefined();
+    expect(match.matches.evidence.find((e: any) => e.kind === 'text' && e.is_subagent)).toBeDefined();
+  });
+
   test('malformed file tool input does not suppress unrelated tool search matches', async () => {
     const { exitCode, stdout } = await runCli(['search', '--tool', 'Bash', '--input-match', 'malformed-file-input-survives', '--project', RELATED_PROJECT]);
     expect(exitCode).toBe(0);
@@ -2997,11 +3653,14 @@ describe('search integration', () => {
     expect(result.ok).toBe(true);
 
     const writer = result.data.find((s: any) => s.session_id === SESSION_ID_8);
-    expect(writer.matches.file_evidence).toEqual([{
+    expect(writer.matches).not.toHaveProperty('file_evidence');
+    expect(writer.matches.evidence.filter((e: any) => e.kind === 'file')).toEqual([{
+      kind: 'file',
       rawPath: join(RELATED_WORKTREE_ROOT, RELATED_PROJECT_FILE),
       logicalPath: RELATED_PROJECT_FILE,
       operation: 'write',
       turn: 2,
+      block_index: 0,
       timestamp: '2026-03-08T10:01:00.000Z',
     }]);
   });
@@ -3016,7 +3675,7 @@ describe('search integration', () => {
     expect(result._meta.returned).toBe(1);
     expect(result._meta.hasMore).toBe(true);
     expect(result.data[0].matches.operations).toEqual(['write']);
-    expect(result.data[0].matches.file_evidence[0]).toMatchObject({
+    expect(result.data[0].matches.evidence.find((e: any) => e.kind === 'file')).toMatchObject({
       rawPath: join(RELATED_WORKTREE_ROOT, RELATED_PROJECT_FILE),
       logicalPath: RELATED_PROJECT_FILE,
       operation: 'write',
@@ -3034,7 +3693,7 @@ describe('search integration', () => {
   });
 
   test('--origin still applies additional candidate filters before earliest-write ordering', async () => {
-    const { exitCode, stdout } = await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--origin', '--text', 'response', '--project', RELATED_PROJECT]);
+    const { exitCode, stdout } = await runCli(['search', '--file', join(RELATED_PROJECT, RELATED_PROJECT_FILE), '--origin', '--text', 'no matching response phrase', '--project', RELATED_PROJECT]);
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
@@ -3094,6 +3753,17 @@ describe('search integration', () => {
     const match = result.data.find((s: any) => s.session_id === SESSION_ID);
     expect(match).toBeDefined();
     expect(match.matches.turns.length).toBeGreaterThanOrEqual(1);
+    expect(match.matches.evidence.find((e: any) => e.kind === 'text')).toMatchObject({
+      kind: 'text',
+      role: 'assistant',
+      turn: 6,
+      snippet: expect.stringContaining('different approach'),
+    });
+    expect(match.session_ref).toEqual({
+      session_id: SESSION_ID,
+      project: fakeDirName,
+    });
+    expect(match.model).toBe('claude-sonnet-4-5');
   });
 
   test('--text "think about this carefully" finds session (matches thinking block)', async () => {
@@ -3105,6 +3775,57 @@ describe('search integration', () => {
     expect(match.matches.turns.length).toBeGreaterThanOrEqual(1);
   });
 
+  test('--text searches string user content and array user text blocks by default', async () => {
+    const stringUser = parseOutput((await runCli(['search', '--text', 'please help me', '--project', FAKE_PROJECT])).stdout);
+    expect(stringUser.ok).toBe(true);
+    const stringMatch = stringUser.data.find((s: any) => s.session_id === SESSION_ID);
+    expect(stringMatch).toBeDefined();
+    expect(stringMatch.matches.evidence.find((e: any) => e.kind === 'text' && e.role === 'user')).toMatchObject({
+      kind: 'text',
+      role: 'user',
+      turn: 1,
+      snippet: expect.stringContaining('please help me'),
+    });
+
+    const arrayUser = parseOutput((await runCli(['search', '--text', 'array content marker', '--text-role', 'user', '--project', FAKE_PROJECT])).stdout);
+    expect(arrayUser.ok).toBe(true);
+    const arrayMatch = arrayUser.data.find((s: any) => s.session_id === SESSION_ID_2);
+    expect(arrayMatch).toBeDefined();
+    expect(arrayMatch.matches.evidence.find((e: any) => e.kind === 'text' && e.role === 'user')).toMatchObject({
+      kind: 'text',
+      role: 'user',
+      turn: 1,
+      block_index: 0,
+    });
+  });
+
+  test('--text-regex matches text and invalid text regex returns INVALID_ARGS', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--text-regex', 'different\\s+approach', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((s: any) => s.session_id)).toContain(SESSION_ID);
+
+    const invalid = parseOutput((await runCli(['search', '--text-regex', '[', '--project', FAKE_PROJECT])).stdout);
+    expect(invalid.ok).toBe(false);
+    expect(invalid.error.code).toBe('INVALID_ARGS');
+    expect(invalid.error.message).toContain('Invalid --text-regex regex');
+  });
+
+  test('--intent-match /plan emits intent evidence', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--intent-match', '/plan', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const match = result.data.find((s: any) => s.session_id === SESSION_ID_3);
+    expect(match).toBeDefined();
+    expect(match.matches.evidence.find((e: any) => e.kind === 'intent')).toMatchObject({
+      kind: 'intent',
+      intent_source: 'first_message',
+      snippet: expect.stringContaining('/plan'),
+    });
+  });
+
   test('--bash "npm install" finds Bash fixture session', async () => {
     const { stdout } = await runCli(['search', '--bash', 'npm install', '--project', FAKE_PROJECT]);
     const result = parseOutput(stdout);
@@ -3112,6 +3833,21 @@ describe('search integration', () => {
     const match = result.data.find((s: any) => s.session_id === SESSION_ID_4);
     expect(match).toBeDefined();
     expect(match.matches.turns.length).toBeGreaterThanOrEqual(1);
+    expect(match.matches.evidence.find((e: any) => e.kind === 'bash')).toMatchObject({
+      kind: 'bash',
+      tool: 'Bash',
+      snippet: expect.stringContaining('npm install'),
+    });
+  });
+
+  test('--bash-regex and --input-regex match raw structured values', async () => {
+    const bash = parseOutput((await runCli(['search', '--bash-regex', 'npm\\s+install', '--project', FAKE_PROJECT])).stdout);
+    expect(bash.ok).toBe(true);
+    expect(bash.data.map((s: any) => s.session_id)).toContain(SESSION_ID_4);
+
+    const input = parseOutput((await runCli(['search', '--tool', 'Write', '--input-regex', 'raw write content marker', '--project', FAKE_PROJECT])).stdout);
+    expect(input.ok).toBe(true);
+    expect(input.data.map((s: any) => s.session_id)).toContain(SESSION_ID_4);
   });
 
   test('--input-match searches raw Bash commands beyond input summary truncation', async () => {
@@ -3122,10 +3858,15 @@ describe('search integration', () => {
     expect(result.data.map((s: any) => s.session_id)).toContain(SESSION_ID_4);
     const match = result.data.find((s: any) => s.session_id === SESSION_ID_4);
     expect(match.matches.tools).toEqual(['Bash']);
-    expect(match.matches.tool_inputs).toEqual([{
+    expect(match.matches).not.toHaveProperty('tool_inputs');
+    expect(match.matches.evidence.filter((e: any) => e.kind === 'tool_input')).toMatchObject([{
+      kind: 'tool_input',
       tool: 'Bash',
       input_summary: expect.not.stringContaining('raw-bash-marker-after-summary'),
+      snippet: expect.stringContaining('raw-bash-marker-after-summary'),
       turn: 2,
+      block_index: 0,
+      timestamp: '2026-03-04T10:01:00.000Z',
     }]);
   });
 
@@ -3133,7 +3874,8 @@ describe('search integration', () => {
     const editResult = parseOutput((await runCli(['search', '--tool', 'Edit', '--input-match', 'legacy raw old marker', '--project', FAKE_PROJECT])).stdout);
     expect(editResult.ok).toBe(true);
     expect(editResult.data.map((s: any) => s.session_id)).toContain(SESSION_ID);
-    expect(editResult.data.find((s: any) => s.session_id === SESSION_ID).matches.tool_inputs[0]).toEqual({
+    expect(editResult.data.find((s: any) => s.session_id === SESSION_ID).matches.evidence.find((e: any) => e.kind === 'tool_input')).toMatchObject({
+      kind: 'tool_input',
       tool: 'Edit',
       input_summary: "file='hello.ts' old=(21 chars) new=(26 chars)",
       turn: 4,
@@ -3150,10 +3892,14 @@ describe('search integration', () => {
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_2]);
-    expect(result.data[0].matches.tool_inputs).toEqual([{
+    expect(result.data[0].matches.evidence.filter((e: any) => e.kind === 'tool_input')).toMatchObject([{
+      kind: 'tool_input',
       tool: 'TodoWrite',
       input_summary: expect.stringContaining('stable json audit marker'),
+      snippet: expect.stringContaining('stable json audit marker'),
       turn: 2,
+      block_index: 0,
+      timestamp: '2026-03-02T10:01:00.000Z',
     }]);
   });
 
@@ -3220,16 +3966,143 @@ describe('search integration', () => {
     ]);
   });
 
+  test('--aggregate counters uses counters as selector and returns nonzero rows', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--counter', 'tracking=.claude-tracking', '--aggregate', 'counters', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((s: any) => s.session_id)).toContain(SESSION_ID_4);
+    const aggregate = result.data.find((s: any) => s.session_id === SESSION_ID_4);
+    expect(aggregate).toMatchObject({
+      session_id: SESSION_ID_4,
+      project: basename(CLAUDE_DIR),
+      project_path_guess: null,
+      project_role: 'main',
+      session_ref: { session_id: SESSION_ID_4, project: basename(CLAUDE_DIR) },
+      counts: { tracking: 1 },
+      total_matches: 1,
+    });
+    expect(result.data.every((row: any) => row.total_matches > 0)).toBe(true);
+  });
+
+  test('--aggregate counters preserves selected zero-count rows and supports bucket day', async () => {
+    const { exitCode, stdout } = await runCli([
+      'search',
+      '--tool', 'Read',
+      '--counter', 'missing=no-such-counter-marker',
+      '--aggregate', 'counters',
+      '--bucket', 'day',
+      '--project', FAKE_PROJECT,
+    ]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const day = result.data.find((bucket: any) => bucket.bucket === '2026-03-04');
+    expect(day).toEqual({
+      bucket: '2026-03-04',
+      sessions: 1,
+      counts: { missing: 0 },
+      total_matches: 0,
+    });
+  });
+
+  test('--aggregate counters supports regex counters, week buckets, and all-project audit shape', async () => {
+    const { exitCode, stdout } = await runCli([
+      'search',
+      '--all-projects',
+      '--project-glob', '*fake-project-worktree',
+      '--tool', 'Write',
+      '--input-match', 'cross audit content marker',
+      '--counter', 'cross=cross audit',
+      '--counter-regex', 'write_file="file_path":".*cross-project',
+      '--aggregate', 'counters',
+      '--bucket', 'week',
+    ]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBe(1);
+    expect(result.data).toEqual([
+      {
+        bucket: '2026-03-02',
+        sessions: 1,
+        counts: { cross: 1, write_file: 1 },
+        total_matches: 2,
+      },
+    ]);
+  });
+
+  test('--aggregate counters can roll up subagent Bash evidence selected by parent /plan intent', async () => {
+    const { exitCode, stdout } = await runCli([
+      'search',
+      '--intent-match', '/plan',
+      '--counter', 'tracking=.claude-tracking',
+      '--aggregate', 'counters',
+      '--project', FAKE_PROJECT,
+    ]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const aggregate = result.data.find((s: any) => s.session_id === SESSION_ID_4);
+    expect(aggregate).toMatchObject({
+      session_id: SESSION_ID_4,
+      counts: { tracking: 1 },
+      total_matches: 1,
+      session_ref: { session_id: SESSION_ID_4, project: basename(CLAUDE_DIR) },
+    });
+  });
+
+  test('--aggregate counters --per-subagent emits transcript-level rows', async () => {
+    const { exitCode, stdout } = await runCli([
+      'search',
+      '--intent-match', '/plan',
+      '--counter', 'tracking=.claude-tracking',
+      '--aggregate', 'counters',
+      '--per-subagent',
+      '--project', FAKE_PROJECT,
+    ]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    const rows = result.data.filter((s: any) => s.session_id === SESSION_ID_4);
+    const subagentRow = rows.find((s: any) => s.agent_id === 'counter_agent');
+    expect(rows.some((s: any) => s.agent_id === undefined && s.total_matches === 0)).toBe(true);
+    expect(subagentRow).toMatchObject({
+      session_id: SESSION_ID_4,
+      agent_id: 'counter_agent',
+      parent_session_id: SESSION_ID_4,
+      is_subagent: true,
+      session_ref: { session_id: SESSION_ID_4, project: basename(CLAUDE_DIR), agent_id: 'counter_agent' },
+      counts: { tracking: 1 },
+      total_matches: 1,
+    });
+  });
+
   test('--aggregate rejects invalid usage', async () => {
     const withoutToolInput = parseOutput((await runCli(['search', '--file', 'hello.ts', '--aggregate', 'count-per-session', '--project', FAKE_PROJECT])).stdout);
     expect(withoutToolInput.ok).toBe(false);
     expect(withoutToolInput.error.code).toBe('INVALID_ARGS');
-    expect(withoutToolInput.error.message).toContain('--aggregate requires --tool or --input-match');
+    expect(withoutToolInput.error.message).toContain('--aggregate requires --tool, --input-match, or --input-regex');
 
     const invalidMode = parseOutput((await runCli(['search', '--tool', 'Read', '--aggregate', 'totals', '--project', FAKE_PROJECT])).stdout);
     expect(invalidMode.ok).toBe(false);
     expect(invalidMode.error.code).toBe('INVALID_ARGS');
-    expect(invalidMode.error.message).toContain('--aggregate must be count-per-session');
+    expect(invalidMode.error.message).toContain('--aggregate must be one of: count-per-session, counters');
+
+    const countersWithoutAggregate = parseOutput((await runCli(['search', '--counter', 'x=y', '--project', FAKE_PROJECT])).stdout);
+    expect(countersWithoutAggregate.ok).toBe(false);
+    expect(countersWithoutAggregate.error.code).toBe('INVALID_ARGS');
+    expect(countersWithoutAggregate.error.message).toContain('--counter and --counter-regex require --aggregate counters');
+
+    const countersWithoutCounter = parseOutput((await runCli(['search', '--tool', 'Read', '--aggregate', 'counters', '--project', FAKE_PROJECT])).stdout);
+    expect(countersWithoutCounter.ok).toBe(false);
+    expect(countersWithoutCounter.error.code).toBe('INVALID_ARGS');
+    expect(countersWithoutCounter.error.message).toContain('--aggregate counters requires at least one --counter or --counter-regex');
+
+    const bucketWithoutCounters = parseOutput((await runCli(['search', '--tool', 'Read', '--aggregate', 'count-per-session', '--bucket', 'day', '--project', FAKE_PROJECT])).stdout);
+    expect(bucketWithoutCounters.ok).toBe(false);
+    expect(bucketWithoutCounters.error.code).toBe('INVALID_ARGS');
+    expect(bucketWithoutCounters.error.message).toContain('--bucket requires --aggregate counters');
   });
 
   test('--tool Grep --branch main combines content + metadata filters', async () => {

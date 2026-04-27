@@ -3,6 +3,35 @@ import { defineCommand, runMain } from 'citty';
 import { homedir } from 'os';
 import { join, basename, dirname, resolve, relative, isAbsolute } from 'path';
 import { readdirSync, existsSync, realpathSync } from 'fs';
+import {
+  aggregateCounterRows,
+  attachCounterTranscriptResults,
+  bucketCounterRows,
+  evidenceTimestamps,
+  parseCounterArgs,
+  parseRegexMatcher,
+  parseSubstringMatcher,
+  SEARCH_EVIDENCE_SNIPPET_CHARS,
+  snippetForMatch,
+  testTextMatcher,
+  toolInputSamplesFromEvidence,
+  type TextMatcher,
+  type SearchEvidence,
+  type SearchEvidenceKind,
+  type SearchMatch,
+  type SearchMeta,
+  type SessionRef,
+  type ToolInputMatch,
+  type SearchBucketMode,
+  type ToolCallScanRecord,
+} from './src/search.ts';
+import {
+  buildSessionSummary,
+  extractSessionIntent,
+  normalizedBlocks,
+  parseSessionText as parseTranscriptSessionText,
+  type SessionSummaryResult,
+} from './src/transcript.ts';
 
 export const VERSION = '0.1.0';
 
@@ -33,10 +62,12 @@ export type SessionEntry = {
   gitBranch?: string;
   version?: string;
   cwd?: string;
+  model?: string;
   message?: {
     role?: string;
     content?: string | ContentBlock[];
     usage?: TokenUsage;
+    model?: string;
   };
   slug?: string;
 };
@@ -71,6 +102,17 @@ export type ListSession = {
   project?: string;
   project_path_guess?: string | null;
   project_role?: SearchProjectRole;
+  session_ref?: SessionRef;
+};
+
+export type ProjectSummary = {
+  project: string;
+  project_path_guess: string | null;
+  project_role: SearchProjectRole;
+  session_count: number;
+  total_lines: number;
+  first_session_at: string | null;
+  last_session_at: string | null;
 };
 
 export type ShapeRow = {
@@ -106,6 +148,10 @@ export type ToolsResult = {
   session_id: string;
   agent_id: string | null;
   tool_calls: ToolCall[];
+};
+
+type ToolCallWithRawInput = ToolCall & {
+  raw_input: Record<string, unknown>;
 };
 
 export type TokenTurn = {
@@ -202,14 +248,6 @@ export type FileMatchResult = {
   logicalPath: string | null;
 };
 
-export type FileMatchEvidence = {
-  rawPath: string;
-  logicalPath: string | null;
-  operation: SearchOperation;
-  turn: number;
-  timestamp: string | null;
-};
-
 export type FileEntry = {
   path: string;
   operations: string[];
@@ -256,38 +294,8 @@ export type SubagentsResult = {
   subagents: SubagentInfo[];
 };
 
-// SearchMatch intentionally omits agent_id — it operates at the session-listing level, not session-scoped.
-export type SearchMatch = {
-  session_id: string;
-  branch: string | null;
-  timestamp: string | null;
-  slug: string | null;
-  project?: string;
-  project_path_guess?: string | null;
-  project_role?: SearchProjectRole;
-  session_ref?: {
-    session_id: string;
-    project: string;
-  };
-  matches: {
-    tools: string[];      // distinct tool names that matched --tool
-    files: string[];      // distinct file paths that matched --file
-    normalized_files?: string[];
-    file_evidence?: FileMatchEvidence[];
-    operations?: SearchOperation[];
-    tool_inputs?: ToolInputMatch[];
-    turns: number[];      // union of all turn numbers where any filter matched
-  };
-};
-
 export type SearchSortMode = 'session-newest' | 'match-earliest' | 'match-newest' | 'project';
-export type SearchAggregateMode = 'none' | 'count-per-session';
-
-export type ToolInputMatch = {
-  tool: string;
-  input_summary: string;
-  turn: number;
-};
+export type SearchAggregateMode = 'none' | 'count-per-session' | 'counters';
 
 export type SearchAggregateResult = {
   session_id: string;
@@ -303,33 +311,38 @@ export type SearchAggregateResult = {
   sample_matches: ToolInputMatch[];
 };
 
-export type SearchMeta = ResponseMeta & {
-  projects_scanned?: number;
-  project?: string;
-  related_projects?: ProjectRef[];
-  included_projects?: PublicProjectRef[];
-  skipped_projects?: PublicProjectRef[];
-  warning?: string;
-};
-
 export type SearchArgs = {
   tool?: string;
   file?: string;
   text?: string;
+  textRegex?: string;
+  textRole?: 'user' | 'assistant' | 'all';
   bash?: string;
+  bashRegex?: string;
   inputMatch?: string;
+  inputRegex?: string;
+  intentMatch?: string;
+  intentRegex?: string;
   branch?: string;
   after?: string;
   before?: string;
   since?: string;
   operation?: SearchOperation;
+  includeSubagents?: boolean;
 };
 
 export type SearchTarget = {
   filePath: string;
   sessionId: string;
+  parentSessionId?: string | null;
+  agentId?: string | null;
   context?: SearchProjectContext;
   projectRef?: ProjectRef;
+};
+
+export type SearchSessionGroup = {
+  parent: SearchTarget;
+  subagents: SearchTarget[];
 };
 
 export type SearchScopeOptions = {
@@ -364,6 +377,13 @@ export type SessionProjectSelector =
 
 export type SearchScanResult = {
   matches: SearchMatch[];
+};
+
+type PreparedSearchArgs = SearchArgs & {
+  textMatcher?: TextMatcher | null;
+  bashMatcher?: TextMatcher | null;
+  inputMatcher?: TextMatcher | null;
+  intentMatcher?: TextMatcher | null;
 };
 
 export type ListMeta = ResponseMeta & {
@@ -1098,6 +1118,41 @@ export async function resolveSession(args: {
   return { sessionId, agentId, entries };
 }
 
+type ResolvedSessionWithText = ResolvedSession & {
+  claudeDir: string;
+  filePath: string;
+  rawText: string;
+  allEntries: SessionEntry[];
+  lineCount: number;
+  metadata: SessionMetadata;
+};
+
+async function resolveSessionWithText(args: {
+  session: string;
+  project?: string;
+  'claude-project'?: string;
+  claudeProjectsRoot?: string;
+}): Promise<ResolvedSessionWithText> {
+  const claudeDir = resolveClaudeProjectDirFromSelector(
+    sessionProjectSelectorFromArgs(args),
+    args.claudeProjectsRoot,
+  );
+  const { filePath, sessionId, agentId } = await resolveSessionFile(claudeDir, args.session);
+  const rawText = await Bun.file(filePath).text();
+  const allEntries = parseSessionText(rawText);
+  return {
+    sessionId,
+    agentId,
+    claudeDir,
+    filePath,
+    rawText,
+    allEntries,
+    entries: userAssistantEntries(allEntries),
+    lineCount: countNonEmptyLines(rawText),
+    metadata: extractSessionMetadata(rawText),
+  };
+}
+
 /** Parse turn range "N" or "N-M". Returns {start, end}. */
 export function parseTurnRange(input: string): { start: number; end: number } {
   const rangeMatch = input.match(/^(\d+)-(\d+)$/);
@@ -1165,6 +1220,18 @@ export function stableJsonStringify(value: unknown): string {
 
 export function toolInputMatches(input: Record<string, unknown>, query: string): boolean {
   return stableJsonStringify(input).toLowerCase().includes(query.toLowerCase());
+}
+
+function toolInputMatchesMatcher(input: Record<string, unknown>, matcher: TextMatcher | null): boolean {
+  return testTextMatcher(matcher, stableJsonStringify(input));
+}
+
+function safeInputSummary(tool: string, input: Record<string, unknown>): string {
+  try {
+    return inputSummary(tool, input);
+  } catch {
+    return stableJsonStringify(input).slice(0, 80);
+  }
 }
 
 /** Determine outcome from a tool_result. */
@@ -1260,6 +1327,7 @@ export type SessionMetadata = {
   timestamp: string | null;
   version: string | null;
   slug: string | null;
+  model: string | null;
 };
 
 type ExtractSessionMetadataOptions = {
@@ -1272,23 +1340,31 @@ export function extractSessionMetadata(text: string, options: ExtractSessionMeta
   let timestamp: string | null = null;
   let version: string | null = null;
   let slug: string | null = null;
+  let model: string | null = null;
 
   let lineStart = 0;
-  for (let j = 0; j < 5 && lineStart <= text.length; j++) {
+  for (let j = 0; j < 50 && lineStart <= text.length; j++) {
     const newlineIndex = text.indexOf('\n', lineStart);
     const lineEnd = newlineIndex === -1 ? text.length : newlineIndex;
     const rawLine = text.slice(lineStart, lineEnd);
     if (rawLine.trim()) {
       try {
         const entry = JSON.parse(rawLine);
-        if (entry.sessionId) {
+        if (model === null) {
+          if (typeof entry.message?.model === 'string' && entry.message.model.trim()) {
+            model = entry.message.model;
+          } else if (typeof entry.model === 'string' && entry.model.trim()) {
+            model = entry.model;
+          }
+        }
+        if (entry.sessionId && branch === null) {
           branch = entry.gitBranch ?? null;
           version = entry.version ?? null;
           timestamp = entry.timestamp ?? null;
-          break;
         }
       } catch { /* skip */ }
     }
+    if (branch !== null && model !== null) break;
     if (newlineIndex === -1) break;
     lineStart = newlineIndex + 1;
   }
@@ -1298,7 +1374,7 @@ export function extractSessionMetadata(text: string, options: ExtractSessionMeta
     if (slugMatch) slug = slugMatch[1] ?? null;
   }
 
-  return { branch, timestamp, version, slug };
+  return { branch, timestamp, version, slug, model };
 }
 
 const isSubagentFile = (f: string) => f.startsWith('agent-') && f.endsWith('.jsonl');
@@ -1408,10 +1484,13 @@ async function listSessionsForContext(
     branch?: string;
     before?: string;
     'include-subagents'?: boolean;
+    'intent-match'?: string;
+    'intent-regex'?: string;
   },
   afterCutoff: string | null,
   minLines: number,
-  includeProjectFields: boolean,
+  includeIdentityFields: boolean,
+  intentMatcher: TextMatcher | null,
 ): Promise<ListSession[]> {
   const files = readdirSync(context.projectRef.claude_dir).filter(f => f.endsWith('.jsonl'));
   const sessions: ListSession[] = [];
@@ -1437,12 +1516,18 @@ async function listSessionsForContext(
         if (args.before) {
           if (!timestamp || timestamp > args.before) return null;
         }
+        if (intentMatcher) {
+          const entries = parseTranscriptSessionText(text);
+          const intents = extractSessionIntent(entries, { slug });
+          if (!intents.some(intent => testTextMatcher(intentMatcher, intent.value))) return null;
+        }
 
         const session: ListSession = { session_id: sessionId, branch, timestamp, version, lines: lineCount, slug };
-        if (includeProjectFields) {
+        if (includeIdentityFields) {
           session.project = context.projectRef.project;
           session.project_path_guess = context.projectRef.project_path_guess;
           session.project_role = context.role;
+          session.session_ref = { session_id: sessionId, project: context.projectRef.project };
         }
         if (args['include-subagents']) {
           try {
@@ -1468,12 +1553,15 @@ async function listSessionsForContext(
 }
 
 const listCommand = defineCommand({
-  meta: { name: 'list', description: 'Index all sessions (metadata only)' },
+  meta: { name: 'list', description: 'Index sessions; scoped lists include associated Claude worktrees by default' },
   args: {
-    project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
-    'all-projects': { type: 'boolean', description: 'List sessions from all Claude project directories', default: false },
-    'project-glob': { type: 'string', description: 'Filter --all-projects by Claude project identity glob' },
+    project: { type: 'string', description: 'Absolute project path identity anchor (defaults to CWD)' },
+    'main-only': { type: 'boolean', description: 'With --project, list only the main Claude project and skip associated worktree transcript directories', default: false },
+    'all-projects': { type: 'boolean', description: 'List sessions from all Claude project directories; use raw project/session_ref.project for stable follow-up' },
+    'project-glob': { type: 'string', description: 'Filter --all-projects by raw Claude project basename or display-only project_path_guess' },
     branch: { type: 'string', description: 'Filter by git branch' },
+    'intent-match': { type: 'string', description: 'Filter session intent sources by case-insensitive substring' },
+    'intent-regex': { type: 'string', description: 'Filter session intent sources by regex' },
     after: { type: 'string', description: 'Sessions after DATE (ISO 8601)' },
     before: { type: 'string', description: 'Sessions before DATE (ISO 8601)' },
     since: { type: 'string', description: 'Sessions from the last duration (e.g. 1d, 2h, 1w)' },
@@ -1490,6 +1578,12 @@ const listCommand = defineCommand({
       if (args['project-glob'] && !allProjects) {
         throw cliError('INVALID_ARGS', '--project-glob requires --all-projects');
       }
+      if (args['main-only'] && allProjects) {
+        throw cliError('INVALID_ARGS', '--main-only cannot be used with --all-projects');
+      }
+      if (args['intent-match'] && args['intent-regex']) {
+        throw cliError('INVALID_ARGS', '--intent-match and --intent-regex are mutually exclusive');
+      }
 
       if (args.since && args.after) {
         throw cliError('INVALID_ARGS', '--since and --after are mutually exclusive');
@@ -1500,17 +1594,28 @@ const listCommand = defineCommand({
       if (lastN != null && lastN <= 0) {
         throw cliError('INVALID_ARGS', '--last must be a positive integer');
       }
+      const intentMatcher = (() => {
+        try {
+          return args['intent-regex']
+            ? parseRegexMatcher(args['intent-regex'], '--intent-regex')
+            : parseSubstringMatcher(args['intent-match']);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw cliError('INVALID_ARGS', message);
+        }
+      })();
 
       const sessions: ListSession[] = [];
       const selection = selectProjectContexts({
-        mode: allProjects ? 'all-projects' : 'scoped',
+        mode: allProjects ? 'all-projects' : (args['main-only'] ? 'scoped' : 'scoped-with-worktrees'),
         projectPath,
         projectGlob: args['project-glob'],
       });
+      const includeIdentityFields = allProjects || selection.contexts.length > 1;
 
       for (const context of selection.contexts) {
         try {
-          sessions.push(...await listSessionsForContext(context, args, afterCutoff, minLines, allProjects));
+          sessions.push(...await listSessionsForContext(context, args, afterCutoff, minLines, includeIdentityFields, intentMatcher));
         } catch {
           if (!allProjects) throw cliError('NOT_FOUND', `Claude project directory not found: ${context.projectRef.claude_dir}`);
         }
@@ -1528,12 +1633,93 @@ const listCommand = defineCommand({
       const total = sessions.length;
       const returned = lastN != null ? sessions.slice(0, lastN) : sessions;
       const responseMeta: ListMeta = meta(total, returned.length);
-      if (allProjects) {
+      if (allProjects || selection.contexts.length > 1) {
         responseMeta.projects_scanned = selection.contexts.length;
         responseMeta.included_projects = selection.includedProjects;
         responseMeta.skipped_projects = selection.skippedProjects;
       }
       output(success(returned, responseMeta));
+    } catch (err: unknown) {
+      handleCommandError(err);
+    }
+  },
+});
+
+async function summarizeProjectContext(context: SearchProjectContext): Promise<ProjectSummary> {
+  const summary: ProjectSummary = {
+    project: context.projectRef.project,
+    project_path_guess: context.projectRef.project_path_guess,
+    project_role: context.role,
+    session_count: 0,
+    total_lines: 0,
+    first_session_at: null,
+    last_session_at: null,
+  };
+  if (!existsSync(context.projectRef.claude_dir)) {
+    throw new Error(`Claude project directory not found: ${context.projectRef.claude_dir}`);
+  }
+
+  const files = readdirSync(context.projectRef.claude_dir).filter(f => f.endsWith('.jsonl')).sort((a, b) => a.localeCompare(b));
+  for (const file of files) {
+    try {
+      const text = await Bun.file(join(context.projectRef.claude_dir, file)).text();
+      const lines = countNonEmptyLines(text);
+      const { timestamp } = extractSessionMetadata(text, { includeSlug: false });
+      summary.session_count++;
+      summary.total_lines += lines;
+      if (timestamp) {
+        if (!summary.first_session_at || timestamp < summary.first_session_at) summary.first_session_at = timestamp;
+        if (!summary.last_session_at || timestamp > summary.last_session_at) summary.last_session_at = timestamp;
+      }
+    } catch {
+      // Project summaries are metadata indexes; skip unreadable transcript files.
+    }
+  }
+
+  return summary;
+}
+
+// ============================================================================
+// Projects Command
+// ============================================================================
+
+const projectsCommand = defineCommand({
+  meta: { name: 'projects', description: 'Summarize Claude project directories and raw project handles' },
+  args: {
+    glob: { type: 'string', description: 'Filter by raw Claude project basename or display-only project_path_guess' },
+    project: { type: 'string', description: 'Absolute project path; include its main and associated worktree projects' },
+  },
+  async run({ args }) {
+    try {
+      const selection = selectProjectContexts({
+        mode: args.project ? 'scoped-with-worktrees' : 'all-projects',
+        projectPath: args.project,
+        projectGlob: args.project ? undefined : args.glob,
+      });
+      let contexts = selection.contexts;
+      if (args.project && args.glob) {
+        contexts = contexts.filter(context => projectMatchesGlob(context.projectRef, args.glob!));
+      }
+
+      const summaries: ProjectSummary[] = [];
+      for (const context of contexts) {
+        try {
+          summaries.push(await summarizeProjectContext(context));
+        } catch {
+          if (args.project) throw cliError('NOT_FOUND', `Claude project directory not found: ${context.projectRef.claude_dir}`);
+        }
+      }
+      summaries.sort((a, b) => a.project.localeCompare(b.project));
+
+      const responseMeta: ListMeta = meta(summaries.length, summaries.length);
+      responseMeta.projects_scanned = contexts.length;
+      responseMeta.included_projects = contexts.map(context => ({
+        project: context.projectRef.project,
+        project_path_guess: context.projectRef.project_path_guess,
+        project_role: context.role,
+      }));
+      responseMeta.skipped_projects = args.project ? [] : selection.skippedProjects;
+      output(success(summaries, responseMeta));
     } catch (err: unknown) {
       handleCommandError(err);
     }
@@ -1704,21 +1890,74 @@ const shapeCommand = defineCommand({
 });
 
 // ============================================================================
+// Summary Command
+// ============================================================================
+
+const summaryCommand = defineCommand({
+  meta: { name: 'summary', description: 'One-call triage summary for a session; use session_ref.project as --claude-project for stable follow-up' },
+  args: {
+    session: { type: 'positional', description: 'Session ID (UUID, prefix, slug, or session:agent-id)', required: true },
+    project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+    'claude-project': { type: 'string', description: 'Raw Claude project directory basename' },
+  },
+  async run({ args }) {
+    try {
+      const resolved = await resolveSessionWithText(args);
+      const subagents = resolved.agentId === null
+        ? await listSubagents(resolved.claudeDir, resolved.sessionId)
+        : [];
+      const result: SessionSummaryResult = buildSessionSummary({
+        sessionId: resolved.sessionId,
+        agentId: resolved.agentId,
+        entries: resolved.entries,
+        metadata: resolved.metadata,
+        lineCount: resolved.lineCount,
+        subagents,
+      });
+      output(success(result, meta(1, 1)));
+    } catch (err: unknown) {
+      handleCommandError(err);
+    }
+  },
+});
+
+// ============================================================================
 // Tools Command
 // ============================================================================
 
 const toolsCommand = defineCommand({
-  meta: { name: 'tools', description: 'Tool call log with condensed input summaries' },
+  meta: { name: 'tools', description: 'Tool call log with outcomes; --input-match searches raw structured inputs beyond input_summary' },
   args: {
     session: { type: 'positional', description: 'Session ID (UUID, prefix, or slug)', required: true },
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
     'claude-project': { type: 'string', description: 'Raw Claude project directory basename' },
     name: { type: 'string', description: 'Filter by tool name' },
+    'name-match': { type: 'string', description: 'Filter tool names by case-insensitive substring' },
+    'input-match': { type: 'string', description: 'Filter by raw structured tool input substring' },
+    'input-regex': { type: 'string', description: 'Filter by raw structured tool input regex' },
     failed: { type: 'boolean', description: 'Show only failed/empty outcomes', default: false },
     turn: { type: 'string', description: 'Filter by turn N or N-M' },
   },
   async run({ args }) {
     try {
+      if (args.name && args['name-match']) {
+        throw cliError('INVALID_ARGS', '--name and --name-match are mutually exclusive');
+      }
+      if (args['input-match'] && args['input-regex']) {
+        throw cliError('INVALID_ARGS', '--input-match and --input-regex are mutually exclusive');
+      }
+      let inputMatcher: TextMatcher | null = null;
+      if (args['input-regex']) {
+        try {
+          inputMatcher = parseRegexMatcher(args['input-regex'], '--input-regex');
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw cliError('INVALID_ARGS', message);
+        }
+      } else {
+        inputMatcher = parseSubstringMatcher(args['input-match']);
+      }
+      const nameMatcher = parseSubstringMatcher(args['name-match']);
       const { sessionId, agentId, entries } = await resolveSession(args);
 
       const turnRange = args.turn ? parseTurnRange(args.turn) : null;
@@ -1726,12 +1965,13 @@ const toolsCommand = defineCommand({
       const resultLookup = buildResultLookup(entries);
 
       // Pass 2: Extract tool calls
-      let calls: ToolCall[] = [];
+      let calls: ToolCallWithRawInput[] = [];
       let turnNum = 0;
       for (const entry of entries) {
         turnNum++;
         if (entry.type === 'assistant' && Array.isArray(entry.message?.content)) {
           for (const block of entry.message!.content as ContentBlock[]) {
+            const rawInput = block.input ?? {};
             if (block.type === 'tool_use' && block.name) {
               const resultInfo = resultLookup.get(block.id ?? '') ?? null;
               let durationMs: number | null = null;
@@ -1742,9 +1982,10 @@ const toolsCommand = defineCommand({
               calls.push({
                 turn: turnNum,
                 tool: block.name,
-                input_summary: inputSummary(block.name, block.input ?? {}),
+                input_summary: inputSummary(block.name, rawInput),
                 outcome: determineOutcome(resultInfo),
                 duration_ms: durationMs,
+                raw_input: rawInput,
               });
             }
           }
@@ -1753,11 +1994,14 @@ const toolsCommand = defineCommand({
 
       // Apply filters
       if (args.name) calls = calls.filter(c => c.tool === args.name);
+      if (nameMatcher) calls = calls.filter(c => testTextMatcher(nameMatcher, c.tool));
+      if (inputMatcher) calls = calls.filter(c => toolInputMatchesMatcher(c.raw_input, inputMatcher));
       if (args.failed) calls = calls.filter(c => c.outcome === 'empty' || c.outcome.startsWith('error:'));
       if (turnRange) calls = calls.filter(c => c.turn >= turnRange.start && c.turn <= turnRange.end);
 
       const total = calls.length;
-      const result: ToolsResult = { session_id: sessionId, agent_id: agentId, tool_calls: calls };
+      const publicCalls: ToolCall[] = calls.map(({ raw_input: _rawInput, ...call }) => call);
+      const result: ToolsResult = { session_id: sessionId, agent_id: agentId, tool_calls: publicCalls };
       output(success(result, meta(total, total)));
     } catch (err: unknown) {
       handleCommandError(err);
@@ -1866,13 +2110,19 @@ const messagesCommand = defineCommand({
     type: { type: 'string', description: 'Filter by content block type' },
     turn: { type: 'string', description: 'Filter by turn N or N-M' },
     'max-content': { type: 'string', description: 'Truncate content to N chars (default: 200)' },
+    'max-tool-result': { type: 'string', description: 'Truncate tool_result content to N chars (default: 200)' },
   },
   async run({ args }) {
     try {
       const { sessionId, agentId, entries } = await resolveSession(args);
 
-      const maxContent = parseIntArg(args['max-content'], '--max-content') ?? 200;
       const turnRange = args.turn ? parseTurnRange(args.turn) : null;
+      const maxContent = parseIntArg(args['max-content'], '--max-content');
+      const maxToolResult = parseIntArg(args['max-tool-result'], '--max-tool-result');
+      const singleTurn = turnRange != null && turnRange.start === turnRange.end;
+      const textMax = maxContent ?? (singleTurn ? null : 200);
+      const thinkingMax = maxContent ?? (singleTurn ? null : 200);
+      const toolResultMax = maxToolResult ?? maxContent ?? 200;
       if (args.role && args.role !== 'user' && args.role !== 'assistant') {
         throw cliError('INVALID_ARGS', "--role must be 'user' or 'assistant'");
       }
@@ -1910,9 +2160,9 @@ const messagesCommand = defineCommand({
         const processed = blocks.map(block => {
           switch (block.type) {
             case 'text':
-              return { type: 'text', text: truncateContent(block.text ?? '', maxContent) };
+              return { type: 'text', text: textMax == null ? block.text ?? '' : truncateContent(block.text ?? '', textMax) };
             case 'thinking':
-              return { type: 'thinking', text: truncateContent(block.thinking ?? '', maxContent) };
+              return { type: 'thinking', text: thinkingMax == null ? block.thinking ?? '' : truncateContent(block.thinking ?? '', thinkingMax) };
             case 'tool_use':
               return { type: 'tool_use', name: block.name, id: block.id };
             case 'tool_result': {
@@ -1921,7 +2171,7 @@ const messagesCommand = defineCommand({
                 type: 'tool_result',
                 tool_use_id: block.tool_use_id,
                 is_error: block.is_error ?? false,
-                content: truncateContent(contentText, maxContent),
+                content: truncateContent(contentText, toolResultMax),
               };
             }
             case 'image':
@@ -1971,7 +2221,7 @@ const sliceCommand = defineCommand({
         if (turnNum < turnRange.start) continue;
         if (turnNum > turnRange.end) break;
 
-        if (maxContent != null && maxContent > 0) {
+        if (maxContent != null) {
           // Deep clone and truncate content blocks
           const cloned = JSON.parse(JSON.stringify(entry)) as SessionEntry;
           truncateEntryContent(cloned, maxContent);
@@ -2036,6 +2286,30 @@ export function listSearchTargetsForContext(context: SearchProjectContext): Sear
     }));
 }
 
+function listSubagentTargetsForParent(parent: SearchTarget): SearchTarget[] {
+  const claudeDir = parent.context?.projectRef.claude_dir ?? parent.projectRef?.claude_dir ?? dirname(parent.filePath);
+  const subagentDir = join(claudeDir, parent.sessionId, 'subagents');
+  if (!existsSync(subagentDir)) return [];
+  return readdirSync(subagentDir)
+    .filter(isSubagentFile)
+    .sort()
+    .map(file => ({
+      filePath: join(subagentDir, file),
+      sessionId: parent.sessionId,
+      parentSessionId: parent.sessionId,
+      agentId: file.slice('agent-'.length, -'.jsonl'.length),
+      context: parent.context,
+      projectRef: parent.projectRef,
+    }));
+}
+
+export function listSearchSessionGroupsForContext(context: SearchProjectContext, includeSubagents: boolean): SearchSessionGroup[] {
+  return listSearchTargetsForContext(context).map(parent => ({
+    parent,
+    subagents: includeSubagents ? listSubagentTargetsForParent(parent) : [],
+  }));
+}
+
 export async function mapConcurrent<T, R>(
   items: T[],
   concurrency: number,
@@ -2057,24 +2331,53 @@ export async function mapConcurrent<T, R>(
   return results;
 }
 
-type SearchTargetResult = {
-  match: SearchMatch | null;
+type TranscriptScan = {
+  target: SearchTarget;
+  metadata: ReturnType<typeof extractSessionMetadata>;
+  evidence: SearchEvidence[];
+  allToolCalls: ToolCallScanRecord[];
+  tools: string[];
+  files: string[];
+  normalizedFiles: string[];
+  operations: SearchOperation[];
+  turns: number[];
+  hits: {
+    tool: boolean;
+    file: boolean;
+    text: boolean;
+    bash: boolean;
+    input: boolean;
+    intent: boolean;
+  };
 };
 
-export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, afterCutoff: string | null): Promise<SearchTargetResult> {
+function sessionRefForSearchTarget(target: SearchTarget): SessionRef {
+  const projectRef = target.context?.projectRef ?? target.projectRef;
+  const ref: SessionRef = {
+    session_id: target.sessionId,
+    project: projectRef?.project ?? basename(dirname(target.filePath)),
+  };
+  if (target.agentId) ref.agent_id = target.agentId;
+  return ref;
+}
+
+function addEvidenceProvenance(evidence: SearchEvidence, target: SearchTarget): SearchEvidence {
+  if (target.agentId) {
+    evidence.agent_id = target.agentId;
+    evidence.parent_session_id = target.parentSessionId ?? target.sessionId;
+    evidence.is_subagent = true;
+  }
+  return evidence;
+}
+
+function searchKindHit(evidence: SearchEvidence[], kind: SearchEvidenceKind): boolean {
+  return evidence.some(item => item.kind === kind);
+}
+
+async function scanSearchTranscript(target: SearchTarget, args: PreparedSearchArgs): Promise<TranscriptScan | null> {
   try {
     const text = await Bun.file(target.filePath).text();
-
-    const { branch, timestamp, slug } = extractSessionMetadata(text);
-
-    if (args.branch && branch !== args.branch) return { match: null };
-    if (afterCutoff) {
-      if (!timestamp || timestamp < afterCutoff) return { match: null };
-    }
-    if (args.before) {
-      if (!timestamp || timestamp > args.before) return { match: null };
-    }
-
+    const metadata = extractSessionMetadata(text);
     const entries = parseSessionText(text);
     const uaEntries = userAssistantEntries(entries);
     const sessionContext = target.context ? buildSearchSessionContext(target.context, entries) : null;
@@ -2082,24 +2385,60 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
     const matchedTools = new Set<string>();
     const matchedFiles = new Set<string>();
     const matchedNormalizedFiles = new Set<string>();
-    const matchedFileEvidence: FileMatchEvidence[] = [];
+    const matchedEvidence: SearchEvidence[] = [];
+    const allToolCalls: ToolCallScanRecord[] = [];
     const matchedOperations = new Set<SearchOperation>();
-    const matchedToolInputs: ToolInputMatch[] = [];
     const matchedTurns = new Set<number>();
 
     const toolQuery = args.tool?.toLowerCase();
     const fileQuery = args.file && sessionContext ? normalizeFileQuery(args.file, sessionContext) : null;
     const rawFileQuery = args.file?.toLowerCase();
-    const textQuery = args.text?.toLowerCase();
-    const bashQuery = args.bash?.toLowerCase();
-    const inputQuery = args.inputMatch?.toLowerCase();
     const operationQuery = args.operation;
+    const textRole = args.textRole ?? 'all';
 
-    let toolHit = !toolQuery;
+    for (const intent of extractSessionIntent(entries, metadata)) {
+      if (!args.intentMatcher || !testTextMatcher(args.intentMatcher, intent.value)) continue;
+      matchedEvidence.push(addEvidenceProvenance({
+        kind: 'intent',
+        turn: intent.source === 'slug' ? 0 : 1,
+        block_index: null,
+        timestamp: metadata.timestamp,
+        snippet: snippetForMatch(intent.value, args.intentMatcher, SEARCH_EVIDENCE_SNIPPET_CHARS),
+        intent_source: intent.source,
+      }, target));
+    }
+
+    for (const normalized of normalizedBlocks(entries)) {
+      if (args.textMatcher && (textRole === 'all' || normalized.role === textRole)) {
+        if (normalized.block.type === 'text' && typeof normalized.block.text === 'string' && testTextMatcher(args.textMatcher, normalized.block.text)) {
+          matchedEvidence.push(addEvidenceProvenance({
+            kind: 'text',
+            turn: normalized.turn,
+            block_index: normalized.block_index,
+            timestamp: normalized.timestamp,
+            role: normalized.role,
+            snippet: snippetForMatch(normalized.block.text, args.textMatcher, SEARCH_EVIDENCE_SNIPPET_CHARS),
+          }, target));
+          matchedTurns.add(normalized.turn);
+        }
+        if (normalized.block.type === 'thinking' && typeof normalized.block.thinking === 'string' && testTextMatcher(args.textMatcher, normalized.block.thinking)) {
+          matchedEvidence.push(addEvidenceProvenance({
+            kind: 'thinking',
+            turn: normalized.turn,
+            block_index: normalized.block_index,
+            timestamp: normalized.timestamp,
+            role: normalized.role,
+            snippet: snippetForMatch(normalized.block.thinking, args.textMatcher, SEARCH_EVIDENCE_SNIPPET_CHARS),
+          }, target));
+          matchedTurns.add(normalized.turn);
+        }
+      }
+    }
+
+    let toolHit = !args.tool;
     let fileHit = !args.file;
-    let textHit = !textQuery;
-    let bashHit = !bashQuery;
-    let inputHit = !inputQuery;
+    let bashHit = !args.bashMatcher;
+    let inputHit = !args.inputMatcher;
 
     for (let ei = 0; ei < uaEntries.length; ei++) {
       const entry = uaEntries[ei]!;
@@ -2107,7 +2446,23 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
       const content = entry.message?.content;
       if (!Array.isArray(content)) continue;
 
-      for (const block of content as ContentBlock[]) {
+      for (let blockIndex = 0; blockIndex < content.length; blockIndex++) {
+        const block = (content as ContentBlock[])[blockIndex]!;
+        if (block.type === 'tool_use' && block.name) {
+          const rawInput = block.input ?? {};
+          allToolCalls.push({
+            turn: turnNum,
+            block_index: blockIndex,
+            timestamp: entry.timestamp ?? null,
+            tool: block.name,
+            input_summary: safeInputSummary(block.name, rawInput),
+            rawInput,
+            agentId: target.agentId ?? null,
+            parentSessionId: target.parentSessionId ?? null,
+            isSubagent: Boolean(target.agentId),
+          });
+        }
+
         if (toolQuery && block.type === 'tool_use' && block.name) {
           if (block.name.toLowerCase().includes(toolQuery)) {
             matchedTools.add(block.name);
@@ -2116,20 +2471,24 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
           }
         }
 
-        if ((toolQuery || inputQuery) && block.type === 'tool_use' && block.name) {
+        if ((args.tool || args.inputMatcher) && block.type === 'tool_use' && block.name) {
           const input = block.input ?? {};
           const nameMatches = !toolQuery || block.name.toLowerCase().includes(toolQuery);
-          const inputMatches = !inputQuery || toolInputMatches(input, inputQuery);
+          const inputMatches = toolInputMatchesMatcher(input, args.inputMatcher ?? null);
           if (nameMatches && inputMatches) {
-            matchedToolInputs.push({
-              tool: block.name,
-              input_summary: inputSummary(block.name, input),
+            matchedEvidence.push(addEvidenceProvenance({
+              kind: 'tool_input',
               turn: turnNum,
-            });
+              block_index: blockIndex,
+              timestamp: entry.timestamp ?? null,
+              tool: block.name,
+              input_summary: safeInputSummary(block.name, input),
+              snippet: args.inputMatcher ? snippetForMatch(stableJsonStringify(input), args.inputMatcher, SEARCH_EVIDENCE_SNIPPET_CHARS) : undefined,
+            }, target));
             matchedTools.add(block.name);
             matchedTurns.add(turnNum);
             if (toolQuery) toolHit = true;
-            if (inputQuery) inputHit = true;
+            if (args.inputMatcher) inputHit = true;
           }
         }
 
@@ -2149,13 +2508,15 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
             if (!operationQuery || fileInfo.operation === operationQuery) {
               matchedFiles.add(fileInfo.path);
               if (fileMatch.logicalPath) matchedNormalizedFiles.add(fileMatch.logicalPath);
-              matchedFileEvidence.push({
+              matchedEvidence.push(addEvidenceProvenance({
+                kind: 'file',
                 rawPath: fileInfo.path,
                 logicalPath: fileMatch.logicalPath,
                 operation: fileInfo.operation,
                 turn: turnNum,
+                block_index: blockIndex,
                 timestamp: entry.timestamp ?? null,
-              });
+              }, target));
               matchedOperations.add(fileInfo.operation);
               matchedTurns.add(turnNum);
               fileHit = true;
@@ -2163,20 +2524,17 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
           }
         }
 
-        if (textQuery && entry.type === 'assistant') {
-          if (block.type === 'text' && block.text && block.text.toLowerCase().includes(textQuery)) {
-            matchedTurns.add(turnNum);
-            textHit = true;
-          }
-          if (block.type === 'thinking' && block.thinking && block.thinking.toLowerCase().includes(textQuery)) {
-            matchedTurns.add(turnNum);
-            textHit = true;
-          }
-        }
-
-        if (bashQuery && block.type === 'tool_use' && block.name === 'Bash') {
+        if (args.bashMatcher && block.type === 'tool_use' && block.name === 'Bash') {
           const command = (block.input as Record<string, any>)?.command;
-          if (typeof command === 'string' && command.toLowerCase().includes(bashQuery)) {
+          if (typeof command === 'string' && testTextMatcher(args.bashMatcher, command)) {
+            matchedEvidence.push(addEvidenceProvenance({
+              kind: 'bash',
+              turn: turnNum,
+              block_index: blockIndex,
+              timestamp: entry.timestamp ?? null,
+              tool: 'Bash',
+              snippet: snippetForMatch(command, args.bashMatcher, SEARCH_EVIDENCE_SNIPPET_CHARS),
+            }, target));
             matchedTurns.add(turnNum);
             bashHit = true;
           }
@@ -2184,17 +2542,80 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
       }
     }
 
-    if (!toolHit || !fileHit || !textHit || !bashHit || !inputHit) return { match: null };
+    return {
+      target,
+      metadata,
+      evidence: matchedEvidence,
+      allToolCalls,
+      tools: Array.from(matchedTools),
+      files: Array.from(matchedFiles),
+      normalizedFiles: Array.from(matchedNormalizedFiles),
+      operations: Array.from(matchedOperations),
+      turns: Array.from(matchedTurns),
+      hits: {
+        tool: toolHit,
+        file: fileHit,
+        text: !args.textMatcher || searchKindHit(matchedEvidence, 'text') || searchKindHit(matchedEvidence, 'thinking'),
+        bash: bashHit,
+        input: inputHit,
+        intent: !args.intentMatcher || searchKindHit(matchedEvidence, 'intent'),
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function scanSearchGroup(group: SearchSessionGroup, args: PreparedSearchArgs, afterCutoff: string | null): Promise<SearchMatch | null> {
+  const parentScan = await scanSearchTranscript(group.parent, args);
+  if (!parentScan) return null;
+
+  const { branch, timestamp, slug, model } = parentScan.metadata;
+
+  if (args.branch && branch !== args.branch) return null;
+  if (afterCutoff) {
+    if (!timestamp || timestamp < afterCutoff) return null;
+  }
+  if (args.before) {
+    if (!timestamp || timestamp > args.before) return null;
+  }
+
+  const scans = [parentScan];
+  for (const subagent of group.subagents) {
+    const scan = await scanSearchTranscript(subagent, args);
+    if (scan) scans.push(scan);
+  }
+
+  const hit = (name: keyof TranscriptScan['hits']) => scans.some(scan => scan.hits[name]);
+  if (!hit('tool') || !hit('file') || !hit('text') || !hit('bash') || !hit('input') || !hit('intent')) return null;
+
+  const matchedTools = new Set<string>();
+  const matchedFiles = new Set<string>();
+  const matchedNormalizedFiles = new Set<string>();
+  const matchedOperations = new Set<SearchOperation>();
+  const matchedTurns = new Set<number>();
+  const matchedEvidence: SearchEvidence[] = [];
+  for (const scan of scans) {
+    scan.tools.forEach(item => matchedTools.add(item));
+    scan.files.forEach(item => matchedFiles.add(item));
+    scan.normalizedFiles.forEach(item => matchedNormalizedFiles.add(item));
+    scan.operations.forEach(item => matchedOperations.add(item));
+    scan.turns.forEach(item => matchedTurns.add(item));
+    matchedEvidence.push(...scan.evidence);
+  }
 
     const match: SearchMatch = {
-      session_id: target.sessionId,
+      session_id: group.parent.sessionId,
       branch,
       timestamp,
       slug,
+      model,
+      session_ref: sessionRefForSearchTarget(group.parent),
       matches: {
         tools: Array.from(matchedTools),
         files: Array.from(matchedFiles),
         turns: Array.from(matchedTurns).sort((a, b) => a - b),
+        evidence: matchedEvidence,
       },
     };
 
@@ -2204,42 +2625,56 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
     if (matchedNormalizedFiles.size > 0) {
       match.matches.normalized_files = Array.from(matchedNormalizedFiles);
     }
-    if (matchedFileEvidence.length > 0) {
-      match.matches.file_evidence = matchedFileEvidence;
-    }
-    if (matchedToolInputs.length > 0) {
-      match.matches.tool_inputs = matchedToolInputs;
-    }
-    const projectRef = target.context?.projectRef ?? target.projectRef;
-    const exposeProjectRef = target.context ? target.context.role !== 'main' : Boolean(target.projectRef);
+    const projectRef = group.parent.context?.projectRef ?? group.parent.projectRef;
+    const exposeProjectRef = group.parent.context ? group.parent.context.role !== 'main' : Boolean(group.parent.projectRef);
     if (projectRef && exposeProjectRef) {
       match.project = projectRef.project;
       match.project_path_guess = projectRef.project_path_guess;
-      if (target.context) {
-        match.project_role = target.context.role;
+      if (group.parent.context) {
+        match.project_role = group.parent.context.role;
       }
-      match.session_ref = {
-        session_id: target.sessionId,
-        project: projectRef.project,
-      };
     }
 
-    return { match };
-  } catch {
-    return { match: null };
-  }
+    attachCounterTranscriptResults(match, scans.map(scan => ({
+      target: {
+        filePath: scan.target.filePath,
+        sessionId: scan.target.sessionId,
+        parentSessionId: scan.target.parentSessionId ?? null,
+        agentId: scan.target.agentId ?? null,
+        context: scan.target.context,
+        projectRef: scan.target.projectRef,
+      },
+      metadata: scan.metadata,
+      allToolCalls: scan.allToolCalls,
+    })));
+
+    return match;
 }
 
-export async function scanSearchTargets(targets: SearchTarget[], args: SearchArgs, afterCutoff: string | null): Promise<SearchScanResult> {
+export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, afterCutoff: string | null): Promise<{ match: SearchMatch | null }> {
+  const preparedArgs: PreparedSearchArgs = {
+    ...args,
+    textMatcher: parseSubstringMatcher(args.text),
+    bashMatcher: parseSubstringMatcher(args.bash),
+    inputMatcher: parseSubstringMatcher(args.inputMatch),
+    intentMatcher: parseSubstringMatcher(args.intentMatch),
+    includeSubagents: false,
+  };
+  return {
+    match: await scanSearchGroup({ parent: target, subagents: [] }, preparedArgs, afterCutoff),
+  };
+}
+
+export async function scanSearchGroups(groups: SearchSessionGroup[], args: PreparedSearchArgs, afterCutoff: string | null): Promise<SearchScanResult> {
   const matches: SearchMatch[] = [];
 
-  const targetResults = await mapConcurrent(
-    targets,
+  const groupResults = await mapConcurrent(
+    groups,
     SEARCH_SCAN_CONCURRENCY,
-    target => scanSearchTarget(target, args, afterCutoff),
+    group => scanSearchGroup(group, args, afterCutoff),
   );
-  for (const result of targetResults) {
-    if (result.match) matches.push(result.match);
+  for (const match of groupResults) {
+    if (match) matches.push(match);
   }
 
   return { matches };
@@ -2247,18 +2682,18 @@ export async function scanSearchTargets(targets: SearchTarget[], args: SearchArg
 
 export async function scanProjectContexts(
   contexts: SearchProjectContext[],
-  args: SearchArgs,
+  args: PreparedSearchArgs,
   afterCutoff: string | null,
 ): Promise<SearchScanResult> {
-  const targets: SearchTarget[] = [];
+  const groups: SearchSessionGroup[] = [];
   for (const context of contexts) {
     try {
-      targets.push(...listSearchTargetsForContext(context));
+      groups.push(...listSearchSessionGroupsForContext(context, args.includeSubagents ?? true));
     } catch {
       // Preserve search's tolerant handling of unreadable Claude project directories.
     }
   }
-  return scanSearchTargets(targets, args, afterCutoff);
+  return scanSearchGroups(groups, args, afterCutoff);
 }
 
 function compareNullableTimestamp(a: string | null | undefined, b: string | null | undefined, direction: 'asc' | 'desc'): number {
@@ -2268,15 +2703,8 @@ function compareNullableTimestamp(a: string | null | undefined, b: string | null
   return direction === 'asc' ? a.localeCompare(b) : b.localeCompare(a);
 }
 
-function sortedEvidenceTimestamps(match: SearchMatch): string[] {
-  return (match.matches.file_evidence ?? [])
-    .map(evidence => evidence.timestamp)
-    .filter((timestamp): timestamp is string => Boolean(timestamp))
-    .sort();
-}
-
 function matchTimestamp(match: SearchMatch, mode: 'earliest' | 'newest'): string | null {
-  const timestamps = sortedEvidenceTimestamps(match);
+  const timestamps = evidenceTimestamps(match, 'file');
   if (timestamps.length === 0) return match.timestamp;
   return mode === 'earliest' ? timestamps[0]! : timestamps[timestamps.length - 1]!;
 }
@@ -2316,9 +2744,9 @@ export function aggregateSearchMatches(matches: SearchMatch[], mode: SearchAggre
       timestamp: match.timestamp,
       slug: match.slug,
       counts: {
-        tool_inputs: match.matches.tool_inputs?.length ?? 0,
+        tool_inputs: match.matches.evidence.filter(evidence => evidence.kind === 'tool_input').length,
       },
-      sample_matches: (match.matches.tool_inputs ?? []).slice(0, 5),
+      sample_matches: toolInputSamplesFromEvidence(match.matches.evidence),
     };
     if (match.project !== undefined) result.project = match.project;
     if (match.project_path_guess !== undefined) result.project_path_guess = match.project_path_guess;
@@ -2332,31 +2760,61 @@ export function aggregateSearchMatches(matches: SearchMatch[], mode: SearchAggre
 // ============================================================================
 
 const searchCommand = defineCommand({
-  meta: { name: 'search', description: 'Find sessions matching structured queries' },
+  meta: { name: 'search', description: 'Find sessions with unified evidence; scoped search includes worktrees and subagents by default' },
   args: {
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
     'all-projects': { type: 'boolean', description: 'Search all Claude project directories', default: false },
     'project-glob': { type: 'string', description: 'Filter --all-projects by Claude project identity glob' },
     tool: { type: 'string', description: 'Sessions using a specific tool (case-insensitive substring)' },
     'input-match': { type: 'string', description: 'Sessions with raw structured tool input containing a case-insensitive substring' },
+    'input-regex': { type: 'string', description: 'Sessions with raw structured tool input matching a regex' },
     file: { type: 'string', description: 'Sessions that touched a file (substring match on path)' },
-    text: { type: 'string', description: 'Search in assistant text and thinking content (case-insensitive substring)' },
+    text: { type: 'string', description: 'Search in user/assistant text and thinking content (case-insensitive substring)' },
+    'text-regex': { type: 'string', description: 'Search in user/assistant text and thinking content with a regex' },
+    'text-role': { type: 'string', description: 'Restrict text search to user, assistant, or all' },
+    'intent-match': { type: 'string', description: 'Search session intent sources by substring' },
+    'intent-regex': { type: 'string', description: 'Search session intent sources by regex' },
     bash: { type: 'string', description: 'Search in Bash command inputs (case-insensitive substring)' },
+    'bash-regex': { type: 'string', description: 'Search in Bash command inputs with a regex' },
+    subagents: { type: 'boolean', description: 'Include one-level subagent transcripts in search groups by default; use --no-subagents to disable', default: true },
     branch: { type: 'string', description: 'Filter by git branch' },
     after: { type: 'string', description: 'Sessions after DATE (ISO 8601)' },
     before: { type: 'string', description: 'Sessions before DATE (ISO 8601)' },
     since: { type: 'string', description: 'Sessions from the last duration (e.g. 1d, 2h, 1w)' },
-    operation: { type: 'string', description: 'With --file, filter by operation: read/edit/write/grep/glob' },
+    operation: { type: 'string', description: 'With --file, bind operation to the same matching file access: read/edit/write/grep/glob' },
     origin: { type: 'boolean', description: 'With --file, return earliest matching write evidence', default: false },
     sort: { type: 'string', description: 'Sort mode: session-newest, match-earliest, match-newest, project' },
-    aggregate: { type: 'string', description: 'Aggregate mode: count-per-session' },
+    aggregate: { type: 'string', description: 'Aggregate mode: count-per-session, counters' },
+    counter: { type: 'string', description: 'Named raw-input counter as NAME=substring' },
+    'counter-regex': { type: 'string', description: 'Named raw-input counter as NAME=regex' },
+    bucket: { type: 'string', description: 'Bucket counter aggregates by: day, week' },
+    'per-subagent': { type: 'boolean', description: 'Emit transcript-level counter rows instead of parent session rollups', default: false },
     last: { type: 'string', description: 'Return only the last N matches' },
   },
   async run({ args }) {
     try {
+      const rawArgs = args as Record<string, unknown>;
+      const hasCounters = Boolean(rawArgs.counter) || Boolean(rawArgs['counter-regex']);
       // Validate at least one search filter is provided
-      if (!args.tool && !args['input-match'] && !args.file && !args.text && !args.bash) {
-        throw cliError('INVALID_ARGS', 'At least one search filter is required (--tool, --input-match, --file, --text, or --bash)');
+      if (!args.tool && !args['input-match'] && !args['input-regex'] && !args.file && !args.text && !args['text-regex'] && !args.bash && !args['bash-regex'] && !args['intent-match'] && !args['intent-regex'] && !hasCounters) {
+        throw cliError('INVALID_ARGS', 'At least one search filter is required (--tool, --input-match, --input-regex, --file, --text, --text-regex, --intent-match, --intent-regex, --bash, --bash-regex, --counter, or --counter-regex)');
+      }
+
+      if (args['input-match'] && args['input-regex']) {
+        throw cliError('INVALID_ARGS', '--input-match and --input-regex are mutually exclusive');
+      }
+      if (args.text && args['text-regex']) {
+        throw cliError('INVALID_ARGS', '--text and --text-regex are mutually exclusive');
+      }
+      if (args['intent-match'] && args['intent-regex']) {
+        throw cliError('INVALID_ARGS', '--intent-match and --intent-regex are mutually exclusive');
+      }
+      if (args.bash && args['bash-regex']) {
+        throw cliError('INVALID_ARGS', '--bash and --bash-regex are mutually exclusive');
+      }
+      const textRole = (args['text-role'] ?? 'all') as SearchArgs['textRole'];
+      if (textRole !== 'user' && textRole !== 'assistant' && textRole !== 'all') {
+        throw cliError('INVALID_ARGS', '--text-role must be one of: user, assistant, all');
       }
 
       // Validate --since and --after mutual exclusivity
@@ -2375,11 +2833,18 @@ const searchCommand = defineCommand({
         throw cliError('INVALID_ARGS', '--sort must be one of: session-newest, match-earliest, match-newest, project');
       }
       const aggregateMode = (args.aggregate ?? 'none') as SearchAggregateMode;
-      if (aggregateMode !== 'none' && aggregateMode !== 'count-per-session') {
-        throw cliError('INVALID_ARGS', '--aggregate must be count-per-session');
+      if (aggregateMode !== 'none' && aggregateMode !== 'count-per-session' && aggregateMode !== 'counters') {
+        throw cliError('INVALID_ARGS', '--aggregate must be one of: count-per-session, counters');
       }
-      if (aggregateMode !== 'none' && !args.tool && !args['input-match']) {
-        throw cliError('INVALID_ARGS', '--aggregate requires --tool or --input-match');
+      if (aggregateMode === 'count-per-session' && !args.tool && !args['input-match'] && !args['input-regex']) {
+        throw cliError('INVALID_ARGS', '--aggregate requires --tool, --input-match, or --input-regex');
+      }
+      const bucketMode = (args.bucket ?? 'none') as SearchBucketMode;
+      if (bucketMode !== 'none' && bucketMode !== 'day' && bucketMode !== 'week') {
+        throw cliError('INVALID_ARGS', '--bucket must be one of: day, week');
+      }
+      if (bucketMode !== 'none' && aggregateMode !== 'counters') {
+        throw cliError('INVALID_ARGS', '--bucket requires --aggregate counters');
       }
 
       const origin = Boolean(args.origin);
@@ -2401,17 +2866,63 @@ const searchCommand = defineCommand({
         throw cliError('INVALID_ARGS', '--last must be a positive integer');
       }
 
-      const searchArgs: SearchArgs = {
+      const parseCliRegexMatcher = (pattern: string | undefined, flagName: string): TextMatcher | null => {
+        try {
+          return parseRegexMatcher(pattern, flagName);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw cliError('INVALID_ARGS', message);
+        }
+      };
+
+      const counters = (() => {
+        try {
+          return parseCounterArgs(
+            rawArgs.counter as string | string[] | undefined,
+            rawArgs['counter-regex'] as string | string[] | undefined,
+          );
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw cliError('INVALID_ARGS', message);
+        }
+      })();
+      if (aggregateMode === 'counters' && counters.length === 0) {
+        throw cliError('INVALID_ARGS', '--aggregate counters requires at least one --counter or --counter-regex');
+      }
+      if (aggregateMode !== 'counters' && counters.length > 0) {
+        throw cliError('INVALID_ARGS', '--counter and --counter-regex require --aggregate counters');
+      }
+
+      const searchArgs: PreparedSearchArgs = {
         tool: args.tool,
         inputMatch: args['input-match'],
+        inputRegex: args['input-regex'],
+        inputMatcher: args['input-regex']
+          ? parseCliRegexMatcher(args['input-regex'], '--input-regex')
+          : parseSubstringMatcher(args['input-match']),
         file: args.file,
         text: args.text,
+        textRegex: args['text-regex'],
+        textRole,
+        textMatcher: args['text-regex']
+          ? parseCliRegexMatcher(args['text-regex'], '--text-regex')
+          : parseSubstringMatcher(args.text),
         bash: args.bash,
+        bashRegex: args['bash-regex'],
+        bashMatcher: args['bash-regex']
+          ? parseCliRegexMatcher(args['bash-regex'], '--bash-regex')
+          : parseSubstringMatcher(args.bash),
+        intentMatch: args['intent-match'],
+        intentRegex: args['intent-regex'],
+        intentMatcher: args['intent-regex']
+          ? parseCliRegexMatcher(args['intent-regex'], '--intent-regex')
+          : parseSubstringMatcher(args['intent-match']),
         branch: args.branch,
         after: args.after,
         before: args.before,
         since: args.since,
         operation: origin ? 'write' : args.operation as SearchOperation | undefined,
+        includeSubagents: args.subagents !== false && !(args as Record<string, unknown>)['no-subagents'],
       };
 
       const allProjects = Boolean(args['all-projects']);
@@ -2434,7 +2945,20 @@ const searchCommand = defineCommand({
       const total = results.length;
       const resultLimit = origin ? lastN ?? 1 : lastN;
       const returned = resultLimit != null ? results.slice(0, resultLimit) : results;
-      const responseMeta: SearchMeta = meta(total, returned.length);
+      let responseData: unknown = returned;
+      let responseMeta: SearchMeta = meta(total, returned.length);
+      if (aggregateMode === 'count-per-session') {
+        responseData = aggregateSearchMatches(returned, aggregateMode);
+      } else if (aggregateMode === 'counters') {
+        const explicitSelector = Boolean(args.tool || args['input-match'] || args['input-regex'] || args.file || args.text || args['text-regex'] || args.bash || args['bash-regex'] || args['intent-match'] || args['intent-regex']);
+        const counterRows = aggregateCounterRows(returned, counters, {
+          tool: args.tool,
+          explicitSelector,
+          perSubagent: Boolean(args['per-subagent']),
+        });
+        responseData = bucketMode === 'none' ? counterRows : bucketCounterRows(counterRows, bucketMode);
+        responseMeta = meta(Array.isArray(responseData) ? responseData.length : 0, Array.isArray(responseData) ? responseData.length : 0);
+      }
       if (allProjects) {
         responseMeta.projects_scanned = selection.contexts.length;
         responseMeta.included_projects = selection.includedProjects;
@@ -2442,10 +2966,7 @@ const searchCommand = defineCommand({
       } else {
         responseMeta.included_projects = selection.includedProjects;
       }
-      output(success(
-        aggregateMode === 'count-per-session' ? aggregateSearchMatches(returned, aggregateMode) : returned,
-        responseMeta,
-      ));
+      output(success(responseData, responseMeta));
     } catch (err: unknown) {
       handleCommandError(err);
     }
@@ -2488,11 +3009,13 @@ const main = defineCommand({
   meta: {
     name: 'cc-session-tool',
     version: VERSION,
-    description: 'Query Claude Code session transcripts',
+    description: 'Query Claude Code session transcripts with stable raw project/session_ref handles',
   },
   subCommands: {
     list: listCommand,
+    projects: projectsCommand,
     shape: shapeCommand,
+    summary: summaryCommand,
     messages: messagesCommand,
     tools: toolsCommand,
     tokens: tokensCommand,
