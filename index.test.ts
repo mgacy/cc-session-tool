@@ -2054,6 +2054,7 @@ describe('list integration', () => {
     const session1 = result.data.find((s: any) => s.session_id === SESSION_ID);
     expect(session1).toBeDefined();
     expect(session1.branch).toBe('main');
+    expect(session1.model).toBe('claude-sonnet-4-5');
     expect(session1.slug).toBe('test-slug-fixture');
   });
 

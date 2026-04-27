@@ -88,6 +88,7 @@ cc-session-tool list [--project <path>] [--main-only] [--all-projects] [--projec
       "branch": "feature/auth",
       "timestamp": "2026-03-07T22:31:26.359Z",
       "version": "2.1.71",
+      "model": "claude-sonnet-4-5",
       "lines": 342,
       "slug": "snuggly-floating-barto"
     }

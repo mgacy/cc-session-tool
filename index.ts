@@ -123,6 +123,7 @@ export type ListSession = {
   branch: string | null;
   timestamp: string | null;
   version: string | null;
+  model: string | null;
   lines: number;
   slug: string | null;
   subagent_count?: number;
@@ -1156,7 +1157,7 @@ async function listSessionsForContext(
 
         if (minLines > 0 && lineCount < minLines) return null;
 
-        const { branch, timestamp, version, slug } = extractSessionMetadata(text);
+        const { branch, timestamp, version, slug, model } = extractSessionMetadata(text);
 
         if (args.branch && branch !== args.branch) return null;
         if (afterCutoff) {
@@ -1171,7 +1172,7 @@ async function listSessionsForContext(
           if (!intents.some(intent => testTextMatcher(intentMatcher, intent.value))) return null;
         }
 
-        const session: ListSession = { session_id: sessionId, branch, timestamp, version, lines: lineCount, slug };
+        const session: ListSession = { session_id: sessionId, branch, timestamp, version, model, lines: lineCount, slug };
         if (includeIdentityFields) {
           session.project = context.projectRef.project;
           session.project_path_guess = context.projectRef.project_path_guess;
