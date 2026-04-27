@@ -1369,10 +1369,12 @@ const FIXTURE_HOME = join(FIXTURE_DIR, 'home');
 const FIXTURE_CLAUDE_PROJECTS_ROOT = claudeProjectsRoot(FIXTURE_HOME);
 const FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project');
 const SECOND_FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project-worktree');
+const SUMMARY_PROJECT = join(FIXTURE_DIR, 'summary-project');
 const RELATED_PROJECT = join(tmpdir(), `ccsessionrelated${randomUUID().replace(/-/g, '')}`);
 const RELATED_WORKTREE_ROOT = join(RELATED_PROJECT, '.claude', 'worktrees', 'feature');
 const fakeDirName = mangleProjectPath(FAKE_PROJECT);
 const secondFakeDirName = mangleProjectPath(SECOND_FAKE_PROJECT);
+const summaryDirName = mangleProjectPath(SUMMARY_PROJECT);
 const relatedDirName = mangleProjectPath(RELATED_PROJECT);
 const relatedWorktreeDirName = mangleProjectPath(RELATED_WORKTREE_ROOT);
 const relatedDoubleDashWorktreeDirName = `${mangleProjectPath(RELATED_PROJECT)}--claude-worktrees-feature`;
@@ -1383,6 +1385,10 @@ const CLAUDE_DIR = join(
 const SECOND_CLAUDE_DIR = join(
   FIXTURE_CLAUDE_PROJECTS_ROOT,
   secondFakeDirName,
+);
+const SUMMARY_CLAUDE_DIR = join(
+  FIXTURE_CLAUDE_PROJECTS_ROOT,
+  summaryDirName,
 );
 const RELATED_CLAUDE_DIR = join(
   FIXTURE_CLAUDE_PROJECTS_ROOT,
@@ -1409,6 +1415,7 @@ const SESSION_ID_9 = 'ffffffcc-1111-2222-3333-444444444444';
 const SESSION_ID_10 = 'ffffffdd-1111-2222-3333-444444444444';
 const SESSION_ID_11 = 'ffffff11-1111-2222-3333-444444444444';
 const SESSION_ID_12 = 'ffffff22-1111-2222-3333-444444444444';
+const SESSION_ID_13 = 'ffffff33-1111-2222-3333-444444444444';
 const CROSS_PROJECT_FILE = 'cross-project-fixture-target.ts';
 const RELATED_PROJECT_FILE = 'related-origin-warning.ts';
 const RELATED_MISSING_CWD_FILE = 'related-missing-cwd.ts';
@@ -1507,14 +1514,40 @@ const SUBAGENT_ID = 'a8361bc';
 beforeAll(() => {
   mkdirSync(FAKE_PROJECT, { recursive: true });
   mkdirSync(SECOND_FAKE_PROJECT, { recursive: true });
+  mkdirSync(SUMMARY_PROJECT, { recursive: true });
   mkdirSync(RELATED_PROJECT, { recursive: true });
   mkdirSync(CLAUDE_DIR, { recursive: true });
   mkdirSync(SECOND_CLAUDE_DIR, { recursive: true });
+  mkdirSync(SUMMARY_CLAUDE_DIR, { recursive: true });
   mkdirSync(RELATED_CLAUDE_DIR, { recursive: true });
   mkdirSync(RELATED_WORKTREE_CLAUDE_DIR, { recursive: true });
   mkdirSync(RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR, { recursive: true });
   const lines = makeFixtureLines();
   writeFileSync(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`), lines.join('\n') + '\n');
+  const fullTimingSummaryLines = [
+    JSON.stringify({
+      type: 'system',
+      sessionId: SESSION_ID_13,
+      timestamp: '2026-03-01T09:59:00.000Z',
+      gitBranch: 'main',
+      version: '2.1.0',
+    }),
+    JSON.stringify({
+      type: 'user',
+      timestamp: '2026-03-01T10:00:00.000Z',
+      message: { role: 'user', content: 'Summarize full timing' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-01T10:02:00.000Z',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Full timing response' }] },
+    }),
+    JSON.stringify({
+      type: 'summary',
+      timestamp: '2026-03-01T10:03:00.000Z',
+    }),
+  ];
+  writeFileSync(join(SUMMARY_CLAUDE_DIR, `${SESSION_ID_13}.jsonl`), fullTimingSummaryLines.join('\n') + '\n');
 
   // Subagent fixture: create subagents dir within the parent session UUID dir
   const subagentDir = join(CLAUDE_DIR, SESSION_ID, 'subagents');
@@ -1918,6 +1951,7 @@ afterAll(() => {
   rmSync(RELATED_PROJECT, { recursive: true, force: true });
   rmSync(CLAUDE_DIR, { recursive: true, force: true });
   rmSync(SECOND_CLAUDE_DIR, { recursive: true, force: true });
+  rmSync(SUMMARY_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(RELATED_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(RELATED_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
@@ -2375,6 +2409,23 @@ describe('summary integration', () => {
     expect(result.data.first_user_prompt).toEqual({ turn: 1, snippet: 'Subagent task' });
     expect(result.data.last_assistant_text).toEqual({ turn: 2, snippet: 'Subagent response' });
     expect(result.data.subagents).toEqual([]);
+  });
+
+  test('uses full transcript entries for timing while counting user and assistant turns', async () => {
+    const { exitCode, stdout } = await runCli(['summary', SESSION_ID_13, '--project', SUMMARY_PROJECT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({
+      session_id: SESSION_ID_13,
+      started_at: '2026-03-01T09:59:00.000Z',
+      ended_at: '2026-03-01T10:03:00.000Z',
+      duration_ms: 240000,
+      turn_count: 2,
+      lines: 4,
+      first_user_prompt: { turn: 1, snippet: 'Summarize full timing' },
+      last_assistant_text: { turn: 2, snippet: 'Full timing response' },
+    });
   });
 });
 
@@ -4514,6 +4565,15 @@ describe('--claude-project session follow-up integration', () => {
     expect(result.ok).toBe(false);
     expect(result.error.code).toBe('INVALID_ARGS');
     expect(result.error.message).toContain('--claude-project');
+  });
+
+  test('valid missing --claude-project basename returns NOT_FOUND even when it contains flag text', async () => {
+    const { exitCode, stdout } = await runCli(['shape', SESSION_ID_8, '--claude-project=--claude-project']);
+    expect(exitCode).toBe(3);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('NOT_FOUND');
+    expect(result.error.message).toContain('Claude project directory not found');
   });
 
   const conflictingCommandArgs = [

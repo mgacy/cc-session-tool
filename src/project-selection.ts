@@ -111,6 +111,22 @@ export type SessionProjectSelector =
   | { kind: 'projectPath'; projectPath: string }
   | { kind: 'claudeProject'; project: string };
 
+export type ProjectSelectionErrorCode = 'INVALID_ARGS' | 'NOT_FOUND';
+
+export class ProjectSelectionError extends Error {
+  readonly code: ProjectSelectionErrorCode;
+
+  constructor(code: ProjectSelectionErrorCode, message: string) {
+    super(message);
+    this.code = code;
+    this.name = 'ProjectSelectionError';
+  }
+}
+
+export function isProjectSelectionError(err: unknown): err is ProjectSelectionError {
+  return err instanceof ProjectSelectionError;
+}
+
 export function claudeProjectsRoot(home = homedir()): string {
   return join(home, '.claude', 'projects');
 }
@@ -526,7 +542,7 @@ export function selectProjectContexts(options: ProjectSelectionOptions): Project
 export function resolveClaudeProjectDir(projectPath: string, root = claudeProjectsRoot()): string {
   const claudeDir = join(root, mangleProjectPath(projectPath));
   if (!existsSync(claudeDir)) {
-    throw new Error(`Claude project directory not found: ${claudeDir}`);
+    throw new ProjectSelectionError('NOT_FOUND', `Claude project directory not found: ${claudeDir}`);
   }
   return claudeDir;
 }
@@ -540,7 +556,7 @@ export function validateClaudeProjectBasename(project: string): void {
     project.includes('\\') ||
     basename(project) !== project
   ) {
-    throw new Error('--claude-project must be a Claude project directory basename');
+    throw new ProjectSelectionError('INVALID_ARGS', '--claude-project must be a Claude project directory basename');
   }
 }
 
@@ -571,7 +587,7 @@ export function resolveClaudeProjectDirFromSelector(
   validateClaudeProjectBasename(selector.project);
   const claudeDir = join(root, selector.project);
   if (!existsSync(claudeDir)) {
-    throw new Error(`Claude project directory not found: ${claudeDir}`);
+    throw new ProjectSelectionError('NOT_FOUND', `Claude project directory not found: ${claudeDir}`);
   }
   return claudeDir;
 }
@@ -584,7 +600,7 @@ export function sessionProjectSelectorFromArgs(args: {
     typeof args['claude-project'] === 'string' ? args['claude-project'] : undefined
   );
   if (args.project && claudeProject) {
-    throw new Error('--project and --claude-project are mutually exclusive');
+    throw new ProjectSelectionError('INVALID_ARGS', '--project and --claude-project are mutually exclusive');
   }
   if (claudeProject) {
     return { kind: 'claudeProject', project: claudeProject };

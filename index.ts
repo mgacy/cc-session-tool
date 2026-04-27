@@ -13,6 +13,7 @@ import {
   extractWorktreeStatePaths as projectExtractWorktreeStatePaths,
   findRelatedProjectRefs as projectFindRelatedProjectRefs,
   isPathWithinOrEqual as projectIsPathWithinOrEqual,
+  isProjectSelectionError as projectIsProjectSelectionError,
   listClaudeProjectRefs as projectListClaudeProjectRefs,
   listSearchTargetsForContext as projectListSearchTargetsForContext,
   mangleProjectPath as projectMangleProjectPath,
@@ -476,6 +477,14 @@ export function isCliError(err: unknown): err is CliError {
   return err instanceof CliError;
 }
 
+function mapProjectSelectionError(err: unknown, fallbackCode: ErrorCode): never {
+  if (projectIsProjectSelectionError(err)) {
+    throw cliError(err.code, err.message);
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  throw cliError(fallbackCode, message);
+}
+
 function handleCommandError(err: unknown): void {
   if (isCliError(err)) {
     output(failure(err.errorCode, err.message));
@@ -526,8 +535,7 @@ export function buildScopedSearchScope(options: SearchScopeOptions): SearchScope
   try {
     return projectBuildScopedSearchScope(options);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw cliError('NOT_FOUND', message);
+    mapProjectSelectionError(err, 'NOT_FOUND');
   }
 }
 
@@ -535,8 +543,7 @@ export function selectProjectContexts(options: ProjectSelectionOptions): Project
   try {
     return projectSelectProjectContexts(options);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw cliError('NOT_FOUND', message);
+    mapProjectSelectionError(err, 'NOT_FOUND');
   }
 }
 
@@ -544,8 +551,7 @@ export function resolveClaudeProjectDir(projectPath: string, root = claudeProjec
   try {
     return projectResolveClaudeProjectDir(projectPath, root);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw cliError('NOT_FOUND', message);
+    mapProjectSelectionError(err, 'NOT_FOUND');
   }
 }
 
@@ -553,8 +559,7 @@ function validateClaudeProjectBasename(project: string): void {
   try {
     projectValidateClaudeProjectBasename(project);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw cliError('INVALID_ARGS', message);
+    mapProjectSelectionError(err, 'INVALID_ARGS');
   }
 }
 
@@ -565,9 +570,7 @@ export function resolveClaudeProjectDirFromSelector(
   try {
     return projectResolveClaudeProjectDirFromSelector(selector, root);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (message.includes('--claude-project')) throw cliError('INVALID_ARGS', message);
-    throw cliError('NOT_FOUND', message);
+    mapProjectSelectionError(err, 'NOT_FOUND');
   }
 }
 
@@ -578,8 +581,7 @@ function sessionProjectSelectorFromArgs(args: {
   try {
     return projectSessionProjectSelectorFromArgs(args);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw cliError('INVALID_ARGS', message);
+    mapProjectSelectionError(err, 'INVALID_ARGS');
   }
 }
 
@@ -1556,7 +1558,7 @@ const summaryCommand = defineCommand({
       const result: SessionSummaryResult = buildSessionSummary({
         sessionId: resolved.sessionId,
         agentId: resolved.agentId,
-        entries: resolved.entries,
+        entries: resolved.allEntries,
         metadata: resolved.metadata,
         lineCount: resolved.lineCount,
         subagents,
