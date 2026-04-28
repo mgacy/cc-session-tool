@@ -27,14 +27,16 @@ Default to Bun instead of Node.js:
 
 ## Architecture
 
-Single-file CLI (`index.ts`) using `citty` for command parsing. All types, helpers, and commands live in one file. Types and pure helpers are `export`ed for unit testing.
+CLI entrypoint and command wiring live in `index.ts` using `citty`. Shared transcript, project-selection, and search primitives live under `src/` and are exported for unit testing.
 
 ### Subcommands
 
 | Command | Purpose |
 |---------|---------|
-| `list` | Index sessions with metadata; supports `--all-projects --project-glob` for audits |
+| `list` | Index sessions with metadata; scoped lists include associated Claude worktrees by default and support `--main-only` |
+| `projects` | Summarize Claude project transcript directories and expose raw project handles |
 | `shape` | Turn-by-turn skeleton with summary stats (tool counts, duration, first edit) |
+| `summary` | One-call triage summary for a session |
 | `tools` | Tool call log with condensed input summaries and outcomes |
 | `files` | Files touched in a session, grouped by path or turn |
 | `tokens` | Per-turn token usage timeline (optional cumulative mode) |
@@ -43,15 +45,15 @@ Single-file CLI (`index.ts`) using `citty` for command parsing. All types, helpe
 | `search` | Find sessions matching structured queries (tool, input, file, text, bash filters), scoped to the logical project plus associated Claude worktrees by default |
 | `subagents` | List subagents for a session with metadata |
 
-All session-scoped commands accept a positional session identifier (UUID, UUID prefix, or slug) and an optional `--project` flag (defaults to CWD). They also accept `--claude-project <project>` for stable follow-up from search/list rows that expose raw Claude project basenames through `project` or `session_ref.project`; do not use `project_path_guess` as a follow-up handle. `--project` and `--claude-project` are mutually exclusive. Subagent sessions can be targeted using colon notation: `<session>:<agent-id>` (e.g., `DA2738E3:a8361bc`).
+All session-scoped commands accept a positional session identifier (UUID, UUID prefix, or slug) and an optional `--project` flag (defaults to CWD). They also accept `--claude-project <project>` for stable follow-up from search/list/projects rows that expose raw Claude project basenames through `project` or `session_ref.project`; do not use `project_path_guess` as a follow-up handle. `--project` and `--claude-project` are mutually exclusive. Subagent sessions can be targeted using colon notation: `<session>:<agent-id>` (e.g., `DA2738E3:a8361bc`).
 
-The `search` command is agent-first and worktree-aware by default. A scoped search from the logical project checkout includes associated Claude-managed worktree transcript directories and compares absolute main-tree file queries to worktree-local accesses by exact canonical path candidates first, then shared project-relative identity. Use `search --file <absolute-main-tree-path> --operation write` as the primary workflow for finding worktree writes to the same logical file; use `--all-projects` for broad audits, not routine worktree lookup.
+The `list` and `search` commands are agent-first and worktree-aware by default. A scoped query from the logical project checkout includes associated Claude-managed worktree transcript directories. Use `list --main-only` only when you intentionally want to ignore worktree sessions. Search compares absolute main-tree file queries to worktree-local accesses by exact canonical path candidates first, then shared project-relative identity. Use `search --file <absolute-main-tree-path> --operation write` as the primary workflow for finding worktree writes to the same logical file; use `--all-projects` for broad audits, not routine worktree lookup.
 
 In `search --all-projects`, an explicit `--project <path>` is a query identity anchor for absolute file matching only. It must not be treated as a scan limit, and without it the command must not silently use CWD or `project_path_guess` as the authoritative project root for unrelated projects.
 
 Use `search --file <path> --operation <read|edit|write|grep|glob>` to bind file-operation filtering to the same matching file access. Use `--origin` to return the earliest matching transcript write evidence for a file; this is transcript evidence, not VCS creation history. Use `--sort session-newest|match-earliest|match-newest|project` for deterministic ordering.
 
-Use `search --tool <name> --input-match <pattern>` to match raw structured tool inputs, including values omitted or truncated in `input_summary`. Add `--aggregate count-per-session` for per-session audit counts. `--project-glob` is valid only with `--all-projects` on `search` and `list`; it matches raw Claude project basenames and display-only `project_path_guess` strings, not filesystem files.
+Use `search --tool <name> --input-match <pattern>` or `tools --input-match <pattern>` to match raw structured tool inputs, including values omitted or truncated in `input_summary`. Add `--aggregate count-per-session` for per-session audit counts, or `--aggregate counters --counter name=pattern --bucket day|week` for named audit tables. `--project-glob` is valid only with `--all-projects` on `search` and `list`; it matches raw Claude project basenames and display-only `project_path_guess` strings, not filesystem files.
 
 ### Session Resolution
 
