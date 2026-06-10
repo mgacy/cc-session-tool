@@ -669,7 +669,7 @@ cc-session-tool subagents <session> [--project <path> | --claude-project <projec
 
 Corpus-wide aggregates served from a SQLite index over the transcripts (`session` / `turn` / `tool_use` tables). The index is built and refreshed lazily on use: each invocation stats every `.jsonl` in scope and re-parses only files whose mtime+size watermark changed. The JSONL transcripts remain the source of truth -- if the cache database is corrupt or unusable, the command transparently falls back to rebuilding it (or to a throwaway in-memory index) and still answers.
 
-The database lives at `~/Library/Caches/cc-session-tool/index.db` on macOS (`~/.cache/cc-session-tool/index.db` elsewhere), overridable with `--db <path>` or the `CC_SESSION_TOOL_DB` env var. `_meta.index` on every response reports the database path, `mode` (`cache` or `memory`), and refresh counts.
+The database lives at `~/Library/Caches/cc-session-tool/index.db` on macOS (`~/.cache/cc-session-tool/index.db` elsewhere), overridable with `--db <path>` or the `CC_SESSION_TOOL_DB` env var. `_meta.index` on every response reports the database path, `mode` (`cache` or `memory`), and `refresh` counts. `refresh.failures` lists any transcripts that could not be parsed (with `file_path` and `reason`), so a wholly-unparseable file is identifiable rather than silently dropped from the rollup.
 
 #### `stats tokens`
 
@@ -683,7 +683,7 @@ cc-session-tool stats tokens [--project <path> | --all-projects] [--bucket day|w
 | ------ | ------- | ----------- |
 | `--bucket` | none | Bucket rows by `day` or `week` (Monday-anchored, matching `search --bucket`). |
 | `--by` | none | Group rows by per-turn `model` or by `session` (one row per transcript, subagents separate). |
-| `--after` / `--before` / `--since` | — | Bound by turn timestamp (`--since` and `--after` are mutually exclusive). |
+| `--after` / `--before` / `--since` | — | Bound by turn timestamp. `--after`/`--before` must be zero-padded ISO 8601 (`2026-01-09` or `2026-01-09T14:30:00Z`); `--since` and `--after` are mutually exclusive. |
 | `--no-subagents` | include | Exclude subagent transcripts from the rollup. |
 
 Each row reports `turns` (assistant turns), `turns_with_usage`, the four token sums, and `cache_hit_rate` (`cache_read / (input + cache_read + cache_creation)`). Token sums are `null` -- never `0` -- when no turn in the group carried `message.usage`, so "no data" is distinguishable from "zero tokens".

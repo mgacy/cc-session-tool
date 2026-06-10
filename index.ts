@@ -937,6 +937,21 @@ export function parseIntArg(value: string | undefined, name: string): number | u
   return n;
 }
 
+/**
+ * Validate an absolute date arg as zero-padded ISO 8601 (YYYY-MM-DD, optionally with time).
+ * Returns it unchanged, or null when absent. Timestamps are compared lexicographically
+ * downstream, so a malformed/unpadded value (e.g. "2026-1-9" or "yesterday") would silently
+ * select the wrong rows -- reject it loudly instead.
+ */
+export function parseDateArg(value: string | undefined, name: string): string | null {
+  if (value == null) return null;
+  const iso = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?)?$/;
+  if (!iso.test(value) || Number.isNaN(new Date(value).getTime())) {
+    throw cliError('INVALID_ARGS', `Invalid ${name} date '${value}' -- expected ISO 8601 (e.g. 2026-01-09 or 2026-01-09T14:30:00Z)`);
+  }
+  return value;
+}
+
 /** Extract text from a content block's content field (string or array). */
 function extractContentText(content: string | ContentBlock[] | undefined): string {
   if (content == null) return '';
@@ -2737,7 +2752,8 @@ const statsTokensCommand = defineCommand({
       if (args.since && args.after) {
         throw cliError('INVALID_ARGS', '--since and --after are mutually exclusive');
       }
-      const afterCutoff = args.since ? parseSince(args.since) : args.after ?? null;
+      const afterCutoff = args.since ? parseSince(args.since) : parseDateArg(args.after, '--after');
+      const beforeCutoff = parseDateArg(args.before, '--before');
       const includeSubagents = args.subagents !== false && !(args as Record<string, unknown>)['no-subagents'];
 
       const selection = selectIndexScope(args);
@@ -2748,7 +2764,7 @@ const statsTokensCommand = defineCommand({
           bucket,
           by,
           after: afterCutoff,
-          before: args.before ?? null,
+          before: beforeCutoff,
           includeSubagents,
         });
         output(success(rows, indexMeta(meta(rows.length, rows.length), handle, selection, Boolean(args['all-projects']))));

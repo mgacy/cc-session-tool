@@ -53,6 +53,7 @@ import {
 } from './src/search.ts';
 
 import {
+  computeIndexFreshness,
   defaultIndexDbPath,
   INDEX_DB_ENV_VAR,
   INDEX_SCHEMA_VERSION,
@@ -4880,6 +4881,38 @@ describe('transcript index module', () => {
     expect(noMatch.length).toBe(0);
     db.close();
   });
+
+  test('tool_use rows capture operation, file_path, logical_path, and is_error', () => {
+    const selection = fixtureSelection();
+    const db = openIndexDb(':memory:');
+    refreshIndexForContexts(db, selection.contexts);
+    const rows = db.query(
+      "SELECT tool, operation, file_path, logical_path, is_error FROM tool_use WHERE session_id = ? AND agent_id = '' ORDER BY turn, block_index",
+    ).all(SESSION_ID) as Array<{ tool: string; operation: string | null; file_path: string | null; logical_path: string | null; is_error: number | null }>;
+    const grep = rows.find(r => r.tool === 'Grep');
+    const edit = rows.find(r => r.tool === 'Edit');
+    // Successful Grep (tool_1) over path 'src/'; failed Edit (tool_2) on an absolute path.
+    // The fixture sets no cwd, so logical_path is null for both.
+    expect(grep).toMatchObject({ operation: 'grep', file_path: 'src/', logical_path: null, is_error: 0 });
+    expect(edit).toMatchObject({ operation: 'edit', file_path: '/a/b/hello.ts', logical_path: null, is_error: 1 });
+    db.close();
+  });
+
+  test('cache_hit_rate is cache_read / (input + cache_read + cache_creation)', () => {
+    const selection = fixtureSelection();
+    const db = openIndexDb(':memory:');
+    refreshIndexForContexts(db, selection.contexts);
+    const rows = queryTokenStats(db, {
+      projects: selection.contexts.map(c => c.projectRef.project),
+      by: 'session',
+      includeSubagents: false,
+    });
+    const row = rows.find(r => r.session_id === SESSION_ID && r.agent_id === null);
+    expect(row).toBeDefined();
+    // Parent usage totals: input 600, cache_read 430, cache_creation 35 -> 430 / 1065 = 0.4038.
+    expect(row!.cache_hit_rate).toBe(0.4038);
+    db.close();
+  });
 });
 
 describe('stats integration (token oracle)', () => {
@@ -5060,6 +5093,70 @@ describe('stats integration (incremental refresh)', () => {
     db.close();
     expect(sessionCount.n).toBe(1);
     expect(turnCount.n).toBe(3); // user + 2 assistant turns
+  });
+});
+
+describe('transcript index refresh edge cases', () => {
+  const makeIndexProject = (label: string, files: Record<string, string>) => {
+    const projectPath = join(FIXTURE_DIR, uniqueTempName(label));
+    const claudeDir = join(FIXTURE_CLAUDE_PROJECTS_ROOT, mangleProjectPath(projectPath));
+    mkdirSync(projectPath, { recursive: true });
+    mkdirSync(claudeDir, { recursive: true });
+    for (const [name, content] of Object.entries(files)) {
+      writeFileSync(join(claudeDir, name), content);
+    }
+    const selection = selectProjectContexts({
+      mode: 'scoped',
+      projectPath,
+      claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT,
+    });
+    return { projectPath, claudeDir, selection };
+  };
+
+  const validSession = (id: string) => [
+    JSON.stringify({ type: 'user', sessionId: id, timestamp: '2026-03-02T10:00:00.000Z', gitBranch: 'main', version: '2.1.0', message: { role: 'user', content: 'hi' } }),
+    JSON.stringify({ type: 'assistant', timestamp: '2026-03-02T10:01:00.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 10, output_tokens: 5 } } }),
+  ].join('\n') + '\n';
+
+  test('removes rows and reports orphans when a transcript is deleted', () => {
+    const SESSION_A = '11111111-0000-0000-0000-00000000000a';
+    const SESSION_B = '22222222-0000-0000-0000-00000000000b';
+    const { claudeDir, selection } = makeIndexProject('index-cleanup', {
+      [`${SESSION_A}.jsonl`]: validSession(SESSION_A),
+      [`${SESSION_B}.jsonl`]: validSession(SESSION_B),
+    });
+    const db = openIndexDb(':memory:');
+    const first = refreshIndexForContexts(db, selection.contexts);
+    expect(first.indexed).toBe(2);
+    expect(first.removed).toBe(0);
+
+    // Delete one transcript: its watermark row remains until the next refresh.
+    rmSync(join(claudeDir, `${SESSION_B}.jsonl`));
+    const freshness = computeIndexFreshness(db, selection.contexts);
+    expect(freshness.orphaned).toBe(1);
+
+    const second = refreshIndexForContexts(db, selection.contexts);
+    expect(second.removed).toBe(1);
+    expect(second.fresh).toBe(1);
+    const remaining = (db.query('SELECT session_id FROM session ORDER BY session_id').all() as Array<{ session_id: string }>).map(r => r.session_id);
+    expect(remaining).toEqual([SESSION_A]);
+    db.close();
+  });
+
+  test('records per-file detail for an unparseable transcript', () => {
+    const SESSION_GOOD = '33333333-0000-0000-0000-00000000000c';
+    const { claudeDir, selection } = makeIndexProject('index-parsefail', {
+      [`${SESSION_GOOD}.jsonl`]: validSession(SESSION_GOOD),
+      'bad.jsonl': 'not json\n',
+    });
+    const db = openIndexDb(':memory:');
+    const stats = refreshIndexForContexts(db, selection.contexts);
+    expect(stats.indexed).toBe(1);
+    expect(stats.failed).toBe(1);
+    expect(stats.failures.length).toBe(1);
+    expect(stats.failures[0]!.file_path).toBe(join(claudeDir, 'bad.jsonl'));
+    expect(stats.failures[0]!.reason).toContain('Session file contains no valid entries');
+    db.close();
   });
 });
 

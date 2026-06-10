@@ -31,12 +31,22 @@ export type IndexTarget = {
   filePath: string;
 };
 
+/** Per-file detail for a transcript that could not be indexed, so a failure is identifiable (not just counted). */
+export type RefreshFailure = {
+  project: string;
+  session_id: string;
+  agent_id: string;
+  file_path: string;
+  reason: string;
+};
+
 export type RefreshStats = {
   scanned: number;
   fresh: number;
   indexed: number;
   removed: number;
   failed: number;
+  failures: RefreshFailure[];
 };
 
 export type IndexFreshness = {
@@ -59,6 +69,9 @@ export type IndexStatus = {
   scope: IndexFreshness;
 };
 
+/** A token count, or null when message.usage was absent for the whole group (NOT zero). See CLAUDE.md. */
+export type TokenCount = number | null;
+
 export type TokenStatsOptions = {
   projects: string[];
   bucket?: 'day' | 'week' | null;
@@ -76,10 +89,10 @@ export type TokenStatsRow = {
   agent_id?: string | null;
   turns: number;
   turns_with_usage: number;
-  input_tokens: number | null;
-  output_tokens: number | null;
-  cache_read_input_tokens: number | null;
-  cache_creation_input_tokens: number | null;
+  input_tokens: TokenCount;
+  output_tokens: TokenCount;
+  cache_read_input_tokens: TokenCount;
+  cache_creation_input_tokens: TokenCount;
   cache_hit_rate: number | null;
 };
 
@@ -386,10 +399,10 @@ export function indexTranscriptFile(db: Database, target: IndexTarget): void {
     ts: string | null;
     role: string;
     model: string | null;
-    input: number | null;
-    output: number | null;
-    cacheRead: number | null;
-    cacheCreate: number | null;
+    input: TokenCount;
+    output: TokenCount;
+    cacheRead: TokenCount;
+    cacheCreate: TokenCount;
   };
   type ToolUseRow = {
     turn: number;
@@ -500,11 +513,13 @@ export function indexTranscriptFile(db: Database, target: IndexTarget): void {
 /**
  * Bring the index up to date for the given project contexts: index new and
  * stale transcripts (mtime+size watermark), drop rows for transcripts that no
- * longer exist on disk. Unreadable/unparseable files have their rows removed
- * and are counted as failed; they retry on the next refresh.
+ * longer exist on disk. Unreadable/unparseable files have their rows removed,
+ * are counted as failed, and are recorded in `failures` with their path and the
+ * parse error so they are identifiable rather than silently dropped; they retry
+ * on the next refresh.
  */
 export function refreshIndexForContexts(db: Database, contexts: SearchProjectContext[]): RefreshStats {
-  const stats: RefreshStats = { scanned: 0, fresh: 0, indexed: 0, removed: 0, failed: 0 };
+  const stats: RefreshStats = { scanned: 0, fresh: 0, indexed: 0, removed: 0, failed: 0, failures: [] };
   const targets: IndexTarget[] = [];
   const seenProjects = new Set<string>();
   for (const context of contexts) {
@@ -538,9 +553,16 @@ export function refreshIndexForContexts(db: Database, contexts: SearchProjectCon
     try {
       indexTranscriptFile(db, target);
       stats.indexed++;
-    } catch {
+    } catch (err) {
       deleteTranscriptRows(db, target.project, target.sessionId, target.agentId);
       stats.failed++;
+      stats.failures.push({
+        project: target.project,
+        session_id: target.sessionId,
+        agent_id: target.agentId,
+        file_path: target.filePath,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -674,14 +696,28 @@ export function queryTokenStats(db: Database, options: TokenStatsOptions): Token
 
   const groupBy = groupCols.length > 0 ? ` GROUP BY ${groupCols.join(', ')}` : '';
   const orderBy = groupCols.length > 0 ? ` ORDER BY ${groupCols.map(col => `${col} DESC`).join(', ')}` : '';
+  // Raw row keys mirror the SELECT aliases above; cast once here so the mapping below needs no per-field casts.
+  type TokenStatsRawRow = {
+    bucket?: string;
+    model?: string | null;
+    project?: string;
+    session_id?: string;
+    agent_id?: string;
+    turns: number;
+    turns_with_usage: number;
+    input_tokens: TokenCount;
+    output_tokens: TokenCount;
+    cache_read_input_tokens: TokenCount;
+    cache_creation_input_tokens: TokenCount;
+  };
   const rows = db.query(
     `SELECT ${select} FROM turn WHERE ${where.join(' AND ')}${groupBy}${orderBy}`,
-  ).all(...queryParams) as Array<Record<string, unknown>>;
+  ).all(...queryParams) as TokenStatsRawRow[];
 
   return rows.map(raw => {
-    const input = raw.input_tokens as number | null;
-    const cacheRead = raw.cache_read_input_tokens as number | null;
-    const cacheCreate = raw.cache_creation_input_tokens as number | null;
+    const input = raw.input_tokens;
+    const cacheRead = raw.cache_read_input_tokens;
+    const cacheCreate = raw.cache_creation_input_tokens;
     let cacheHitRate: number | null = null;
     if (input !== null || cacheRead !== null || cacheCreate !== null) {
       const denominator = (input ?? 0) + (cacheRead ?? 0) + (cacheCreate ?? 0);
@@ -690,20 +726,20 @@ export function queryTokenStats(db: Database, options: TokenStatsOptions): Token
       }
     }
     const row: TokenStatsRow = {
-      turns: raw.turns as number,
-      turns_with_usage: raw.turns_with_usage as number,
+      turns: raw.turns,
+      turns_with_usage: raw.turns_with_usage,
       input_tokens: input,
-      output_tokens: raw.output_tokens as number | null,
+      output_tokens: raw.output_tokens,
       cache_read_input_tokens: cacheRead,
       cache_creation_input_tokens: cacheCreate,
       cache_hit_rate: cacheHitRate,
     };
-    if (options.bucket) row.bucket = raw.bucket as string;
-    if (options.by === 'model') row.model = (raw.model as string | null) ?? null;
+    if (options.bucket) row.bucket = raw.bucket;
+    if (options.by === 'model') row.model = raw.model ?? null;
     if (options.by === 'session') {
-      row.project = raw.project as string;
-      row.session_id = raw.session_id as string;
-      row.agent_id = (raw.agent_id as string) === PARENT_AGENT_ID ? null : (raw.agent_id as string);
+      row.project = raw.project;
+      row.session_id = raw.session_id;
+      row.agent_id = raw.agent_id === PARENT_AGENT_ID ? null : raw.agent_id;
     }
     return row;
   });
