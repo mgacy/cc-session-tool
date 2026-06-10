@@ -23,6 +23,11 @@ export const INDEX_DB_ENV_VAR = 'CC_SESSION_TOOL_DB';
 /** agent_id sentinel for parent transcripts; NULL would break PK-based row replacement. */
 const PARENT_AGENT_ID = '';
 
+/** Map a stored agent_id back to its public form: the parent sentinel ('') becomes null. */
+function publicAgentId(agentId: string | undefined): string | null | undefined {
+  return agentId === PARENT_AGENT_ID ? null : agentId;
+}
+
 export type IndexTarget = {
   project: string;
   sessionId: string;
@@ -292,6 +297,18 @@ function targetKey(project: string, sessionId: string, agentId: string): string 
   return [project, sessionId, agentId].join(KEY_SEPARATOR);
 }
 
+/** Collect index targets across contexts, deduping repeated projects (e.g. shared worktrees). */
+function collectTargets(contexts: SearchProjectContext[]): { targets: IndexTarget[]; projects: string[] } {
+  const targets: IndexTarget[] = [];
+  const seenProjects = new Set<string>();
+  for (const context of contexts) {
+    if (seenProjects.has(context.projectRef.project)) continue;
+    seenProjects.add(context.projectRef.project);
+    targets.push(...listIndexTargetsForContext(context));
+  }
+  return { targets, projects: Array.from(seenProjects) };
+}
+
 function loadWatermarks(db: Database, projects: string[]): Map<string, Watermark> {
   const map = new Map<string, Watermark>();
   if (projects.length === 0) return map;
@@ -520,15 +537,9 @@ export function indexTranscriptFile(db: Database, target: IndexTarget): void {
  */
 export function refreshIndexForContexts(db: Database, contexts: SearchProjectContext[]): RefreshStats {
   const stats: RefreshStats = { scanned: 0, fresh: 0, indexed: 0, removed: 0, failed: 0, failures: [] };
-  const targets: IndexTarget[] = [];
-  const seenProjects = new Set<string>();
-  for (const context of contexts) {
-    if (seenProjects.has(context.projectRef.project)) continue;
-    seenProjects.add(context.projectRef.project);
-    targets.push(...listIndexTargetsForContext(context));
-  }
+  const { targets, projects } = collectTargets(contexts);
 
-  const watermarks = loadWatermarks(db, Array.from(seenProjects));
+  const watermarks = loadWatermarks(db, projects);
   const seenKeys = new Set<string>();
 
   for (const target of targets) {
@@ -568,7 +579,7 @@ export function refreshIndexForContexts(db: Database, contexts: SearchProjectCon
 
   for (const key of watermarks.keys()) {
     if (seenKeys.has(key)) continue;
-    const [project, sessionId, agentId] = key.split('\u0000');
+    const [project, sessionId, agentId] = key.split(KEY_SEPARATOR);
     deleteTranscriptRows(db, project!, sessionId!, agentId!);
     stats.removed++;
   }
@@ -578,14 +589,8 @@ export function refreshIndexForContexts(db: Database, contexts: SearchProjectCon
 
 export function computeIndexFreshness(db: Database, contexts: SearchProjectContext[]): IndexFreshness {
   const freshness: IndexFreshness = { on_disk: 0, indexed: 0, fresh: 0, stale: 0, not_indexed: 0, orphaned: 0 };
-  const targets: IndexTarget[] = [];
-  const seenProjects = new Set<string>();
-  for (const context of contexts) {
-    if (seenProjects.has(context.projectRef.project)) continue;
-    seenProjects.add(context.projectRef.project);
-    targets.push(...listIndexTargetsForContext(context));
-  }
-  const watermarks = loadWatermarks(db, Array.from(seenProjects));
+  const { targets, projects } = collectTargets(contexts);
+  const watermarks = loadWatermarks(db, projects);
   freshness.indexed = watermarks.size;
   const seenKeys = new Set<string>();
   for (const target of targets) {
@@ -739,7 +744,7 @@ export function queryTokenStats(db: Database, options: TokenStatsOptions): Token
     if (options.by === 'session') {
       row.project = raw.project;
       row.session_id = raw.session_id;
-      row.agent_id = raw.agent_id === PARENT_AGENT_ID ? null : raw.agent_id;
+      row.agent_id = publicAgentId(raw.agent_id);
     }
     return row;
   });

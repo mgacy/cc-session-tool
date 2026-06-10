@@ -2653,11 +2653,16 @@ function acquireIndexForContexts(dbFlag: string | undefined, contexts: SearchPro
   return { db: memoryDb, dbPath, mode: 'memory', refresh };
 }
 
+/** The db path to report: the in-memory fallback hides the unusable cache path behind ':memory:'. */
+function publicDbPath(handle: IndexHandle): string {
+  return handle.mode === 'memory' ? ':memory:' : handle.dbPath;
+}
+
 function indexMeta(base: ResponseMeta, handle: IndexHandle, selection: ProjectSelection, allProjects: boolean): IndexMeta {
   const responseMeta: IndexMeta = {
     ...base,
     index: {
-      db_path: handle.mode === 'memory' ? ':memory:' : handle.dbPath,
+      db_path: publicDbPath(handle),
       mode: handle.mode,
       refresh: handle.refresh,
     },
@@ -2684,7 +2689,7 @@ const indexStatusCommand = defineCommand({
       const selection = selectIndexScope(args);
       const handle = acquireIndexForContexts(args.db, selection.contexts);
       try {
-        const status: IndexStatus = queryIndexStatus(handle.db, handle.mode === 'memory' ? ':memory:' : handle.dbPath, selection.contexts);
+        const status: IndexStatus = queryIndexStatus(handle.db, publicDbPath(handle), selection.contexts);
         output(success(status, indexMeta(meta(1, 1), handle, selection, Boolean(args['all-projects']))));
       } finally {
         handle.db.close();
@@ -2709,7 +2714,7 @@ const indexRebuildCommand = defineCommand({
       removeIndexDbFiles(dbPath);
       const handle = acquireIndexForContexts(args.db, selection.contexts);
       try {
-        const status: IndexStatus = queryIndexStatus(handle.db, handle.mode === 'memory' ? ':memory:' : handle.dbPath, selection.contexts);
+        const status: IndexStatus = queryIndexStatus(handle.db, publicDbPath(handle), selection.contexts);
         output(success(status, indexMeta(meta(1, 1), handle, selection, allProjects)));
       } finally {
         handle.db.close();
