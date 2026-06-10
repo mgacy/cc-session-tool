@@ -1,5 +1,6 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { appendFileSync, mkdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'fs';
+import { Database } from 'bun:sqlite';
 import { basename, join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
@@ -50,6 +51,18 @@ import {
   type SearchMatch,
   type SearchMeta,
 } from './src/search.ts';
+
+import {
+  defaultIndexDbPath,
+  INDEX_DB_ENV_VAR,
+  INDEX_SCHEMA_VERSION,
+  listIndexTargetsForContext,
+  openIndexDb,
+  queryTokenStats,
+  queryToolPairs,
+  refreshIndexForContexts,
+  resolveIndexDbPath,
+} from './src/transcript-index.ts';
 
 function uniqueTempName(prefix: string): string {
   return `${prefix}-${randomUUID()}`;
@@ -1957,11 +1970,11 @@ afterAll(() => {
   rmSync(RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
 });
 
-function runCli(args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+function runCli(args: string[], extraEnv: Record<string, string> = {}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   return new Promise(async (resolve) => {
     const proc = Bun.spawn(['bun', 'run', 'index.ts', ...args], {
       cwd: import.meta.dir,
-      env: { ...process.env, HOME: FIXTURE_HOME },
+      env: { ...process.env, HOME: FIXTURE_HOME, ...extraEnv },
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -4720,5 +4733,403 @@ describe('list --include-subagents integration', () => {
     for (const session of result.data) {
       expect('subagent_count' in session).toBe(false);
     }
+  });
+});
+
+// ============================================================================
+// SQLite transcript index
+// ============================================================================
+
+describe('index db path resolution', () => {
+  test('--db flag wins over env and default', () => {
+    expect(resolveIndexDbPath('/explicit/path.db', { [INDEX_DB_ENV_VAR]: '/env/path.db' })).toBe('/explicit/path.db');
+  });
+
+  test('env var wins over default', () => {
+    expect(resolveIndexDbPath(undefined, { [INDEX_DB_ENV_VAR]: '/env/path.db' })).toBe('/env/path.db');
+  });
+
+  test('falls back to platform cache directory', () => {
+    expect(resolveIndexDbPath(undefined, {})).toBe(defaultIndexDbPath());
+    expect(defaultIndexDbPath('/home/u', 'darwin')).toBe('/home/u/Library/Caches/cc-session-tool/index.db');
+    expect(defaultIndexDbPath('/home/u', 'linux')).toBe('/home/u/.cache/cc-session-tool/index.db');
+  });
+});
+
+describe('transcript index module', () => {
+  const fixtureSelection = () => selectProjectContexts({
+    mode: 'scoped',
+    projectPath: FAKE_PROJECT,
+    claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT,
+  });
+
+  test('schema version mismatch drops and rebuilds tables', () => {
+    const dbPath = join(FIXTURE_DIR, 'dbs', `${uniqueTempName('schema')}.db`);
+    const fileDb = openIndexDb(dbPath);
+    fileDb.exec('UPDATE schema_version SET version = 999');
+    fileDb.exec("INSERT INTO session (project, session_id, agent_id, file_path, file_mtime_ms, file_size, indexed_at, turn_count, line_count) VALUES ('p', 's', '', '/f', 1, 1, 'now', 0, 0)");
+    fileDb.close();
+
+    const reopened = openIndexDb(dbPath);
+    const version = reopened.query('SELECT version FROM schema_version').get() as { version: number };
+    expect(version.version).toBe(INDEX_SCHEMA_VERSION);
+    const count = reopened.query('SELECT COUNT(*) AS n FROM session').get() as { n: number };
+    expect(count.n).toBe(0);
+    reopened.close();
+  });
+
+  test('indexes parent and subagent transcripts as separate rows', () => {
+    const selection = fixtureSelection();
+    const targets = listIndexTargetsForContext(selection.contexts[0]!);
+    const parent = targets.find(t => t.sessionId === SESSION_ID && t.agentId === '');
+    const subagent = targets.find(t => t.sessionId === SESSION_ID && t.agentId === SUBAGENT_ID);
+    expect(parent).toBeDefined();
+    expect(subagent).toBeDefined();
+    expect(subagent!.parentSessionId).toBe(SESSION_ID);
+
+    const db = openIndexDb(':memory:');
+    const stats = refreshIndexForContexts(db, selection.contexts);
+    // Earlier parse tests may have written intentionally unparseable .jsonl
+    // files into this fixture dir; those count as failed, never as indexed.
+    expect(stats.indexed + stats.failed).toBe(targets.length);
+    expect(stats.indexed).toBeGreaterThanOrEqual(targets.length - 1);
+    const rows = db.query('SELECT agent_id, parent_session_id FROM session WHERE session_id = ? ORDER BY agent_id').all(SESSION_ID) as Array<{ agent_id: string; parent_session_id: string | null }>;
+    expect(rows.length).toBe(4); // parent + 3 subagents
+    expect(rows[0]!.agent_id).toBe('');
+    expect(rows[0]!.parent_session_id).toBeNull();
+    db.close();
+  });
+
+  test('second refresh is a no-op when files are unchanged', () => {
+    const selection = fixtureSelection();
+    const db = openIndexDb(':memory:');
+    const first = refreshIndexForContexts(db, selection.contexts);
+    expect(first.indexed).toBeGreaterThan(0);
+    const second = refreshIndexForContexts(db, selection.contexts);
+    expect(second.indexed).toBe(0);
+    expect(second.fresh).toBe(first.indexed + first.fresh);
+    expect(second.removed).toBe(0);
+    db.close();
+  });
+
+  test('stores NULL token fields, never zero, when usage is absent', () => {
+    const selection = selectProjectContexts({
+      mode: 'scoped',
+      projectPath: SUMMARY_PROJECT,
+      claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT,
+    });
+    const db = openIndexDb(':memory:');
+    refreshIndexForContexts(db, selection.contexts);
+
+    // SESSION_ID_13's assistant turn has no usage data at all.
+    const turn = db.query("SELECT input_tokens, output_tokens FROM turn WHERE session_id = ? AND role = 'assistant'").get(SESSION_ID_13) as { input_tokens: number | null; output_tokens: number | null };
+    expect(turn.input_tokens).toBeNull();
+    expect(turn.output_tokens).toBeNull();
+    const session = db.query('SELECT input_tokens_total, output_tokens_total FROM session WHERE session_id = ?').get(SESSION_ID_13) as { input_tokens_total: number | null; output_tokens_total: number | null };
+    expect(session.input_tokens_total).toBeNull();
+    expect(session.output_tokens_total).toBeNull();
+
+    const rows = queryTokenStats(db, {
+      projects: selection.contexts.map(c => c.projectRef.project),
+      by: 'session',
+      includeSubagents: true,
+    });
+    const statRow = rows.find(r => r.session_id === SESSION_ID_13);
+    expect(statRow).toBeDefined();
+    expect(statRow!.input_tokens).toBeNull();
+    expect(statRow!.turns).toBe(1);
+    expect(statRow!.turns_with_usage).toBe(0);
+    expect(statRow!.cache_hit_rate).toBeNull();
+    db.close();
+  });
+
+  test('turn rows exclude system and summary entries, matching live turn numbering', () => {
+    const selection = selectProjectContexts({
+      mode: 'scoped',
+      projectPath: SUMMARY_PROJECT,
+      claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT,
+    });
+    const db = openIndexDb(':memory:');
+    refreshIndexForContexts(db, selection.contexts);
+    // SESSION_ID_13 has system + user + assistant + summary entries; only user/assistant get turn rows.
+    const rows = db.query('SELECT turn, role FROM turn WHERE session_id = ? ORDER BY turn').all(SESSION_ID_13) as Array<{ turn: number; role: string }>;
+    expect(rows).toEqual([
+      { turn: 1, role: 'user' },
+      { turn: 2, role: 'assistant' },
+    ]);
+    db.close();
+  });
+
+  test('queryToolPairs orders by sequence and respects filters', () => {
+    const selection = fixtureSelection();
+    const db = openIndexDb(':memory:');
+    refreshIndexForContexts(db, selection.contexts);
+    const projects = selection.contexts.map(c => c.projectRef.project);
+
+    // Fixture session: Grep (turn 2) then Edit (turn 4).
+    const pairs = queryToolPairs(db, { projects, prev: 'Grep', next: 'Edit', limit: 10, includeSubagents: false });
+    expect(pairs.length).toBe(1);
+    expect(pairs[0]!.prev_tool).toBe('Grep');
+    expect(pairs[0]!.tool).toBe('Edit');
+    expect(pairs[0]!.count).toBeGreaterThanOrEqual(1);
+
+    const editOps = queryToolPairs(db, { projects, operation: 'edit', limit: 10, includeSubagents: false });
+    expect(editOps.every(p => p.tool === 'Edit')).toBe(true);
+
+    const noMatch = queryToolPairs(db, { projects, pathMatch: 'no-such-path-fragment', limit: 10, includeSubagents: false });
+    expect(noMatch.length).toBe(0);
+    db.close();
+  });
+});
+
+describe('stats integration (token oracle)', () => {
+  const ORACLE_DB = join(FIXTURE_DIR, 'dbs', 'oracle.db');
+
+  test('per-session totals from the index match the tokens command', async () => {
+    const statsRun = await runCli(['stats', 'tokens', '--by', 'session', '--project', FAKE_PROJECT, '--db', ORACLE_DB]);
+    expect(statsRun.exitCode).toBe(0);
+    const stats = parseOutput(statsRun.stdout);
+    expect(stats.ok).toBe(true);
+    expect(stats._meta.index.mode).toBe('cache');
+
+    const tokensRun = await runCli(['tokens', SESSION_ID, '--project', FAKE_PROJECT]);
+    const tokens = parseOutput(tokensRun.stdout);
+    expect(tokens.ok).toBe(true);
+
+    const row = stats.data.find((r: any) => r.session_id === SESSION_ID && r.agent_id === null);
+    expect(row).toBeDefined();
+    // The tokens command zero-fills absent usage; the index stores NULL. Coalesce for comparison.
+    expect(row.input_tokens ?? 0).toBe(tokens.data.totals.input);
+    expect(row.output_tokens ?? 0).toBe(tokens.data.totals.output);
+    expect(row.cache_read_input_tokens ?? 0).toBe(tokens.data.totals.cache_read);
+    expect(row.cache_creation_input_tokens ?? 0).toBe(tokens.data.totals.cache_create);
+    expect(row.turns).toBe(tokens.data.turns.length);
+  });
+
+  test('subagent totals from the index match tokens on the subagent transcript', async () => {
+    const statsRun = await runCli(['stats', 'tokens', '--by', 'session', '--project', FAKE_PROJECT, '--db', ORACLE_DB]);
+    const stats = parseOutput(statsRun.stdout);
+    const tokensRun = await runCli(['tokens', `${SESSION_ID}:${SUBAGENT_ID}`, '--project', FAKE_PROJECT]);
+    const tokens = parseOutput(tokensRun.stdout);
+    expect(tokens.ok).toBe(true);
+
+    const row = stats.data.find((r: any) => r.session_id === SESSION_ID && r.agent_id === SUBAGENT_ID);
+    expect(row).toBeDefined();
+    expect(row.input_tokens ?? 0).toBe(tokens.data.totals.input);
+    expect(row.output_tokens ?? 0).toBe(tokens.data.totals.output);
+    expect(row.cache_read_input_tokens ?? 0).toBe(tokens.data.totals.cache_read);
+    expect(row.cache_creation_input_tokens ?? 0).toBe(tokens.data.totals.cache_create);
+  });
+
+  test('--no-subagents excludes subagent rows', async () => {
+    const statsRun = await runCli(['stats', 'tokens', '--by', 'session', '--no-subagents', '--project', FAKE_PROJECT, '--db', ORACLE_DB]);
+    const stats = parseOutput(statsRun.stdout);
+    expect(stats.ok).toBe(true);
+    expect(stats.data.every((r: any) => r.agent_id === null)).toBe(true);
+  });
+
+  test('bucketed rollup by model uses day buckets and per-turn models', async () => {
+    const statsRun = await runCli(['stats', 'tokens', '--bucket', 'day', '--by', 'model', '--project', FAKE_PROJECT, '--db', ORACLE_DB]);
+    const stats = parseOutput(statsRun.stdout);
+    expect(stats.ok).toBe(true);
+    const row = stats.data.find((r: any) => r.model === 'claude-sonnet-4-5');
+    expect(row).toBeDefined();
+    expect(row.bucket).toBe('2026-03-01');
+  });
+
+  test('rejects invalid --bucket and --by values', async () => {
+    const badBucket = await runCli(['stats', 'tokens', '--bucket', 'month', '--project', FAKE_PROJECT, '--db', ORACLE_DB]);
+    expect(badBucket.exitCode).toBe(2);
+    expect(parseOutput(badBucket.stdout).error.code).toBe('INVALID_ARGS');
+    const badBy = await runCli(['stats', 'tokens', '--by', 'branch', '--project', FAKE_PROJECT, '--db', ORACLE_DB]);
+    expect(badBy.exitCode).toBe(2);
+    expect(parseOutput(badBy.stdout).error.code).toBe('INVALID_ARGS');
+  });
+});
+
+describe('stats integration (tool oracle)', () => {
+  test('tool counts in the index match the tools command', async () => {
+    const dbPath = join(FIXTURE_DIR, 'dbs', 'tool-oracle.db');
+    const statsRun = await runCli(['stats', 'trajectories', '--project', FAKE_PROJECT, '--db', dbPath]);
+    expect(statsRun.exitCode).toBe(0);
+
+    const toolsRun = await runCli(['tools', SESSION_ID, '--project', FAKE_PROJECT]);
+    const tools = parseOutput(toolsRun.stdout);
+    expect(tools.ok).toBe(true);
+    const liveCounts: Record<string, number> = {};
+    for (const call of tools.data.tool_calls) {
+      liveCounts[call.tool] = (liveCounts[call.tool] ?? 0) + 1;
+    }
+
+    const db = new Database(dbPath, { readonly: true });
+    const rows = db.query("SELECT tool, COUNT(*) AS n FROM tool_use WHERE session_id = ? AND agent_id = '' GROUP BY tool").all(SESSION_ID) as Array<{ tool: string; n: number }>;
+    db.close();
+    const indexCounts = Object.fromEntries(rows.map(r => [r.tool, r.n]));
+    expect(indexCounts).toEqual(liveCounts);
+  });
+
+  test('trajectories returns the fixture Grep -> Edit pair through the CLI', async () => {
+    const dbPath = join(FIXTURE_DIR, 'dbs', 'tool-oracle.db');
+    const statsRun = await runCli(['stats', 'trajectories', '--prev', 'Grep', '--next', 'Edit', '--project', FAKE_PROJECT, '--db', dbPath]);
+    const stats = parseOutput(statsRun.stdout);
+    expect(stats.ok).toBe(true);
+    expect(stats.data.length).toBe(1);
+    expect(stats.data[0]).toMatchObject({ prev_tool: 'Grep', tool: 'Edit' });
+  });
+
+  test('rejects invalid --operation and --limit', async () => {
+    const dbPath = join(FIXTURE_DIR, 'dbs', 'tool-oracle.db');
+    const badOp = await runCli(['stats', 'trajectories', '--operation', 'rename', '--project', FAKE_PROJECT, '--db', dbPath]);
+    expect(badOp.exitCode).toBe(2);
+    const badLimit = await runCli(['stats', 'trajectories', '--limit', '0', '--project', FAKE_PROJECT, '--db', dbPath]);
+    expect(badLimit.exitCode).toBe(2);
+  });
+});
+
+describe('stats integration (incremental refresh)', () => {
+  const REFRESH_SESSION_ID = '99999999-aaaa-bbbb-cccc-dddddddddddd';
+  const REFRESH_PROJECT = join(FIXTURE_DIR, 'index-refresh-project');
+  const REFRESH_CLAUDE_DIR = join(FIXTURE_CLAUDE_PROJECTS_ROOT, mangleProjectPath(REFRESH_PROJECT));
+  const REFRESH_DB = join(FIXTURE_DIR, 'dbs', 'refresh.db');
+  const sessionFile = join(REFRESH_CLAUDE_DIR, `${REFRESH_SESSION_ID}.jsonl`);
+
+  beforeAll(() => {
+    mkdirSync(REFRESH_PROJECT, { recursive: true });
+    mkdirSync(REFRESH_CLAUDE_DIR, { recursive: true });
+    const lines = [
+      JSON.stringify({
+        type: 'user',
+        sessionId: REFRESH_SESSION_ID,
+        timestamp: '2026-03-02T10:00:00.000Z',
+        gitBranch: 'main',
+        version: '2.1.0',
+        message: { role: 'user', content: 'Refresh fixture' },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-03-02T10:01:00.000Z',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'First response' }],
+          usage: { input_tokens: 10, output_tokens: 5 },
+        },
+      }),
+    ];
+    writeFileSync(sessionFile, lines.join('\n') + '\n');
+  });
+
+  test('detects mtime/size change and replaces exactly that session rows', async () => {
+    const first = parseOutput((await runCli(['stats', 'tokens', '--by', 'session', '--project', REFRESH_PROJECT, '--db', REFRESH_DB])).stdout);
+    expect(first.ok).toBe(true);
+    expect(first._meta.index.refresh.indexed).toBe(1);
+    const firstRow = first.data.find((r: any) => r.session_id === REFRESH_SESSION_ID);
+    expect(firstRow.input_tokens).toBe(10);
+    expect(firstRow.output_tokens).toBe(5);
+
+    // Unchanged file: refresh is a no-op.
+    const noop = parseOutput((await runCli(['stats', 'tokens', '--by', 'session', '--project', REFRESH_PROJECT, '--db', REFRESH_DB])).stdout);
+    expect(noop._meta.index.refresh.indexed).toBe(0);
+    expect(noop._meta.index.refresh.fresh).toBe(1);
+
+    appendFileSync(sessionFile, JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-03-02T10:02:00.000Z',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Appended response' }],
+        usage: { input_tokens: 7, output_tokens: 3 },
+      },
+    }) + '\n');
+    // Force a watermark difference even on coarse-mtime filesystems.
+    const future = new Date(Date.now() + 5000);
+    utimesSync(sessionFile, future, future);
+
+    const second = parseOutput((await runCli(['stats', 'tokens', '--by', 'session', '--project', REFRESH_PROJECT, '--db', REFRESH_DB])).stdout);
+    expect(second.ok).toBe(true);
+    expect(second._meta.index.refresh.indexed).toBe(1);
+    expect(second._meta.index.refresh.fresh).toBe(0);
+    const secondRow = second.data.find((r: any) => r.session_id === REFRESH_SESSION_ID);
+    expect(secondRow.input_tokens).toBe(17);
+    expect(secondRow.output_tokens).toBe(8);
+    expect(secondRow.turns).toBe(2);
+
+    // Rows were replaced, not duplicated.
+    const db = new Database(REFRESH_DB, { readonly: true });
+    const sessionCount = db.query('SELECT COUNT(*) AS n FROM session WHERE session_id = ?').get(REFRESH_SESSION_ID) as { n: number };
+    const turnCount = db.query('SELECT COUNT(*) AS n FROM turn WHERE session_id = ?').get(REFRESH_SESSION_ID) as { n: number };
+    db.close();
+    expect(sessionCount.n).toBe(1);
+    expect(turnCount.n).toBe(3); // user + 2 assistant turns
+  });
+});
+
+describe('index command integration', () => {
+  test('index status reports counts and freshness for the scope', async () => {
+    const dbPath = join(FIXTURE_DIR, 'dbs', 'status.db');
+    const { exitCode, stdout } = await runCli(['index', 'status', '--project', FAKE_PROJECT, '--db', dbPath]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.db_path).toBe(dbPath);
+    expect(result.data.schema_version).toBe(INDEX_SCHEMA_VERSION);
+    expect(result.data.sessions).toBeGreaterThan(0);
+    expect(result.data.turns).toBeGreaterThan(0);
+    expect(result.data.tool_uses).toBeGreaterThan(0);
+    expect(result.data.scope.stale).toBe(0);
+    // Unparseable fixture files written by earlier parse tests stay not_indexed.
+    expect(result.data.scope.fresh + result.data.scope.not_indexed).toBe(result.data.scope.on_disk);
+    expect(result.data.scope.fresh).toBe(result.data.sessions);
+  });
+
+  test('index rebuild recreates the database from scratch', async () => {
+    const dbPath = join(FIXTURE_DIR, 'dbs', 'rebuild.db');
+    const first = parseOutput((await runCli(['index', 'status', '--project', FAKE_PROJECT, '--db', dbPath])).stdout);
+    expect(first.ok).toBe(true);
+    const rebuilt = parseOutput((await runCli(['index', 'rebuild', '--project', FAKE_PROJECT, '--db', dbPath])).stdout);
+    expect(rebuilt.ok).toBe(true);
+    expect(rebuilt.data.sessions).toBe(first.data.sessions);
+    // Everything was re-indexed, nothing reported fresh from the old database.
+    expect(rebuilt._meta.index.refresh.indexed).toBe(rebuilt.data.sessions);
+    expect(rebuilt._meta.index.refresh.fresh).toBe(0);
+  });
+
+  test('respects CC_SESSION_TOOL_DB env var', async () => {
+    const dbPath = join(FIXTURE_DIR, 'dbs', 'env-var.db');
+    const { stdout } = await runCli(['index', 'status', '--project', FAKE_PROJECT], { CC_SESSION_TOOL_DB: dbPath });
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.db_path).toBe(dbPath);
+  });
+});
+
+describe('index resilience', () => {
+  test('a corrupt cache file is rebuilt transparently', async () => {
+    const dbPath = join(FIXTURE_DIR, 'dbs', 'corrupt.db');
+    mkdirSync(join(FIXTURE_DIR, 'dbs'), { recursive: true });
+    writeFileSync(dbPath, 'this is not a sqlite database');
+    const { exitCode, stdout } = await runCli(['stats', 'tokens', '--by', 'session', '--project', FAKE_PROJECT, '--db', dbPath]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.index.mode).toBe('cache');
+    expect(result.data.length).toBeGreaterThan(0);
+  });
+
+  test('falls back to an in-memory index when the cache path is unusable', async () => {
+    // A directory at the db path cannot be opened or deleted by the rebuild path.
+    const dbPath = join(FIXTURE_DIR, 'dbs', 'unusable-dir.db');
+    mkdirSync(dbPath, { recursive: true });
+    writeFileSync(join(dbPath, 'occupant.txt'), 'keep');
+    const { exitCode, stdout } = await runCli(['stats', 'tokens', '--by', 'session', '--project', FAKE_PROJECT, '--db', dbPath]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.index.mode).toBe('memory');
+    expect(result._meta.index.db_path).toBe(':memory:');
+    expect(result.data.length).toBeGreaterThan(0);
+
+    const oracle = parseOutput((await runCli(['tokens', SESSION_ID, '--project', FAKE_PROJECT])).stdout);
+    const row = result.data.find((r: any) => r.session_id === SESSION_ID && r.agent_id === null);
+    expect(row.input_tokens ?? 0).toBe(oracle.data.totals.input);
   });
 });
