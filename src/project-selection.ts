@@ -296,7 +296,7 @@ function acceptedWorktreeRoot(projectRoot: string | null, candidate: string | nu
   return deriveWorktreeRootFromPath(projectRoot, candidate);
 }
 
-function extractFilePath(toolName: string, input: Record<string, unknown>): { path: string; operation: SearchOperation } | null {
+export function extractFilePath(toolName: string, input: Record<string, unknown>): { path: string; operation: SearchOperation } | null {
   const fileAccess = (key: 'file_path' | 'path', operation: SearchOperation): { path: string; operation: SearchOperation } | null => {
     const value = input[key];
     return typeof value === 'string' && value.trim() ? { path: value, operation } : null;
