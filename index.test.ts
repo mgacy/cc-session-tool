@@ -7,6 +7,7 @@ import { randomUUID } from 'crypto';
 import {
   ERROR_CODES, success, failure, CliError, isCliError,
   parseTurnRange, truncateContent, inputSummary, determineOutcome, parseIntArg,
+  parseDateArg,
   extractFilePath, parseSince, buildResultLookup, extractSessionMetadata,
   resolveClaudeProjectDir, resolveSessionFile, resolveSession, parseSessionLines, userAssistantEntries,
   claudeProjectsRoot, findRelatedProjectRefs, listClaudeProjectRefs, listSubagents,
@@ -553,6 +554,38 @@ describe('parseSince', () => {
 
   test('throws on negative (no match)', () => {
     expect(() => parseSince('-1h')).toThrow('Invalid --since duration');
+  });
+});
+
+describe('parseDateArg', () => {
+  test('returns null when the value is absent', () => {
+    expect(parseDateArg(undefined, '--before', 'end')).toBeNull();
+  });
+
+  test('widens a bare date to an inclusive whole-day UTC boundary', () => {
+    // --after anchors the day's start, --before its end, so the named day is
+    // included on both ends rather than silently dropped by lexicographic sort.
+    expect(parseDateArg('2026-01-09', '--after', 'start')).toBe('2026-01-09T00:00:00.000Z');
+    expect(parseDateArg('2026-01-09', '--before', 'end')).toBe('2026-01-09T23:59:59.999Z');
+  });
+
+  test('canonicalizes a UTC timestamp to millisecond precision', () => {
+    expect(parseDateArg('2026-01-09T14:30:00Z', '--after', 'start')).toBe('2026-01-09T14:30:00.000Z');
+  });
+
+  test('converts an offset timestamp to UTC so it sorts correctly', () => {
+    expect(parseDateArg('2026-01-09T14:30:00+02:00', '--before', 'end')).toBe('2026-01-09T12:30:00.000Z');
+  });
+
+  test('rejects a time without a timezone', () => {
+    expect(() => parseDateArg('2026-01-09T14:30', '--before', 'end')).toThrow('Invalid --before date');
+    expect(() => parseDateArg('2026-01-09T14:30:00', '--after', 'start')).toThrow('Invalid --after date');
+  });
+
+  test('rejects malformed or unpadded values', () => {
+    expect(() => parseDateArg('2026-1-9', '--after', 'start')).toThrow('Invalid --after date');
+    expect(() => parseDateArg('yesterday', '--before', 'end')).toThrow('Invalid --before date');
+    expect(() => parseDateArg('2026-13-40', '--after', 'start')).toThrow('Invalid --after date');
   });
 });
 
@@ -4977,6 +5010,26 @@ describe('stats integration (token oracle)', () => {
     const badBy = await runCli(['stats', 'tokens', '--by', 'branch', '--project', FAKE_PROJECT, '--db', ORACLE_DB]);
     expect(badBy.exitCode).toBe(2);
     expect(parseOutput(badBy.stdout).error.code).toBe('INVALID_ARGS');
+  });
+
+  test('date-only --before includes the whole named UTC day', async () => {
+    // The fixture session has assistant turns on 2026-03-01 (e.g. 2026-03-01T10:00:00.000Z).
+    // A bare-date --before must include them; lexicographic `ts <= '2026-03-01'` would not.
+    const dbPath = join(FIXTURE_DIR, 'dbs', `${uniqueTempName('before-day')}.db`);
+    const included = parseOutput((await runCli(['stats', 'tokens', '--by', 'session', '--before', '2026-03-01', '--project', FAKE_PROJECT, '--db', dbPath])).stdout);
+    expect(included.ok).toBe(true);
+    const row = included.data.find((r: any) => r.session_id === SESSION_ID && r.agent_id === null);
+    expect(row).toBeDefined();
+    expect(row.turns).toBeGreaterThan(0);
+
+    // A bare date before any of the session's turns excludes it entirely.
+    const excluded = parseOutput((await runCli(['stats', 'tokens', '--by', 'session', '--before', '2026-02-28', '--project', FAKE_PROJECT, '--db', dbPath])).stdout);
+    expect(excluded.data.find((r: any) => r.session_id === SESSION_ID)).toBeUndefined();
+
+    // A time without a timezone is rejected rather than compared ambiguously.
+    const badTz = await runCli(['stats', 'tokens', '--before', '2026-03-01T10:00', '--project', FAKE_PROJECT, '--db', dbPath]);
+    expect(badTz.exitCode).toBe(2);
+    expect(parseOutput(badTz.stdout).error.code).toBe('INVALID_ARGS');
   });
 });
 

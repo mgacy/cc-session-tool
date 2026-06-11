@@ -683,7 +683,7 @@ cc-session-tool stats tokens [--project <path> | --all-projects] [--bucket day|w
 | ------ | ------- | ----------- |
 | `--bucket` | none | Bucket rows by `day` or `week` (Monday-anchored, matching `search --bucket`). |
 | `--by` | none | Group rows by per-turn `model` or by `session` (one row per transcript, subagents separate). |
-| `--after` / `--before` / `--since` | — | Bound by turn timestamp. `--after`/`--before` must be zero-padded ISO 8601 (`2026-01-09` or `2026-01-09T14:30:00Z`); `--since` and `--after` are mutually exclusive. |
+| `--after` / `--before` / `--since` | — | Bound by turn timestamp, **inclusive**. `--after`/`--before` take zero-padded ISO 8601: a bare date (`2026-01-09`) covers the whole UTC day (`--after` from `00:00:00.000Z`, `--before` through `23:59:59.999Z`), and a value carrying a time must include a timezone (`2026-01-09T14:30:00Z` or an offset). `--since` and `--after` are mutually exclusive. |
 | `--no-subagents` | include | Exclude subagent transcripts from the rollup. |
 
 Each row reports `turns` (assistant turns), `turns_with_usage`, the four token sums, and `cache_hit_rate` (`cache_read / (input + cache_read + cache_creation)`). Token sums are `null` -- never `0` -- when no turn in the group carried `message.usage`, so "no data" is distinguishable from "zero tokens".

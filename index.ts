@@ -938,18 +938,31 @@ export function parseIntArg(value: string | undefined, name: string): number | u
 }
 
 /**
- * Validate an absolute date arg as zero-padded ISO 8601 (YYYY-MM-DD, optionally with time).
- * Returns it unchanged, or null when absent. Timestamps are compared lexicographically
- * downstream, so a malformed/unpadded value (e.g. "2026-1-9" or "yesterday") would silently
- * select the wrong rows -- reject it loudly instead.
+ * Validate and normalize an absolute date arg to a canonical UTC timestamp for
+ * lexicographic comparison against the index's stored `...Z` timestamps.
+ *
+ * Accepts a zero-padded bare date (YYYY-MM-DD) or a date-time carrying an explicit
+ * timezone. A bare date is widened to a whole-day UTC boundary so the named day is
+ * included on both ends: `boundary: 'start'` -> `T00:00:00.000Z` (for --after),
+ * `boundary: 'end'` -> `T23:59:59.999Z` (for --before). Without this, a bare-date
+ * `--before` would lexicographically sort before that day's `...Z` timestamps and
+ * silently drop the whole day. A date-time is canonicalized to UTC via toISOString(),
+ * which also keeps offset inputs (e.g. `+02:00`) correct under lexicographic compare.
+ * A time without a timezone, or a malformed/unpadded value (e.g. "2026-1-9",
+ * "2026-01-09T14:30", "yesterday"), can't be compared unambiguously against the stored
+ * timestamps -- reject it loudly instead. Returns null when absent.
  */
-export function parseDateArg(value: string | undefined, name: string): string | null {
+export function parseDateArg(value: string | undefined, name: string, boundary: 'start' | 'end'): string | null {
   if (value == null) return null;
-  const iso = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?)?$/;
-  if (!iso.test(value) || Number.isNaN(new Date(value).getTime())) {
-    throw cliError('INVALID_ARGS', `Invalid ${name} date '${value}' -- expected ISO 8601 (e.g. 2026-01-09 or 2026-01-09T14:30:00Z)`);
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/;
+  const dateTimeTz = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+  if (dateOnly.test(value) && !Number.isNaN(new Date(value).getTime())) {
+    return boundary === 'start' ? `${value}T00:00:00.000Z` : `${value}T23:59:59.999Z`;
   }
-  return value;
+  if (dateTimeTz.test(value) && !Number.isNaN(new Date(value).getTime())) {
+    return new Date(value).toISOString();
+  }
+  throw cliError('INVALID_ARGS', `Invalid ${name} date '${value}' -- expected ISO 8601, with a timezone when a time is given (e.g. 2026-01-09 or 2026-01-09T14:30:00Z)`);
 }
 
 /** Extract text from a content block's content field (string or array). */
@@ -2739,8 +2752,8 @@ const statsTokensCommand = defineCommand({
     ...INDEX_SCOPE_ARGS,
     bucket: { type: 'string', description: 'Bucket rows by: day, week (Monday-anchored)' },
     by: { type: 'string', description: 'Group rows by: model, session' },
-    after: { type: 'string', description: 'Turns at or after DATE (ISO 8601)' },
-    before: { type: 'string', description: 'Turns at or before DATE (ISO 8601)' },
+    after: { type: 'string', description: 'Turns at or after DATE, inclusive (ISO 8601; a bare date covers the whole UTC day, a time requires a timezone)' },
+    before: { type: 'string', description: 'Turns at or before DATE, inclusive (ISO 8601; a bare date covers the whole UTC day, a time requires a timezone)' },
     since: { type: 'string', description: 'Turns from the last duration (e.g. 1d, 2h, 1w)' },
     subagents: { type: 'boolean', description: 'Include subagent transcripts; use --no-subagents to exclude', default: true },
   },
@@ -2757,8 +2770,8 @@ const statsTokensCommand = defineCommand({
       if (args.since && args.after) {
         throw cliError('INVALID_ARGS', '--since and --after are mutually exclusive');
       }
-      const afterCutoff = args.since ? parseSince(args.since) : parseDateArg(args.after, '--after');
-      const beforeCutoff = parseDateArg(args.before, '--before');
+      const afterCutoff = args.since ? parseSince(args.since) : parseDateArg(args.after, '--after', 'start');
+      const beforeCutoff = parseDateArg(args.before, '--before', 'end');
       const includeSubagents = args.subagents !== false && !(args as Record<string, unknown>)['no-subagents'];
 
       const selection = selectIndexScope(args);
