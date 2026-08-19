@@ -44,6 +44,8 @@ CLI entrypoint and command wiring live in `index.ts` using `citty`. Shared trans
 | `slice` | Raw entries for a turn range |
 | `search` | Find sessions matching structured queries (tool, input, file, text, bash filters), scoped to the logical project plus associated Claude worktrees by default |
 | `subagents` | List subagents for a session with metadata |
+| `stats` | Corpus-wide aggregates from the SQLite transcript index: `stats tokens` (rollups, optional `--bucket day\|week`, `--by model\|session`) and `stats trajectories` (prev-tool/next-tool pair counts) |
+| `index` | SQLite index escape hatches: `index status` (path, counts, freshness) and `index rebuild` (drop and re-index; default scope all projects) |
 
 All session-scoped commands accept a positional session identifier (UUID, UUID prefix, or slug) and an optional `--project` flag (defaults to CWD). They also accept `--claude-project <project>` for stable follow-up from search/list/projects rows that expose raw Claude project basenames through `project` or `session_ref.project`; do not use `project_path_guess` as a follow-up handle. `--project` and `--claude-project` are mutually exclusive. Subagent sessions can be targeted using colon notation: `<session>:<agent-id>` (e.g., `DA2738E3:a8361bc`).
 
@@ -54,6 +56,10 @@ In `search --all-projects`, an explicit `--project <path>` is a query identity a
 Use `search --file <path> --operation <read|edit|write|grep|glob>` to bind file-operation filtering to the same matching file access. Use `--origin` to return the earliest matching transcript write evidence for a file; this is transcript evidence, not VCS creation history. Use `--sort session-newest|match-earliest|match-newest|project` for deterministic ordering.
 
 Use `search --tool <name> --input-match <pattern>` or `tools --input-match <pattern>` to match raw structured tool inputs, including values omitted or truncated in `input_summary`. Add `--aggregate count-per-session` for per-session audit counts, or `--aggregate counters --counter name=pattern --bucket day|week` for named audit tables. `--project-glob` is valid only with `--all-projects` on `search` and `list`; it matches raw Claude project basenames and display-only `project_path_guess` strings, not filesystem files.
+
+### SQLite Transcript Index
+
+`stats` (and `index`) are backed by a normalized SQLite cache (`session` / `turn` / `tool_use` / `schema_version` tables) in `src/transcript-index.ts`. The JSONL transcripts are always the source of truth: the index is built/refreshed lazily on use via per-file mtime+size watermarks, a schema-version mismatch drops and rebuilds all tables (no migrations), and any unusable cache falls back to a transparent rebuild or an in-memory index — a command must never fail or block because of the cache. The database defaults to the user cache directory and is overridable via `--db` or `CC_SESSION_TOOL_DB` (integration tests must point at a per-test DB, never the real cache). Token columns store NULL — never zero — when `message.usage` is absent, so aggregates can distinguish "no data" from "zero tokens". Existing commands do not read the index; their live-scan paths are unchanged.
 
 ### Session Resolution
 

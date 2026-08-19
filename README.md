@@ -665,6 +665,73 @@ cc-session-tool subagents <session> [--project <path> | --claude-project <projec
 - Use the returned `agent_id` with colon notation to target a subagent with any session-scoped command (e.g., `shape DA2738E3:a8361bc`).
 - Colon notation is rejected by this command (subagents of subagents do not exist).
 
+### `stats`
+
+Corpus-wide aggregates served from a SQLite index over the transcripts (`session` / `turn` / `tool_use` tables). The index is built and refreshed lazily on use: each invocation stats every `.jsonl` in scope and re-parses only files whose mtime+size watermark changed. The JSONL transcripts remain the source of truth -- if the cache database is corrupt or unusable, the command transparently falls back to rebuilding it (or to a throwaway in-memory index) and still answers.
+
+The database lives at `~/Library/Caches/cc-session-tool/index.db` on macOS (`~/.cache/cc-session-tool/index.db` elsewhere), overridable with `--db <path>` or the `CC_SESSION_TOOL_DB` env var. `_meta.index` on every response reports the database path, `mode` (`cache` or `memory`), and `refresh` counts. `refresh.failures` lists any transcripts that could not be parsed (with `file_path` and `reason`), so a wholly-unparseable file is identifiable rather than silently dropped from the rollup.
+
+#### `stats tokens`
+
+Token-usage rollups across many sessions.
+
+```bash
+cc-session-tool stats tokens [--project <path> | --all-projects] [--bucket day|week] [--by model|session] [--after <date>] [--before <date>] [--since <duration>] [--no-subagents] [--db <path>]
+```
+
+| Option | Default | Description |
+| ------ | ------- | ----------- |
+| `--bucket` | none | Bucket rows by `day` or `week` (Monday-anchored, matching `search --bucket`). |
+| `--by` | none | Group rows by per-turn `model` or by `session` (one row per transcript, subagents separate). |
+| `--after` / `--before` / `--since` | — | Bound by turn timestamp, **inclusive**. `--after`/`--before` take zero-padded ISO 8601: a bare date (`2026-01-09`) covers the whole UTC day (`--after` from `00:00:00.000Z`, `--before` through `23:59:59.999Z`), and a value carrying a time must include a timezone (`2026-01-09T14:30:00Z` or an offset). `--since` and `--after` are mutually exclusive. |
+| `--no-subagents` | include | Exclude subagent transcripts from the rollup. |
+
+Each row reports `turns` (assistant turns), `turns_with_usage`, the four token sums, and `cache_hit_rate` (`cache_read / (input + cache_read + cache_creation)`). Token sums are `null` -- never `0` -- when no turn in the group carried `message.usage`, so "no data" is distinguishable from "zero tokens".
+
+```bash
+# Daily spend per model across the whole corpus
+cc-session-tool stats tokens --all-projects --bucket day --by model
+
+# Cache hit rate by week for the current project (worktrees included)
+cc-session-tool stats tokens --bucket week
+```
+
+#### `stats trajectories`
+
+Tool-sequence pair counts (`prev_tool -> tool`) over consecutive `tool_use` blocks within each transcript, computed with SQL window functions over `(session, agent, turn, block_index)` order.
+
+```bash
+cc-session-tool stats trajectories [--project <path> | --all-projects] [--prev <tool>] [--next <tool>] [--operation read|edit|write|grep|glob] [--path-match <substr>] [--limit <n>] [--no-subagents] [--db <path>]
+```
+
+| Option | Default | Description |
+| ------ | ------- | ----------- |
+| `--prev` | — | Exact name of the preceding tool (`prev_tool` is `null` for a transcript's first call). |
+| `--next` | — | Exact name of the current tool. |
+| `--operation` | — | File operation of the current call. |
+| `--path-match` | — | Substring of the current call's raw file path. |
+| `--limit` | 50 | Maximum pairs returned, ordered by count descending. |
+
+```bash
+# How often does Edit follow Read, corpus-wide?
+cc-session-tool stats trajectories --all-projects --prev Read --next Edit
+
+# Most common tool transitions in this project
+cc-session-tool stats trajectories --limit 20
+```
+
+### `index`
+
+Escape hatches for the SQLite index that backs `stats`. Neither is required for normal use -- `stats` builds and refreshes the index automatically.
+
+```bash
+cc-session-tool index status  [--project <path> | --all-projects] [--db <path>]
+cc-session-tool index rebuild [--project <path> | --all-projects] [--db <path>]
+```
+
+- `index status` reports the database path, schema version, size, row counts, and scope freshness (`fresh` / `stale` / `not_indexed` / `orphaned` transcript counts).
+- `index rebuild` deletes the database and re-indexes the selected scope from scratch (default: all projects). A schema-version bump does this automatically on first use; there is no migration code by design.
+
 ## Composition Examples
 
 ### Quick access to recent sessions

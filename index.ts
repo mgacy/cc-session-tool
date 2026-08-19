@@ -59,6 +59,27 @@ import {
   parseSessionText as parseTranscriptSessionText,
   type SessionSummaryResult,
 } from './src/transcript.ts';
+import {
+  buildResultLookup as toolLogBuildResultLookup,
+  inputSummary as toolLogInputSummary,
+  safeInputSummary,
+  stableJsonStringify as toolLogStableJsonStringify,
+  type ToolResultInfo,
+} from './src/tool-log.ts';
+import {
+  openIndexDb,
+  queryIndexStatus,
+  queryTokenStats,
+  queryToolPairs,
+  refreshIndexForContexts,
+  removeIndexDbFiles,
+  resolveIndexDbPath,
+  type IndexStatus,
+  type RefreshStats,
+  type TokenStatsRow,
+  type ToolPairRow,
+} from './src/transcript-index.ts';
+import type { Database } from 'bun:sqlite';
 
 export const VERSION = '0.2.0';
 
@@ -828,45 +849,8 @@ export function truncateContent(text: string, maxLen: number): string {
   return text.slice(0, maxLen) + `...[truncated, ${text.length} chars]`;
 }
 
-/** Condensed tool input summary per tool type. */
-export function inputSummary(name: string, input: Record<string, unknown>): string {
-  const inp = input as Record<string, any>;
-  switch (name) {
-    case 'Grep':
-      return `pattern='${inp.pattern ?? ''}' ${inp.path ? `path='${inp.path}'` : ''}`.trim();
-    case 'Read':
-      return `file='${basename(inp.file_path ?? '')}' ${inp.offset != null ? `offset=${inp.offset}` : ''} ${inp.limit != null ? `limit=${inp.limit}` : ''}`.trim().replace(/\s+/g, ' ');
-    case 'Edit':
-      return `file='${basename(inp.file_path ?? '')}' old=(${(inp.old_string ?? '').length} chars) new=(${(inp.new_string ?? '').length} chars)`;
-    case 'Write':
-      return `file='${basename(inp.file_path ?? '')}' (${(inp.content ?? '').length} chars)`;
-    case 'Bash':
-      return (inp.command ?? '').slice(0, 80);
-    case 'Glob':
-      return `pattern='${inp.pattern ?? ''}' ${inp.path ? `path='${inp.path}'` : ''}`.trim();
-    case 'Agent':
-    case 'Task':
-      return `prompt='${(inp.prompt ?? inp.description ?? '').slice(0, 80)}'`;
-    case 'WebFetch':
-      return `url='${inp.url ?? ''}'`;
-    case 'WebSearch':
-      return `query='${inp.query ?? ''}'`;
-    default:
-      return JSON.stringify(inp).slice(0, 80);
-  }
-}
-
-export function stableJsonStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stableJsonStringify).join(',')}]`;
-
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, entryValue]) => entryValue !== undefined)
-    .sort(([a], [b]) => a.localeCompare(b));
-  return `{${entries
-    .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableJsonStringify(entryValue)}`)
-    .join(',')}}`;
-}
+export const inputSummary = toolLogInputSummary;
+export const stableJsonStringify = toolLogStableJsonStringify;
 
 export function toolInputMatches(input: Record<string, unknown>, query: string): boolean {
   return stableJsonStringify(input).toLowerCase().includes(query.toLowerCase());
@@ -874,14 +858,6 @@ export function toolInputMatches(input: Record<string, unknown>, query: string):
 
 function toolInputMatchesMatcher(input: Record<string, unknown>, matcher: TextMatcher | null): boolean {
   return testTextMatcher(matcher, stableJsonStringify(input));
-}
-
-function safeInputSummary(tool: string, input: Record<string, unknown>): string {
-  try {
-    return inputSummary(tool, input);
-  } catch {
-    return stableJsonStringify(input).slice(0, 80);
-  }
 }
 
 /** Determine outcome from a tool_result. */
@@ -959,6 +935,34 @@ export function parseIntArg(value: string | undefined, name: string): number | u
     throw cliError('INVALID_ARGS', `${name} must be a non-negative integer`);
   }
   return n;
+}
+
+/**
+ * Validate and normalize an absolute date arg to a canonical UTC timestamp for
+ * lexicographic comparison against the index's stored `...Z` timestamps.
+ *
+ * Accepts a zero-padded bare date (YYYY-MM-DD) or a date-time carrying an explicit
+ * timezone. A bare date is widened to a whole-day UTC boundary so the named day is
+ * included on both ends: `boundary: 'start'` -> `T00:00:00.000Z` (for --after),
+ * `boundary: 'end'` -> `T23:59:59.999Z` (for --before). Without this, a bare-date
+ * `--before` would lexicographically sort before that day's `...Z` timestamps and
+ * silently drop the whole day. A date-time is canonicalized to UTC via toISOString(),
+ * which also keeps offset inputs (e.g. `+02:00`) correct under lexicographic compare.
+ * A time without a timezone, or a malformed/unpadded value (e.g. "2026-1-9",
+ * "2026-01-09T14:30", "yesterday"), can't be compared unambiguously against the stored
+ * timestamps -- reject it loudly instead. Returns null when absent.
+ */
+export function parseDateArg(value: string | undefined, name: string, boundary: 'start' | 'end'): string | null {
+  if (value == null) return null;
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/;
+  const dateTimeTz = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+  if (dateOnly.test(value) && !Number.isNaN(new Date(value).getTime())) {
+    return boundary === 'start' ? `${value}T00:00:00.000Z` : `${value}T23:59:59.999Z`;
+  }
+  if (dateTimeTz.test(value) && !Number.isNaN(new Date(value).getTime())) {
+    return new Date(value).toISOString();
+  }
+  throw cliError('INVALID_ARGS', `Invalid ${name} date '${value}' -- expected ISO 8601, with a timezone when a time is given (e.g. 2026-01-09 or 2026-01-09T14:30:00Z)`);
 }
 
 /** Extract text from a content block's content field (string or array). */
@@ -1098,31 +1102,10 @@ export async function listSubagents(claudeDir: string, sessionUuid: string): Pro
   return infos;
 }
 
-/** Result info for a tool_use_id, extracted from tool_result blocks. */
-export type ToolResultInfo = {
-  is_error: boolean;
-  content: string | ContentBlock[] | undefined;
-  result_ts: string | undefined;
-};
+export type { ToolResultInfo };
 
 /** Build a lookup from tool_use_id to result info from user entries. */
-export function buildResultLookup(entries: SessionEntry[]): Map<string, ToolResultInfo> {
-  const lookup = new Map<string, ToolResultInfo>();
-  for (const entry of entries) {
-    if (entry.type === 'user' && Array.isArray(entry.message?.content)) {
-      for (const block of entry.message!.content as ContentBlock[]) {
-        if (block.type === 'tool_result' && block.tool_use_id) {
-          lookup.set(block.tool_use_id, {
-            is_error: block.is_error ?? false,
-            content: block.content,
-            result_ts: entry.timestamp ?? undefined,
-          });
-        }
-      }
-    }
-  }
-  return lookup;
-}
+export const buildResultLookup = toolLogBuildResultLookup;
 
 // ============================================================================
 // List Command
@@ -2613,6 +2596,258 @@ const searchCommand = defineCommand({
 });
 
 // ============================================================================
+// Index + Stats Commands (SQLite transcript index)
+// ============================================================================
+
+export type IndexMeta = ResponseMeta & {
+  index?: {
+    db_path: string;
+    mode: 'cache' | 'memory';
+    refresh: RefreshStats;
+  };
+  projects_scanned?: number;
+  included_projects?: PublicProjectRef[];
+  skipped_projects?: PublicProjectRef[];
+};
+
+type IndexScopeArgs = {
+  project?: string;
+  'all-projects'?: boolean;
+};
+
+type IndexHandle = {
+  db: Database;
+  dbPath: string;
+  mode: 'cache' | 'memory';
+  refresh: RefreshStats;
+};
+
+function selectIndexScope(args: IndexScopeArgs): ProjectSelection {
+  const allProjects = Boolean(args['all-projects']);
+  return selectProjectContexts({
+    mode: allProjects ? 'all-projects' : 'scoped-with-worktrees',
+    projectPath: allProjects ? args.project : args.project || process.cwd(),
+  });
+}
+
+/**
+ * Open and refresh the index for the given scope. The JSONL transcripts stay
+ * the source of truth: an unopenable cache is deleted and rebuilt once, and if
+ * that also fails the query runs against a throwaway in-memory index built by
+ * the same code -- a command never fails or blocks because of the cache.
+ */
+function acquireIndexForContexts(dbFlag: string | undefined, contexts: SearchProjectContext[]): IndexHandle {
+  const dbPath = resolveIndexDbPath(dbFlag);
+  let db: Database | null = null;
+  try {
+    db = openIndexDb(dbPath);
+  } catch {
+    try {
+      removeIndexDbFiles(dbPath);
+      db = openIndexDb(dbPath);
+    } catch {
+      db = null;
+    }
+  }
+  if (db) {
+    try {
+      const refresh = refreshIndexForContexts(db, contexts);
+      return { db, dbPath, mode: 'cache', refresh };
+    } catch {
+      try {
+        db.close();
+      } catch {
+        // The cache handle is already unusable; in-memory fallback follows.
+      }
+    }
+  }
+  const memoryDb = openIndexDb(':memory:');
+  const refresh = refreshIndexForContexts(memoryDb, contexts);
+  return { db: memoryDb, dbPath, mode: 'memory', refresh };
+}
+
+/** The db path to report: the in-memory fallback hides the unusable cache path behind ':memory:'. */
+function publicDbPath(handle: IndexHandle): string {
+  return handle.mode === 'memory' ? ':memory:' : handle.dbPath;
+}
+
+function indexMeta(base: ResponseMeta, handle: IndexHandle, selection: ProjectSelection, allProjects: boolean): IndexMeta {
+  const responseMeta: IndexMeta = {
+    ...base,
+    index: {
+      db_path: publicDbPath(handle),
+      mode: handle.mode,
+      refresh: handle.refresh,
+    },
+  };
+  responseMeta.included_projects = selection.includedProjects;
+  if (allProjects) {
+    responseMeta.projects_scanned = selection.contexts.length;
+    responseMeta.skipped_projects = selection.skippedProjects;
+  }
+  return responseMeta;
+}
+
+const INDEX_SCOPE_ARGS = {
+  project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
+  'all-projects': { type: 'boolean', description: 'Operate on all Claude project directories', default: false },
+  db: { type: 'string', description: 'Index database path (default: CC_SESSION_TOOL_DB or the user cache directory)' },
+} as const;
+
+const indexStatusCommand = defineCommand({
+  meta: { name: 'status', description: 'Report index database location, row counts, and freshness for the selected scope' },
+  args: { ...INDEX_SCOPE_ARGS },
+  async run({ args }) {
+    try {
+      const selection = selectIndexScope(args);
+      const handle = acquireIndexForContexts(args.db, selection.contexts);
+      try {
+        const status: IndexStatus = queryIndexStatus(handle.db, publicDbPath(handle), selection.contexts);
+        output(success(status, indexMeta(meta(1, 1), handle, selection, Boolean(args['all-projects']))));
+      } finally {
+        handle.db.close();
+      }
+    } catch (err: unknown) {
+      handleCommandError(err);
+    }
+  },
+});
+
+const indexRebuildCommand = defineCommand({
+  meta: { name: 'rebuild', description: 'Drop and rebuild the index database, re-indexing the selected scope (default: all projects)' },
+  args: { ...INDEX_SCOPE_ARGS },
+  async run({ args }) {
+    try {
+      const allProjects = args.project ? Boolean(args['all-projects']) : true;
+      const selection = selectProjectContexts({
+        mode: allProjects ? 'all-projects' : 'scoped-with-worktrees',
+        projectPath: args.project,
+      });
+      const dbPath = resolveIndexDbPath(args.db);
+      removeIndexDbFiles(dbPath);
+      const handle = acquireIndexForContexts(args.db, selection.contexts);
+      try {
+        const status: IndexStatus = queryIndexStatus(handle.db, publicDbPath(handle), selection.contexts);
+        output(success(status, indexMeta(meta(1, 1), handle, selection, allProjects)));
+      } finally {
+        handle.db.close();
+      }
+    } catch (err: unknown) {
+      handleCommandError(err);
+    }
+  },
+});
+
+const indexCommand = defineCommand({
+  meta: { name: 'index', description: 'Inspect or rebuild the SQLite transcript index (built lazily by stats commands)' },
+  subCommands: {
+    status: indexStatusCommand,
+    rebuild: indexRebuildCommand,
+  },
+});
+
+const statsTokensCommand = defineCommand({
+  meta: { name: 'tokens', description: 'Corpus-wide token rollups from the transcript index; sums are null (not 0) when usage data is absent' },
+  args: {
+    ...INDEX_SCOPE_ARGS,
+    bucket: { type: 'string', description: 'Bucket rows by: day, week (Monday-anchored)' },
+    by: { type: 'string', description: 'Group rows by: model, session' },
+    after: { type: 'string', description: 'Turns at or after DATE, inclusive (ISO 8601; a bare date covers the whole UTC day, a time requires a timezone)' },
+    before: { type: 'string', description: 'Turns at or before DATE, inclusive (ISO 8601; a bare date covers the whole UTC day, a time requires a timezone)' },
+    since: { type: 'string', description: 'Turns from the last duration (e.g. 1d, 2h, 1w)' },
+    subagents: { type: 'boolean', description: 'Include subagent transcripts; use --no-subagents to exclude', default: true },
+  },
+  async run({ args }) {
+    try {
+      const bucket = (args.bucket ?? null) as 'day' | 'week' | null;
+      if (bucket !== null && bucket !== 'day' && bucket !== 'week') {
+        throw cliError('INVALID_ARGS', '--bucket must be one of: day, week');
+      }
+      const by = (args.by ?? null) as 'model' | 'session' | null;
+      if (by !== null && by !== 'model' && by !== 'session') {
+        throw cliError('INVALID_ARGS', '--by must be one of: model, session');
+      }
+      if (args.since && args.after) {
+        throw cliError('INVALID_ARGS', '--since and --after are mutually exclusive');
+      }
+      const afterCutoff = args.since ? parseSince(args.since) : parseDateArg(args.after, '--after', 'start');
+      const beforeCutoff = parseDateArg(args.before, '--before', 'end');
+      const includeSubagents = args.subagents !== false && !(args as Record<string, unknown>)['no-subagents'];
+
+      const selection = selectIndexScope(args);
+      const handle = acquireIndexForContexts(args.db, selection.contexts);
+      try {
+        const rows: TokenStatsRow[] = queryTokenStats(handle.db, {
+          projects: selection.contexts.map(context => context.projectRef.project),
+          bucket,
+          by,
+          after: afterCutoff,
+          before: beforeCutoff,
+          includeSubagents,
+        });
+        output(success(rows, indexMeta(meta(rows.length, rows.length), handle, selection, Boolean(args['all-projects']))));
+      } finally {
+        handle.db.close();
+      }
+    } catch (err: unknown) {
+      handleCommandError(err);
+    }
+  },
+});
+
+const statsTrajectoriesCommand = defineCommand({
+  meta: { name: 'trajectories', description: 'Tool-sequence pair counts (prev tool -> tool) from the transcript index' },
+  args: {
+    ...INDEX_SCOPE_ARGS,
+    prev: { type: 'string', description: 'Filter pairs by the preceding tool name (exact)' },
+    next: { type: 'string', description: 'Filter pairs by the current tool name (exact)' },
+    operation: { type: 'string', description: 'Filter by the current call file operation: read/edit/write/grep/glob' },
+    'path-match': { type: 'string', description: 'Filter by case-sensitive substring of the current call file path' },
+    limit: { type: 'string', description: 'Return at most N pairs (default: 50)' },
+    subagents: { type: 'boolean', description: 'Include subagent transcripts; use --no-subagents to exclude', default: true },
+  },
+  async run({ args }) {
+    try {
+      if (args.operation && !SEARCH_OPERATIONS.includes(args.operation as SearchOperation)) {
+        throw cliError('INVALID_ARGS', '--operation must be one of: read, edit, write, grep, glob');
+      }
+      const limit = parseIntArg(args.limit, '--limit') ?? 50;
+      if (limit <= 0) {
+        throw cliError('INVALID_ARGS', '--limit must be a positive integer');
+      }
+      const includeSubagents = args.subagents !== false && !(args as Record<string, unknown>)['no-subagents'];
+
+      const selection = selectIndexScope(args);
+      const handle = acquireIndexForContexts(args.db, selection.contexts);
+      try {
+        const rows: ToolPairRow[] = queryToolPairs(handle.db, {
+          projects: selection.contexts.map(context => context.projectRef.project),
+          prev: args.prev ?? null,
+          next: args.next ?? null,
+          operation: args.operation ?? null,
+          pathMatch: args['path-match'] ?? null,
+          limit,
+          includeSubagents,
+        });
+        output(success(rows, indexMeta(meta(rows.length, rows.length), handle, selection, Boolean(args['all-projects']))));
+      } finally {
+        handle.db.close();
+      }
+    } catch (err: unknown) {
+      handleCommandError(err);
+    }
+  },
+});
+
+const statsCommand = defineCommand({
+  meta: { name: 'stats', description: 'Corpus-wide aggregates over the SQLite transcript index (built/refreshed lazily on use)' },
+  subCommands: {
+    tokens: statsTokensCommand,
+    trajectories: statsTrajectoriesCommand,
+  },
+});
+
+// ============================================================================
 // Subagents Command
 // ============================================================================
 
@@ -2662,6 +2897,8 @@ const main = defineCommand({
     files: filesCommand,
     search: searchCommand,
     subagents: subagentsCommand,
+    stats: statsCommand,
+    index: indexCommand,
   },
 });
 
