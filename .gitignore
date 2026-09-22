@@ -38,8 +38,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .DS_Store
 
 # User specific configs
+!.vscode/extensions.json
 .claude-tracking/
 .claude/settings.local.json
+.claude/skills/cc-session-tool-workspace/**
 .env
 .vscode/
-!.vscode/extensions.json
