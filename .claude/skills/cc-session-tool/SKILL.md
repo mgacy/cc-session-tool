@@ -18,7 +18,7 @@ Match the user's intent to a command before reading flags. Most investigations a
 | List recent sessions (current project + its worktrees)          | `list`                |
 | Cross-project listing                                           | `list --all-projects` |
 | Index project transcript directories themselves                 | `projects`            |
-| Find which sessions touched a file, ran a tool, said a phrase, or saw an error/output | `search` |
+| Find which sessions touched a file, ran a tool, said a phrase   | `search`              |
 | Get a fast triage summary of one session                        | `summary`             |
 | See the turn-by-turn skeleton with tool/edit stats              | `shape`               |
 | Inspect tool calls with condensed inputs and outcomes           | `tools`               |
@@ -37,7 +37,7 @@ Two-phase pattern that minimizes token usage:
 1. **Triage** — narrow to one session with `list`, `search`, or a session ID the user provided.
 2. **Drill** — start with `summary` for a one-shot overview. If you need more, use `shape` for the table of contents, then `tools` / `files` / `messages` / `slice` for specifics.
 
-Avoid `slice` without a `--turn` range narrower than ~5 turns — it returns raw content, which is expensive. Use `messages` (truncated by default, except for a single `--turn N`) or `shape` first to locate the turns you care about.
+Avoid `slice` without a `--turn` range narrower than ~5 turns — it returns raw content, which is expensive. Use `messages` (truncated by default; a single `--turn N` lifts this for text and thinking, but tool results stay truncated unless you pass `--max-tool-result`) or `shape` first to locate the turns you care about.
 
 ## Key concepts
 
@@ -170,23 +170,6 @@ cc-session-tool search --tool Bash \
   --bucket day
 ```
 
-### "Which sessions hit error X?"
-
-```bash
-# Bash calls whose output contains the text
-cc-session-tool search --tool Bash --output-match "permission denied" --sort match-earliest
-
-# Bash calls running a command whose result failed
-cc-session-tool search --bash "bun test" --failed
-
-# Read the full result: the evidence's result_turn, not turn. Add :<agent_id> for subagent
-# evidence; match tool_use_id when the turn holds several results.
-cc-session-tool messages <session>[:<agent_id>] --claude-project <session_ref.project> \
-  --turn <result_turn> --type tool_result --max-tool-result 4000
-```
-
-See `references/search.md` ("Tool output and failures") for binding rules and limits.
-
 ## Pitfalls to avoid
 
 - **`--text` does not search tool output.** An empty `--text` result does not mean an error or refusal never happened; search tool results with `--output-match` / `--output-regex` or `--failed`.
@@ -203,4 +186,4 @@ See `references/search.md` ("Tool output and failures") for binding rules and li
 Use these reference files when the above isn't enough. Read only the one you need.
 
 - `references/commands.md` — full per-command flag list and output schemas, condensed from the README.
-- `references/search.md` — search command deep dive: scoping semantics, file-identity matching across worktrees, aggregation modes, output fields.
+- `references/search.md` — search command deep dive: scoping semantics, file-identity matching across worktrees, tool-output and failure matching, aggregation modes, output fields.
