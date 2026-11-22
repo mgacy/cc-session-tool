@@ -3112,6 +3112,18 @@ describe('projects integration', () => {
       },
     ]);
   });
+
+  test('projects --project --glob matching nothing is ok with zero projects scanned', async () => {
+    const { exitCode, stdout } = await runCli(['projects', '--project', RELATED_PROJECT, '--glob', 'no-such-project-dir-zz']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data).toEqual([]);
+    expect(result._meta.projects_scanned).toBe(0);
+    expect(result._meta.projects_skipped).toBe(3);
+    expect(result._meta).not.toHaveProperty('included_projects');
+    expect(result._meta).not.toHaveProperty('skipped_projects');
+  });
 });
 
 describe('--include-project-lists across project-selecting leaves (integration)', () => {
@@ -4539,23 +4551,28 @@ describe('search integration', () => {
     expect(result._meta.skipped_projects).toEqual([]);
   });
 
-  test('search --aggregate counters --bucket keeps project counts and omits arrays by default', async () => {
+  test('search --aggregate counters --bucket counts bucket rows and keeps project counts by default', async () => {
+    // RELATED_PROJECT has three Read sessions (2026-03-07, 03-08, 03-11) spanning two Monday-anchored weeks,
+    // so total/returned only equal 2 if they are recomputed from the bucket rows rather than the session matches.
     const { exitCode, stdout } = await runCli([
       'search',
       '--tool', 'Read',
       '--counter', 'missing=no-such-counter-marker',
       '--aggregate', 'counters',
-      '--bucket', 'day',
-      '--project', FAKE_PROJECT,
+      '--bucket', 'week',
+      '--project', RELATED_PROJECT,
     ]);
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
-    expect(result._meta.projects_scanned).toBe(1);
+    expect(result.data).toHaveLength(2);
+    expect(result.data.reduce((sum: number, row: any) => sum + row.sessions, 0)).toBe(3);
+    expect(result._meta.total).toBe(2);
+    expect(result._meta.returned).toBe(2);
+    expect(result._meta.projects_scanned).toBe(3);
     expect(result._meta.projects_skipped).toBe(0);
     expect(result._meta).not.toHaveProperty('included_projects');
     expect(result._meta).not.toHaveProperty('skipped_projects');
-    expect(result._meta.total).toBe(result.data.length);
   });
 
   test('search --all-projects --project-glob filters selected and skipped projects', async () => {
