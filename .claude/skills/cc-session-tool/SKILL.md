@@ -162,23 +162,23 @@ cc-session-tool search --tool Bash \
 ### "Which sessions hit error X?"
 
 ```bash
-# Tool output is matched by --output-match, not --text; bound to the same Bash call
+# Bash calls whose output contains the text
 cc-session-tool search --tool Bash --output-match "permission denied" --sort match-earliest
 
-# Or: Bash calls matching a command whose result failed
+# Bash calls running a command whose result failed
 cc-session-tool search --bash "bun test" --failed
 
-# Follow up on a tool_output evidence item: read the full result at result_turn.
-# Append :<agent_id> when the evidence came from a subagent, and pick the result whose tool_use_id matches.
+# Read the full result: the evidence's result_turn, not turn. Add :<agent_id> for subagent
+# evidence; match tool_use_id when the turn holds several results.
 cc-session-tool messages <session>[:<agent_id>] --claude-project <session_ref.project> \
   --turn <result_turn> --type tool_result --max-tool-result 4000
 ```
 
-See `references/search.md` ("Tool output and failures") for binding rules, limits, and rejected combinations.
+See `references/search.md` ("Tool output and failures") for binding rules and limits.
 
 ## Pitfalls to avoid
 
-- **`--text` does not search tool output.** Errors, refusals and tool results are matched by `--output-match` / `--output-regex` or `--failed`. An empty `--text` result is not evidence that something never happened. Output of user `!` commands is user text, so `--text` does match it.
+- **`--text` does not search tool output.** An empty `--text` result does not mean an error or refusal never happened; search tool results with `--output-match` / `--output-regex` or `--failed`.
 - **Don't read JSONL files directly.** Transcripts are huge; always go through the CLI.
 - **Don't rely on `project_path_guess`** for follow-up commands. Use `project` / `session_ref.project` with `--claude-project`.
 - **Don't pass `--operation` without `--file`** — the filter only binds when there's a matching file access to bind to.
