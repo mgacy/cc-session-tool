@@ -645,14 +645,14 @@ describe('Claude project discovery helpers', () => {
   });
 
   test('findRelatedProjectRefs returns both raw worktree project-name shapes under the project path', () => {
-    const projectPath = '/Users/matt/repo';
+    const projectPath = '/tmp/repo';
     const worktreesDirProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
     const doubleDashProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-b`;
     const refs = [
       {
         project: worktreesDirProject,
         claude_dir: `/tmp/claude/projects/${worktreesDirProject}`,
-        project_path_guess: '/Users/matt/repo/.claude/worktrees/feature/a',
+        project_path_guess: '/tmp/repo/.claude/worktrees/feature/a',
       },
       {
         project: doubleDashProject,
@@ -665,9 +665,9 @@ describe('Claude project discovery helpers', () => {
         project_path_guess: projectPathGuessFromClaudeProject(doubleDashProject),
       },
       {
-        project: '-Users-matt-repo-other',
-        claude_dir: '/tmp/claude/projects/-Users-matt-repo-other',
-        project_path_guess: '/Users/matt/repo/other',
+        project: '-tmp-repo-other',
+        claude_dir: '/tmp/claude/projects/-tmp-repo-other',
+        project_path_guess: '/tmp/repo/other',
       },
       {
         project: 'not-mangled',
@@ -676,14 +676,14 @@ describe('Claude project discovery helpers', () => {
       },
     ];
 
-    expect(findRelatedProjectRefs('/Users/matt/repo/', refs)).toEqual([refs[0]!, refs[1]!]);
+    expect(findRelatedProjectRefs('/tmp/repo/', refs)).toEqual([refs[0]!, refs[1]!]);
   });
 
   test('findRelatedProjectRefs handles hyphenated project paths without relying on path guesses', () => {
-    const projectPath = '/Users/matt/Developer/cc-session-tool/cc-session-tool';
+    const projectPath = '/tmp/cc-session-tool/cc-session-tool';
     const relatedProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
     const relatedDoubleDashProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-b`;
-    const siblingProject = mangleProjectPath('/Users/matt/Developer/cc-session-tool/other');
+    const siblingProject = mangleProjectPath('/tmp/cc-session-tool/other');
     const similarPrefixProject = `${mangleProjectPath(`${projectPath}-other`)}--claude-worktrees-feature-c`;
     const refs = [
       {
