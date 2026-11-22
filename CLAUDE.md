@@ -78,6 +78,7 @@ Sessions are resolved in order within the selected Claude project directory: exa
 5. `project_path_guess` is display metadata only; raw `project` / `session_ref.project` is the stable Claude project identity for follow-up commands.
 6. `mangleProjectPath` must mirror Claude Code's project-dir encoder exactly (NFC; every non-`[A-Za-z0-9]` UTF-16 code unit becomes `-`; names over 200 chars are truncated with a hash suffix), and worktree discovery derives its prefix from the same sanitizer. Encoding-sensitive tests must write the encoding-sensitive part of expected basenames (e.g. `--claude-worktrees-`) as literals, because encoder-derived fixtures agree with any encoder.
 7. Arguments are validated strictly before any I/O: input a command does not declare in its `args` is `INVALID_ARGS`, never silently ignored.
+8. Project-selecting commands report coverage as `_meta.projects_scanned` / `_meta.projects_skipped` counts. Never emit unbounded per-directory arrays in `_meta` by default. `included_projects` / `skipped_projects` are opt-in via `--include-project-lists`.
 
 ### Testing
 

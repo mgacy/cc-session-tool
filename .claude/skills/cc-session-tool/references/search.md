@@ -23,6 +23,7 @@ At least one **selector** is required: `--tool`, `--input-match` / `--input-rege
 | `--project <path>` | Same as above but with an explicit logical project. |
 | `--all-projects` | Scan every top-level Claude project directory under `~/.claude/projects`. |
 | `--project-glob <pat>` | Only valid with `--all-projects`. Filter by raw Claude project basename **or** by display-only `project_path_guess`. `*` and `?` supported. This matches Claude project identity, not filesystem files. |
+| `--include-project-lists` | Add the `_meta.included_projects` / `_meta.skipped_projects` arrays. Default is the `projects_scanned` / `projects_skipped` counts only. |
 | `--no-subagents` | Disable the default one-level subagent transcript inclusion. |
 
 **Critical:** in `--all-projects` mode, an explicit `--project` is **only** a file-identity anchor for normalizing absolute `--file` queries. It does **not** narrow the scan, and the tool does **not** silently use CWD or `project_path_guess` as an authoritative root for unrelated projects.
@@ -116,7 +117,7 @@ Worktree / all-project responses add:
 - `project_role` — `main` / `worktree` / `global`
 - `session_ref` — `{ session_id, project }` for stable follow-up
 
-Scoped responses set `_meta.included_projects`; all-projects responses set `_meta.projects_scanned`.
+Every response carries `_meta.projects_scanned` / `_meta.projects_skipped`; `--include-project-lists` adds the project arrays. See SKILL.md "Output envelope".
 
 `--origin` results add `matches.file_evidence` (the earliest matching write entry).
 

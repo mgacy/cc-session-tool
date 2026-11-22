@@ -40,6 +40,7 @@ import {
   resolveSessionWithText,
 } from './src/transcript.ts';
 import {
+  buildProjectScanMeta,
   buildScopedSearchScope as buildScopedSearchScopeModule,
   listSearchTargetsForContext as listSearchTargetsForContextModule,
   claudeProjectPathHash,
@@ -225,6 +226,7 @@ describe('search matcher primitives', () => {
       returned: 0,
       hasMore: false,
       projects_scanned: 1,
+      projects_skipped: 0,
       included_projects: [],
       skipped_projects: [],
     };
@@ -2652,17 +2654,22 @@ describe('worktree project path resolution integration', () => {
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result._meta).not.toHaveProperty('included_projects');
+    expect(result._meta).not.toHaveProperty('skipped_projects');
+    expect(result._meta.projects_scanned).toBe(1);
+    expect(result._meta.projects_skipped).toBe(0);
     const ids = result.data.map((s: any) => s.session_id);
     expect(ids).toContain(SESSION_ID_8);
     expect(ids).not.toContain(SESSION_ID_7);
   });
 
   test('search --project <worktree> resolves the worktree dir and excludes the parent and sibling', async () => {
-    const { exitCode, stdout } = await runCli(['search', '--bash-regex', 'bun test related', '--project', RELATED_WORKTREE_ROOT]);
+    const { exitCode, stdout } = await runCli(['search', '--bash-regex', 'bun test related', '--project', RELATED_WORKTREE_ROOT, '--include-project-lists']);
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result.data.map((s: any) => s.session_id)).toContain(SESSION_ID_8);
+    expect(result._meta.projects_scanned).toBe(1);
+    expect(result._meta.projects_skipped).toBe(0);
     expect(result._meta.included_projects).toEqual([
       {
         project: relatedWorktreeDirName,
@@ -2670,6 +2677,7 @@ describe('worktree project path resolution integration', () => {
         project_role: 'main',
       },
     ]);
+    expect(result._meta.skipped_projects).toEqual([]);
   });
 
   test('projects --project <worktree> returns exactly that worktree dir', async () => {
@@ -2696,7 +2704,7 @@ describe('worktree project path resolution integration', () => {
   test('stats tokens --project <worktree> scopes to that worktree dir with a per-test db', async () => {
     const dbDir = join(FIXTURE_DIR, 'dbs-worktree');
     mkdirSync(dbDir, { recursive: true });
-    const { exitCode, stdout } = await runCli(['stats', 'tokens', '--by', 'session', '--project', RELATED_WORKTREE_ROOT, '--db', join(dbDir, 'worktree.db')]);
+    const { exitCode, stdout } = await runCli(['stats', 'tokens', '--by', 'session', '--project', RELATED_WORKTREE_ROOT, '--db', join(dbDir, 'worktree.db'), '--include-project-lists']);
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
@@ -2707,6 +2715,7 @@ describe('worktree project path resolution integration', () => {
         project_role: 'main',
       },
     ]);
+    expect(result._meta.skipped_projects).toEqual([]);
     const ids = result.data.map((r: any) => r.session_id);
     expect(ids).toContain(SESSION_ID_8);
     expect(ids).not.toContain(SESSION_ID_7);
@@ -2787,11 +2796,12 @@ describe('worktree CWD default integration', () => {
   });
 
   test('stats tokens from a worktree CWD resolves the CWD scope with a per-test db', async () => {
-    const { exitCode, stdout } = await runCli(['stats', 'tokens', '--by', 'session', '--db', dbPath], { HOME: home }, worktreeDir);
+    const { exitCode, stdout } = await runCli(['stats', 'tokens', '--by', 'session', '--db', dbPath, '--include-project-lists'], { HOME: home }, worktreeDir);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(exitCode).toBe(0);
     expect(result._meta.included_projects.map((p: any) => p.project)).toEqual([worktreeProject]);
+    expect(result._meta.skipped_projects).toEqual([]);
     const row = result.data.find((r: any) => r.session_id === sessionId && r.agent_id === null);
     expect(row).toMatchObject({ input_tokens: 10, output_tokens: 5 });
   });
@@ -2883,11 +2893,13 @@ describe('list integration', () => {
   });
 
   test('scoped list includes associated worktree projects by default and exposes session_ref handles', async () => {
-    const { exitCode, stdout } = await runCli(['list', '--project', RELATED_PROJECT]);
+    const { exitCode, stdout } = await runCli(['list', '--project', RELATED_PROJECT, '--include-project-lists']);
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result._meta.projects_scanned).toBe(3);
+    expect(result._meta.projects_skipped).toBe(0);
+    expect(result._meta.skipped_projects).toEqual([]);
     expect(result._meta.included_projects).toEqual([
       {
         project: relatedDirName,
@@ -2920,6 +2932,9 @@ describe('list integration', () => {
     expect(result.ok).toBe(true);
     expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_7]);
     expect(result._meta).not.toHaveProperty('included_projects');
+    expect(result._meta).not.toHaveProperty('skipped_projects');
+    expect(result._meta.projects_scanned).toBe(1);
+    expect(result._meta.projects_skipped).toBe(0);
   });
 
   test('list intent filters inspect slug and first user message', async () => {
@@ -2943,11 +2958,12 @@ describe('list integration', () => {
   });
 
   test('--all-projects lists sessions with project metadata', async () => {
-    const { exitCode, stdout } = await runCli(['list', '--all-projects']);
+    const { exitCode, stdout } = await runCli(['list', '--all-projects', '--include-project-lists']);
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result._meta.projects_scanned).toBeGreaterThanOrEqual(4);
+    expect(result._meta.projects_skipped).toBe(0);
     expect(result._meta.included_projects).toContainEqual({
       project: secondFakeDirName,
       project_path_guess: projectPathGuessFromClaudeProject(secondFakeDirName),
@@ -2961,11 +2977,12 @@ describe('list integration', () => {
   });
 
   test('list --all-projects --project-glob filters selected and skipped projects', async () => {
-    const { exitCode, stdout } = await runCli(['list', '--all-projects', '--project-glob', '*fake-project-worktree']);
+    const { exitCode, stdout } = await runCli(['list', '--all-projects', '--project-glob', '*fake-project-worktree', '--include-project-lists']);
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result._meta.projects_scanned).toBe(1);
+    expect(result._meta.projects_skipped).toBe(result._meta.skipped_projects.length);
     expect(result._meta.included_projects).toEqual([{
       project: secondFakeDirName,
       project_path_guess: projectPathGuessFromClaudeProject(secondFakeDirName),
@@ -2976,6 +2993,18 @@ describe('list integration', () => {
       project_path_guess: projectPathGuessFromClaudeProject(fakeDirName),
       project_role: 'global',
     });
+    expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_6]);
+  });
+
+  test('list --all-projects --project-glob reports counts only by default', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--all-projects', '--project-glob', '*fake-project-worktree']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBe(1);
+    expect(result._meta.projects_skipped).toBeGreaterThanOrEqual(1);
+    expect(result._meta).not.toHaveProperty('included_projects');
+    expect(result._meta).not.toHaveProperty('skipped_projects');
     expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_6]);
   });
 
@@ -2995,6 +3024,10 @@ describe('projects integration', () => {
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBe(2);
+    expect(result._meta.projects_skipped).toBeGreaterThanOrEqual(1);
+    expect(result._meta).not.toHaveProperty('included_projects');
+    expect(result._meta).not.toHaveProperty('skipped_projects');
     expect(result.data.map((p: any) => p.project)).toEqual([fakeDirName, secondFakeDirName]);
     expect(result.data[0]).toMatchObject({
       project: fakeDirName,
@@ -3032,6 +3065,84 @@ describe('projects integration', () => {
       session_count: 5,
     });
   });
+
+  test('unfiltered projects reports counts only by default', async () => {
+    const { exitCode, stdout } = await runCli(['projects']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBeGreaterThanOrEqual(4);
+    expect(result._meta.projects_skipped).toBe(0);
+    expect(result._meta).not.toHaveProperty('included_projects');
+    expect(result._meta).not.toHaveProperty('skipped_projects');
+  });
+
+  test('projects --project --glob reports what the glob excluded', async () => {
+    const args = ['projects', '--project', RELATED_PROJECT, '--glob', relatedWorktreeDirName];
+    const result = parseOutput((await runCli(args)).stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((p: any) => p.project)).toEqual([relatedWorktreeDirName]);
+    expect(result._meta.projects_scanned).toBe(1);
+    expect(result._meta.projects_skipped).toBe(2);
+    expect(result._meta).not.toHaveProperty('included_projects');
+    expect(result._meta).not.toHaveProperty('skipped_projects');
+
+    const withLists = parseOutput((await runCli([...args, '--include-project-lists'])).stdout);
+    expect(withLists._meta.projects_scanned).toBe(1);
+    expect(withLists._meta.projects_skipped).toBe(2);
+    expect(withLists._meta.included_projects.map((p: any) => p.project)).toEqual([relatedWorktreeDirName]);
+    expect(withLists._meta.skipped_projects).toEqual([
+      { project: relatedDirName, project_path_guess: RELATED_PROJECT, project_role: 'main' },
+      {
+        project: relatedSiblingWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedSiblingWorktreeDirName),
+        project_role: 'worktree',
+      },
+    ]);
+  });
+});
+
+describe('--include-project-lists across project-selecting leaves (integration)', () => {
+  // Each row is one project-selecting leaf run against the RELATED_PROJECT fixture (main + 2 worktrees).
+  const PROJECT_LIST_LEAVES: { name: string; args: string[]; usesDb?: boolean }[] = [
+    { name: 'list', args: ['list', '--project', RELATED_PROJECT] },
+    { name: 'projects', args: ['projects', '--project', RELATED_PROJECT] },
+    { name: 'search', args: ['search', '--tool', 'Bash', '--project', RELATED_PROJECT] },
+    { name: 'index status', args: ['index', 'status', '--project', RELATED_PROJECT], usesDb: true },
+    { name: 'index rebuild', args: ['index', 'rebuild', '--project', RELATED_PROJECT], usesDb: true },
+    { name: 'stats tokens', args: ['stats', 'tokens', '--project', RELATED_PROJECT], usesDb: true },
+    { name: 'stats trajectories', args: ['stats', 'trajectories', '--project', RELATED_PROJECT], usesDb: true },
+  ];
+
+  for (const leaf of PROJECT_LIST_LEAVES) {
+    test(`'${leaf.name}' defaults to counts and adds arrays with --include-project-lists`, async () => {
+      const tempDir = join(tmpdir(), uniqueTempName('cc-session-project-lists'));
+      mkdirSync(tempDir, { recursive: true });
+      try {
+        const dbArgs = leaf.usesDb ? ['--db', join(tempDir, 'index.db')] : [];
+
+        const def = await runCli([...leaf.args, ...dbArgs]);
+        expect(def.exitCode).toBe(0);
+        const defResult = parseOutput(def.stdout);
+        expect(defResult.ok).toBe(true);
+        expect(defResult._meta.projects_scanned).toBe(3);
+        expect(defResult._meta.projects_skipped).toBe(0);
+        expect(defResult._meta).not.toHaveProperty('included_projects');
+        expect(defResult._meta).not.toHaveProperty('skipped_projects');
+
+        const opt = await runCli([...leaf.args, '--include-project-lists', ...dbArgs]);
+        expect(opt.exitCode).toBe(0);
+        const optResult = parseOutput(opt.stdout);
+        expect(optResult.ok).toBe(true);
+        expect(optResult._meta.included_projects).toHaveLength(optResult._meta.projects_scanned);
+        expect(optResult._meta.skipped_projects).toHaveLength(optResult._meta.projects_skipped);
+        expect(optResult._meta.projects_scanned).toBe(3);
+        expect(optResult._meta.skipped_projects).toEqual([]);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe('help contract integration', () => {
@@ -3623,6 +3734,60 @@ describe('project-selection module foundation', () => {
     } finally {
       rmSync(join(tmpdir(), unique), { recursive: true, force: true });
     }
+  });
+
+  const globSelection = () => selectProjectContexts({
+    mode: 'all-projects',
+    claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT,
+    projectGlob: `*${fakeDirName}`,
+  });
+
+  test('buildProjectScanMeta returns only the two counts by default', () => {
+    const selection = globSelection();
+    expect(selection.skippedProjects.length).toBeGreaterThan(0);
+    const scanMeta = buildProjectScanMeta(selection, { includeLists: false });
+    expect(scanMeta).toEqual({
+      projects_scanned: selection.contexts.length,
+      projects_skipped: selection.skippedProjects.length,
+    });
+    expect(scanMeta).not.toHaveProperty('included_projects');
+    expect(scanMeta).not.toHaveProperty('skipped_projects');
+  });
+
+  test('buildProjectScanMeta with includeLists passes the selection arrays through', () => {
+    const selection = globSelection();
+    const scanMeta = buildProjectScanMeta(selection, { includeLists: true });
+    expect(scanMeta.projects_scanned).toBe(selection.contexts.length);
+    expect(scanMeta.projects_skipped).toBe(selection.skippedProjects.length);
+    expect(scanMeta.included_projects).toEqual(selection.includedProjects);
+    expect(scanMeta.skipped_projects).toEqual(selection.skippedProjects);
+  });
+
+  test('selectProjectContexts scoped mode honors projectGlob and reports glob-excluded contexts as skipped', () => {
+    const selection = selectProjectContexts({
+      mode: 'scoped-with-worktrees',
+      projectPath: RELATED_PROJECT,
+      projectGlob: relatedWorktreeDirName,
+      claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT,
+    });
+    expect(selection.contexts.map(context => context.projectRef.project)).toEqual([relatedWorktreeDirName]);
+    expect(selection.includedProjects.map(ref => [ref.project, ref.project_role])).toEqual([
+      [relatedWorktreeDirName, 'worktree'],
+    ]);
+    expect(selection.skippedProjects.map(ref => [ref.project, ref.project_role])).toEqual([
+      [relatedDirName, 'main'],
+      [relatedSiblingWorktreeDirName, 'worktree'],
+    ]);
+  });
+
+  test('selectProjectContexts scoped mode without projectGlob skips nothing', () => {
+    const selection = selectProjectContexts({
+      mode: 'scoped-with-worktrees',
+      projectPath: RELATED_PROJECT,
+      claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT,
+    });
+    expect(selection.contexts).toHaveLength(3);
+    expect(selection.skippedProjects).toEqual([]);
   });
 });
 
@@ -4342,12 +4507,52 @@ describe('search integration', () => {
     expect(result._meta.projects_scanned).toBeGreaterThanOrEqual(2);
   });
 
-  test('search --all-projects --project-glob filters selected and skipped projects', async () => {
-    const { exitCode, stdout } = await runCli(['search', '--all-projects', '--project-glob', '*fake-project-worktree', '--file', CROSS_PROJECT_FILE]);
+  test('search --all-projects defaults to project counts without arrays', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--all-projects', '--file', CROSS_PROJECT_FILE]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBeGreaterThanOrEqual(2);
+    expect(result._meta.projects_skipped).toBe(0);
+    expect(result._meta).not.toHaveProperty('included_projects');
+    expect(result._meta).not.toHaveProperty('skipped_projects');
+  });
+
+  test('search --all-projects --include-project-lists adds both arrays', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--all-projects', '--file', CROSS_PROJECT_FILE, '--include-project-lists']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.included_projects).toHaveLength(result._meta.projects_scanned);
+    expect(result._meta.skipped_projects).toEqual([]);
+  });
+
+  test('search --aggregate counters --bucket keeps project counts and omits arrays by default', async () => {
+    const { exitCode, stdout } = await runCli([
+      'search',
+      '--tool', 'Read',
+      '--counter', 'missing=no-such-counter-marker',
+      '--aggregate', 'counters',
+      '--bucket', 'day',
+      '--project', FAKE_PROJECT,
+    ]);
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result._meta.projects_scanned).toBe(1);
+    expect(result._meta.projects_skipped).toBe(0);
+    expect(result._meta).not.toHaveProperty('included_projects');
+    expect(result._meta).not.toHaveProperty('skipped_projects');
+    expect(result._meta.total).toBe(result.data.length);
+  });
+
+  test('search --all-projects --project-glob filters selected and skipped projects', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--all-projects', '--project-glob', '*fake-project-worktree', '--file', CROSS_PROJECT_FILE, '--include-project-lists']);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.projects_scanned).toBe(1);
+    expect(result._meta.projects_skipped).toBe(result._meta.skipped_projects.length);
     expect(result._meta.included_projects).toEqual([{
       project: secondFakeDirName,
       project_path_guess: projectPathGuessFromClaudeProject(secondFakeDirName),
@@ -4418,11 +4623,14 @@ describe('search integration', () => {
   });
 
   test('scoped --file includes related worktree project metadata', async () => {
-    const { exitCode, stdout } = await runCli(['search', '--file', RELATED_PROJECT_FILE, '--project', RELATED_PROJECT]);
+    const { exitCode, stdout } = await runCli(['search', '--file', RELATED_PROJECT_FILE, '--project', RELATED_PROJECT, '--include-project-lists']);
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result.data.find((s: any) => s.session_id === SESSION_ID_7)).toBeDefined();
+    expect(result._meta.projects_scanned).toBe(3);
+    expect(result._meta.projects_skipped).toBe(0);
+    expect(result._meta.skipped_projects).toEqual([]);
     expect(result._meta.included_projects).toEqual([
       {
         project: relatedDirName,
@@ -6843,6 +7051,22 @@ describe('real command tree (resolver + parser)', () => {
     expect(enumerateLeafPaths(cliMain).sort()).toEqual(Object.keys(LEAF_REQUIRED_ARGS).sort());
     expect(Object.keys(LEAF_REQUIRED_ARGS)).toHaveLength(15);
   });
+
+  // Leaves that select projects and therefore accept --include-project-lists; grows as each leaf is wired.
+  const PROJECT_LIST_LEAF_PATHS = new Set(['list', 'projects', 'search', 'index status', 'index rebuild', 'stats tokens', 'stats trajectories']);
+
+  for (const [leafPath, required] of Object.entries(LEAF_REQUIRED_ARGS)) {
+    const accepts = PROJECT_LIST_LEAF_PATHS.has(leafPath);
+    test(`'${leafPath}' ${accepts ? 'accepts' : 'rejects'} --include-project-lists`, async () => {
+      const resolved = await resolveCliCommand(cliMain, [...leafPath.split(' '), ...required, '--include-project-lists']);
+      const parse = () => parseCommandArgs(resolved.rawArgs, resolved.argsDef, leafPath);
+      if (accepts) {
+        expect(parse).not.toThrow();
+      } else {
+        expect(parse).toThrow(CliArgsError);
+      }
+    });
+  }
 
   for (const [leafPath, required] of Object.entries(LEAF_REQUIRED_ARGS)) {
     test(`resolves and parses '${leafPath}'`, async () => {

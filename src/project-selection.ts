@@ -107,6 +107,36 @@ export type ProjectSelection = {
   skippedProjects: PublicProjectRef[];
 };
 
+/**
+ * Project coverage fields that every project-selecting command adds to `_meta`.
+ * The arrays grow with the number of Claude project directories, so they are
+ * present only when the caller passes --include-project-lists.
+ */
+export type ProjectScanMeta = {
+  /** Claude project directories selected for the scan; directories that later fail to read are still counted. */
+  projects_scanned: number;
+  /** Candidate directories excluded by a project glob; 0 when no glob applied. */
+  projects_skipped: number;
+  included_projects?: PublicProjectRef[];
+  skipped_projects?: PublicProjectRef[];
+};
+
+export type ProjectScanMetaOptions = {
+  includeLists: boolean;
+};
+
+export function buildProjectScanMeta(selection: ProjectSelection, options: ProjectScanMetaOptions): ProjectScanMeta {
+  const scanMeta: ProjectScanMeta = {
+    projects_scanned: selection.contexts.length,
+    projects_skipped: selection.skippedProjects.length,
+  };
+  if (options.includeLists) {
+    scanMeta.included_projects = selection.includedProjects;
+    scanMeta.skipped_projects = selection.skippedProjects;
+  }
+  return scanMeta;
+}
+
 export type SessionProjectSelector =
   | { kind: 'projectPath'; projectPath: string }
   | { kind: 'claudeProject'; project: string };
@@ -520,33 +550,37 @@ export function projectMatchesGlob(ref: ProjectRef, glob: string): boolean {
   return projectMatchesPattern(ref, globToRegExp(glob));
 }
 
+function partitionByProjectGlob(candidates: SearchProjectContext[], glob: string | undefined): ProjectSelection {
+  const regex = glob ? globToRegExp(glob) : null;
+  const included: SearchProjectContext[] = [];
+  const skipped: SearchProjectContext[] = [];
+  for (const context of candidates) {
+    if (regex && !projectMatchesPattern(context.projectRef, regex)) {
+      skipped.push(context);
+    } else {
+      included.push(context);
+    }
+  }
+  return {
+    contexts: included,
+    includedProjects: included.map(publicProjectRef),
+    skippedProjects: skipped.map(publicProjectRef),
+  };
+}
+
 export function selectProjectContexts(options: ProjectSelectionOptions): ProjectSelection {
   const root = options.claudeProjectsRoot ?? claudeProjectsRoot();
 
   if (options.mode === 'all-projects') {
-    const included: SearchProjectContext[] = [];
-    const skipped: SearchProjectContext[] = [];
-    const projectGlobRegex = options.projectGlob ? globToRegExp(options.projectGlob) : null;
     const queryAnchorRoot = options.projectPath ?? null;
-    for (const projectRef of listClaudeProjectRefs(root)) {
-      const context: SearchProjectContext = {
-        role: 'global',
-        projectRoot: null,
-        worktreeRoot: null,
-        queryAnchorRoot,
-        projectRef,
-      };
-      if (projectGlobRegex && !projectMatchesPattern(projectRef, projectGlobRegex)) {
-        skipped.push(context);
-      } else {
-        included.push(context);
-      }
-    }
-    return {
-      contexts: included,
-      includedProjects: included.map(publicProjectRef),
-      skippedProjects: skipped.map(publicProjectRef),
-    };
+    const candidates: SearchProjectContext[] = listClaudeProjectRefs(root).map((projectRef) => ({
+      role: 'global',
+      projectRoot: null,
+      worktreeRoot: null,
+      queryAnchorRoot,
+      projectRef,
+    }));
+    return partitionByProjectGlob(candidates, options.projectGlob);
   }
 
   const projectPath = options.projectPath || process.cwd();
@@ -555,11 +589,7 @@ export function selectProjectContexts(options: ProjectSelectionOptions): Project
     claudeProjectsRoot: root,
     includeWorktrees: options.mode === 'scoped-with-worktrees',
   });
-  return {
-    contexts: scope.projects,
-    includedProjects: scope.projects.map(publicProjectRef),
-    skippedProjects: [],
-  };
+  return partitionByProjectGlob(scope.projects, options.projectGlob);
 }
 
 export function resolveClaudeProjectDir(projectPath: string, root = claudeProjectsRoot()): string {
