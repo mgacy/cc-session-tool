@@ -1,0 +1,2 @@
+- [Scratchpad fixtures truncate](reference_plan_review_simulation.md) — scratchpad paths exceed 200 sanitized chars; derive fixture project names with the encoder
+- [Claude Code encoder parity](reference_claude_code_encoder_parity.md) — find the ground-truth project-dir encoder in the native binary via grep -F plus dd, not a context regex

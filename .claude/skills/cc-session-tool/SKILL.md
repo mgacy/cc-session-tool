@@ -64,6 +64,8 @@ cc-session-tool shape DA2738E3:a8361bc            # inspect one
 
 By default, `list` and `search` are scoped to the **logical project** of the current working directory and _also_ include that project's Claude-managed worktree transcript directories. This is intentional: from the main checkout, a search can find work done in a worktree without `--all-projects`.
 
+From a Claude-managed worktree checkout (`<repo>/.claude/worktrees/<name>`, as CWD or `--project`), scoped `list`/`search`/`stats`/`index status` (and `projects --project <worktree>`) cover only that worktree and any worktrees nested under it, not the main checkout or siblings. Absolute `--file` paths are then anchored to the worktree, so a main-tree path will not find writes made there. For the whole logical project, pass `--project <repo root>` with a main-tree absolute or relative `--file` path.
+
 For follow-up commands, use the stable `project` field (or `session_ref.project`) returned in search/list rows as `--claude-project`. **Never** use `project_path_guess` — it is display-only and lossy.
 
 ```bash

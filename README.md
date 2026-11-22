@@ -39,6 +39,8 @@ Use `--claude-project` for stable follow-up from cross-project or worktree searc
 cc-session-tool shape DA2738E3 --claude-project -workspace-app
 ```
 
+**Worktree checkouts:** From a Claude-managed worktree checkout (`<repo>/.claude/worktrees/<name>`, as CWD or `--project`), scoped `list`/`search`/`stats`/`index status` (and `projects --project <worktree>`) cover only that worktree and any worktrees nested under it, not the main checkout or siblings. Absolute `search --file` paths are then anchored to the worktree, so a main-tree path will not find writes made there. For the whole logical project, pass `--project <repo root>` with a main-tree absolute or relative `--file` path.
+
 **Subagent targeting:** Append `:<agent-id>` to a session identifier in any session-scoped command (except `subagents`) to target a subagent session (e.g., `DA2738E3:a8361bc` or `snuggly-floating-barto:a8361bc`). The parent session is resolved normally, then the subagent file is located at `<session-dir>/subagents/agent-<agent-id>.jsonl`. Use the `subagents` command to discover available agent IDs.
 
 **Input validation:** Session IDs accept `[a-zA-Z0-9-]` characters; agent IDs also allow underscores `[a-zA-Z0-9_-]`. All other inputs are rejected with exit code 2.
@@ -584,7 +586,7 @@ Scoped responses include `_meta.included_projects`, showing the main project and
 | Field | Description |
 | ----- | ----------- |
 | `project` | Raw Claude project directory basename from `~/.claude/projects`. |
-| `project_path_guess` | Best-effort unmangled path guess, or `null` when the directory name is not in Claude's path-mangled form. This is display-only and lossy when path segments contain literal hyphens. |
+| `project_path_guess` | Best-effort unmangled path guess, or `null` when the directory name is not in Claude's path-mangled form. Display-only and lossy: Claude Code encodes every non-alphanumeric path character as `-` and hash-truncates names over 200 chars. |
 | `project_role` | `main`, `worktree`, or `global`. |
 | `session_ref` | Stable follow-up identity: `{ "session_id": "...", "project": "<raw Claude project basename>" }`. |
 

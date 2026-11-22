@@ -74,6 +74,7 @@ Sessions are resolved in order within the selected Claude project directory: exa
 3. Errors are thrown via `cliError(code, msg)` and caught at the command handler level
 4. Content truncation uses `"...[truncated, N chars]"` suffix
 5. `project_path_guess` is display metadata only; raw `project` / `session_ref.project` is the stable Claude project identity for follow-up commands.
+6. `mangleProjectPath` must mirror Claude Code's project-dir encoder exactly (NFC; every non-`[A-Za-z0-9]` UTF-16 code unit becomes `-`; names over 200 chars are truncated with a hash suffix), and worktree discovery derives its prefix from the same sanitizer. Encoding-sensitive tests must write the encoding-sensitive part of expected basenames (e.g. `--claude-worktrees-`) as literals, because encoder-derived fixtures agree with any encoder.
 
 ### Testing
 
