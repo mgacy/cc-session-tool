@@ -2683,8 +2683,9 @@ const searchCommand = defineCommand({
           explicitSelector,
           perSubagent: Boolean(args['per-subagent']),
         });
-        responseData = bucketMode === 'none' ? counterRows : bucketCounterRows(counterRows, bucketMode);
-        baseMeta = meta(Array.isArray(responseData) ? responseData.length : 0, Array.isArray(responseData) ? responseData.length : 0);
+        const counterTable = bucketMode === 'none' ? counterRows : bucketCounterRows(counterRows, bucketMode);
+        responseData = counterTable;
+        baseMeta = meta(counterTable.length, counterTable.length);
       }
       const responseMeta: SearchMeta = {
         ...baseMeta,
