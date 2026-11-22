@@ -6,6 +6,7 @@ import type {
   SearchProjectRole,
 } from './project-selection.ts';
 import type { SessionMetadata } from './transcript.ts';
+import { extractContentText, isFailedResult, type ToolResultInfo } from './tool-log.ts';
 
 export const SEARCH_EVIDENCE_SNIPPET_CHARS = 200;
 export const SUMMARY_SNIPPET_CHARS = 400;
@@ -30,6 +31,7 @@ export type IntentMatchSource = 'slug' | 'first_prompt' | 'first_message';
 export type SearchEvidenceKind =
   | 'file'
   | 'tool_input'
+  | 'tool_output'
   | 'text'
   | 'thinking'
   | 'bash'
@@ -53,6 +55,15 @@ export type SearchEvidence = {
   tool?: string;
   input_summary?: string;
   intent_source?: IntentMatchSource;
+
+  /** tool_output only: id joining the tool_use to its tool_result (printed by `messages`). */
+  tool_use_id?: string;
+  /** tool_output only: user turn holding the matching tool_result block. */
+  result_turn?: number;
+  /** tool_output only: timestamp of the user entry holding the tool_result. */
+  result_timestamp?: string | null;
+  /** tool_output only: the tool_result's is_error flag. */
+  is_error?: boolean;
 };
 
 export type SearchMatch = {
@@ -289,13 +300,38 @@ export function evidenceTimestamps(match: SearchMatch, kind?: SearchEvidenceKind
     .sort();
 }
 
-export type CallSelectors = { toolInput: boolean; bash: boolean };
+export type ResultSelectors = { outputMatcher: TextMatcher | null; failed: boolean };
+
+/**
+ * Cheapest check first: missing result -> --failed -> text extraction -> output matcher.
+ * Text is extracted only for results that survive --failed.
+ */
+export function evaluateResultSelectors(
+  result: ToolResultInfo | undefined,
+  selectors: ResultSelectors,
+): { matched: false } | { matched: true; snippet: string | undefined } {
+  if (!result) return { matched: false };
+  if (selectors.failed && !isFailedResult(result)) return { matched: false };
+
+  const text = extractContentText(result.content);
+  let snippet: string;
+  if (selectors.outputMatcher) {
+    if (!testTextMatcher(selectors.outputMatcher, text)) return { matched: false };
+    snippet = snippetForMatch(text, selectors.outputMatcher, SEARCH_EVIDENCE_SNIPPET_CHARS);
+  } else {
+    snippet = text.slice(0, SEARCH_EVIDENCE_SNIPPET_CHARS);
+  }
+  return { matched: true, snippet: snippet === '' ? undefined : snippet };
+}
+
+export type CallSelectors = { toolInput: boolean; bash: boolean; toolOutput?: boolean };
 
 /** One evidence item per tool call that satisfies every selected call-level selector. */
 export function matchedToolCalls(evidence: SearchEvidence[], selectors: CallSelectors): SearchEvidence[] {
   const required: SearchEvidenceKind[] = [];
   if (selectors.toolInput) required.push('tool_input');
   if (selectors.bash) required.push('bash');
+  if (selectors.toolOutput) required.push('tool_output');
 
   const byCall = new Map<string, Map<SearchEvidenceKind, SearchEvidence>>();
   for (const item of evidence) {
@@ -313,7 +349,7 @@ export function matchedToolCalls(evidence: SearchEvidence[], selectors: CallSele
 
 export function toolInputSamplesFromEvidence(evidence: SearchEvidence[], limit = 5): ToolInputMatch[] {
   return evidence
-    .filter(e => (e.kind === 'tool_input' || e.kind === 'bash') && e.tool)
+    .filter(e => (e.kind === 'tool_input' || e.kind === 'bash' || e.kind === 'tool_output') && e.tool)
     .slice(0, limit)
     .map(e => ({
       tool: e.tool!,

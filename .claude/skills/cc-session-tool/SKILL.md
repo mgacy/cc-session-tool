@@ -37,7 +37,7 @@ Two-phase pattern that minimizes token usage:
 1. **Triage** — narrow to one session with `list`, `search`, or a session ID the user provided.
 2. **Drill** — start with `summary` for a one-shot overview. If you need more, use `shape` for the table of contents, then `tools` / `files` / `messages` / `slice` for specifics.
 
-Avoid `slice` without a `--turn` range narrower than ~5 turns — it returns raw content, which is expensive. Use `messages` (truncated by default, except for a single `--turn N`) or `shape` first to locate the turns you care about.
+Avoid `slice` without a `--turn` range narrower than ~5 turns — it returns raw content, which is expensive. Use `messages` (truncated by default; a single `--turn N` lifts this for text and thinking, but tool results stay truncated unless you pass `--max-tool-result`) or `shape` first to locate the turns you care about.
 
 ## Key concepts
 
@@ -172,6 +172,7 @@ cc-session-tool search --tool Bash \
 
 ## Pitfalls to avoid
 
+- **`--text` does not search tool output.** An empty `--text` result does not mean an error or refusal never happened; search tool results with `--output-match` / `--output-regex` or `--failed`.
 - **Don't read JSONL files directly.** Transcripts are huge; always go through the CLI.
 - **Don't rely on `project_path_guess`** for follow-up commands. Use `project` / `session_ref.project` with `--claude-project`.
 - **Don't pass `--operation` without `--file`** — the filter only binds when there's a matching file access to bind to.
@@ -185,4 +186,4 @@ cc-session-tool search --tool Bash \
 Use these reference files when the above isn't enough. Read only the one you need.
 
 - `references/commands.md` — full per-command flag list and output schemas, condensed from the README.
-- `references/search.md` — search command deep dive: scoping semantics, file-identity matching across worktrees, aggregation modes, output fields.
+- `references/search.md` — search command deep dive: scoping semantics, file-identity matching across worktrees, tool-output and failure matching, aggregation modes, output fields.

@@ -480,7 +480,7 @@ cc-session-tool slice <session> --turn <N|N-M> [--project <path> | --claude-proj
 Find sessions matching structured filters. By default, search is scoped to the logical project derived from `--project <path>` or the current working directory, and it also includes associated Claude-managed worktree transcript directories. This agent-first default means a query from the main checkout can find work performed from a Claude worktree without `--all-projects`.
 
 ```bash
-cc-session-tool search [--project <path>] [--all-projects] [--project-glob <pattern>] [--tool <name>] [--input-match <text>|--input-regex <regex>] [--file <path>] [--text <text>|--text-regex <regex>] [--intent-match <text>|--intent-regex <regex>] [--bash <text>|--bash-regex <regex>] [--no-subagents] [--operation <op>] [--origin] [--sort <mode>] [--aggregate count-per-session|counters] [--counter NAME=text] [--counter-regex NAME=regex] [--bucket day|week] [--per-subagent] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>]
+cc-session-tool search [--project <path>] [--all-projects] [--project-glob <pattern>] [--tool <name>] [--input-match <text>|--input-regex <regex>] [--output-match <text>|--output-regex <regex>] [--failed] [--file <path>] [--text <text>|--text-regex <regex>] [--intent-match <text>|--intent-regex <regex>] [--bash <text>|--bash-regex <regex>] [--no-subagents] [--operation <op>] [--origin] [--sort <mode>] [--aggregate count-per-session|counters] [--counter NAME=text] [--counter-regex NAME=regex] [--bucket day|week] [--per-subagent] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>]
 ```
 
 | Option           | Default | Description |
@@ -491,16 +491,19 @@ cc-session-tool search [--project <path>] [--all-projects] [--project-glob <patt
 | `--tool`         | —       | Match tool names by case-insensitive substring. |
 | `--input-match`  | —       | Match raw structured tool input by case-insensitive substring, including fields omitted or truncated by `input_summary`. |
 | `--input-regex`  | —       | Match raw structured tool input by regex. Mutually exclusive with `--input-match`. |
+| `--output-match` | —       | Match tool result text by case-insensitive substring. Binds to the same tool call as the other tool-call selectors (see below). |
+| `--output-regex` | —       | Match tool result text by case-sensitive regex. Mutually exclusive with `--output-match`. |
+| `--failed`       | false   | Match failed tool calls (`is_error` or an empty result, as `tools --failed`). Binds like `--output-match`. |
 | `--file`         | —       | Match touched file paths by substring. |
 | `--operation`    | all     | With `--file`, filter by matching file operation: `read`, `edit`, `write`, `grep`, `glob`. |
 | `--origin`       | false   | With `--file`, return earliest matching transcript write evidence. Implies `--operation write` and defaults to one result. |
-| `--sort`         | `session-newest` | Sort matches by `session-newest`, `match-earliest`, `match-newest`, or `project`. |
+| `--sort`         | `session-newest` | Sort matches by `session-newest`, `match-earliest`, `match-newest`, or `project`. `match-*` order by the time of the matching evidence. |
 | `--aggregate`    | `none`  | `count-per-session` returns per-session tool-input counts; `counters` returns named raw-input counters. |
 | `--counter` / `--counter-regex` | — | Named raw-input counter as `NAME=pattern`; repeatable; requires `--aggregate counters`. |
 | `--bucket`       | `none`  | With `--aggregate counters`, bucket by `day` or `week`. Missing timestamps use `unknown`. |
 | `--per-subagent` | false   | With counter aggregation, emit transcript-level rows instead of parent session rollups. |
-| `--text`         | —       | Match user/assistant text and thinking by case-insensitive substring. |
-| `--text-regex`   | —       | Match user/assistant text and thinking by regex. |
+| `--text`         | —       | Match user/assistant text and thinking by case-insensitive substring. Does **not** search tool output; use `--output-match`. |
+| `--text-regex`   | —       | Match user/assistant text and thinking by regex. Does **not** search tool output; use `--output-regex`. |
 | `--intent-match` | —       | Match session intent sources (`slug`, first prompt token, first user message) by substring. |
 | `--intent-regex` | —       | Match session intent sources by regex. |
 | `--bash`         | —       | Match Bash command inputs by case-insensitive substring. |
@@ -512,7 +515,15 @@ cc-session-tool search [--project <path>] [--all-projects] [--project-glob <patt
 | `--since`        | —       | Sessions from the last duration: `30m`, `2h`, `1d`, `1w` (mutually exclusive with `--after`). |
 | `--last`         | all     | Return only the N matches after sorting. With `--origin`, defaults to 1 unless set. |
 
-At least one selector is required: `--tool`, raw-input, file, text, intent, bash, or counter filter. You may provide more than one; multiple filters use AND semantics. `--operation` is valid only with `--file`, and it is tied to the same matching file access, not any other file access in the session.
+At least one selector is required: `--tool`, raw-input, output (`--output-match` / `--output-regex`), `--failed`, file, text, intent, bash, or counter filter. You may provide more than one; multiple filters use AND semantics. `--operation` is valid only with `--file`, and it is tied to the same matching file access, not any other file access in the session.
+
+**Tool output and failures.** With `--output-match`, `--output-regex` or `--failed`, the tool-call selectors (`--tool`, `--input-*`, `--bash*`, `--file`, `--operation`) must match the same call whose result matches, and evidence lists only those calls; `--tool Bash --output-match X` ignores a `Read` that returned `X`. `--text*`, `--intent-*`, `--branch` and date filters still apply session-wide. `count-per-session` then counts the matched calls. Matching covers the text `messages --type tool_result` shows; outputs persisted to disk match only on their 2 KB preview, and API errors are not tool results. `--failed` alone matches about half of all sessions, so pair it with another selector.
+
+Each matched call yields `tool_output` evidence (example below). Its `turn` is the call's turn, as in `tools`; the result is at `result_turn`. Read it in full with:
+
+```bash
+cc-session-tool messages <session>[:<agent_id>] --claude-project <session_ref.project> --turn <result_turn> --type tool_result --max-tool-result 4000
+```
 
 For absolute `--file` queries inside the logical project, search compares exact canonical path candidates first, then exact project-relative logical identity. For example, `/workspace/app/src/auth.ts` in the main checkout matches `/workspace/app/.claude/worktrees/feature-a/src/auth.ts` from a related Claude worktree as the same logical file `src/auth.ts`. If a worktree path reaches the same file through a symlinked directory, the realpath candidate can also match even when the lexical absolute paths differ. If both sides normalize to logical paths and they differ, search does not fall back to substring matching.
 
@@ -536,6 +547,12 @@ cc-session-tool search --all-projects --project /workspace/app --file /workspace
 
 # Audit raw Bash inputs, including long commands beyond the condensed summary
 cc-session-tool search --tool Bash --input-match "bun test" --aggregate count-per-session
+
+# Which sessions saw a Bash error, earliest first
+cc-session-tool search --all-projects --tool Bash --output-match "permission denied" --sort match-earliest
+
+# Sessions where a `bun test` Bash call failed
+cc-session-tool search --bash "bun test" --failed
 ```
 
 **Output:**
@@ -570,6 +587,24 @@ cc-session-tool search --tool Bash --input-match "bun test" --aggregate count-pe
     }
   ],
   "_meta": { "total": 1, "returned": 1, "hasMore": false }
+}
+```
+
+A `tool_output` evidence item:
+
+```json
+{
+  "kind": "tool_output",
+  "turn": 12,
+  "block_index": 1,
+  "timestamp": "2026-03-07T22:40:02.000Z",
+  "tool": "Bash",
+  "input_summary": "bun test",
+  "tool_use_id": "toolu_01ABC...",
+  "result_turn": 13,
+  "result_timestamp": "2026-03-07T22:40:09.000Z",
+  "is_error": true,
+  "snippet": "...FAIL index.test.ts ..."
 }
 ```
 

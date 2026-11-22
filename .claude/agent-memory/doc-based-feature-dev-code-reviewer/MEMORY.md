@@ -1,3 +1,4 @@
 - [Scratchpad fixtures truncate](reference_plan_review_simulation.md) — scratchpad paths exceed 200 sanitized chars; derive fixture project names with the encoder
 - [Claude Code encoder parity](reference_claude_code_encoder_parity.md) — find the ground-truth project-dir encoder in the native binary via grep -F plus dd, not a context regex
 - [Pre-existing pipe truncation](project_preexisting_pipe_truncation.md) — large JSON via pipe truncates at ~64KB (issue #21); redirect to a file, don't blame the diff
+- [Review verification techniques](project_review_verification_techniques.md) — piped CLI JSON cut at ~128 KB (redirect to a file); scoped searches include the live session

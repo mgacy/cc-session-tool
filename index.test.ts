@@ -18,8 +18,13 @@ import {
   normalizeFileQuery, matchFileAccess, projectMatchesGlob, selectProjectContexts,
   stableJsonStringify, toolInputMatches, deriveWorktreeRootFromPath,
   extractWorktreeStatePaths, collectObservedWorktreeRoots, absolutePathCandidatesFor,
-  scanSearchTarget, main as cliMain, VERSION,
+  scanSearchTarget, extractContentText, sortSearchMatches, main as cliMain, VERSION,
 } from './index.ts';
+import {
+  buildToolResultLocations,
+  isFailedOutcome,
+  isFailedResult,
+} from './src/tool-log.ts';
 import {
   applyTruncationPolicy,
   buildSessionSummary,
@@ -55,12 +60,16 @@ import {
   aggregateCounterRows,
   attachCounterTranscriptResults,
   bucketCounterRows,
+  evaluateResultSelectors,
   evidenceTimestamps,
+  matchedToolCalls,
   parseCounterArgs,
   parseRegexMatcher,
   parseSubstringMatcher,
   snippetForMatch,
   testTextMatcher,
+  toolInputSamplesFromEvidence,
+  type SearchEvidence,
   type SearchMatch,
   type SearchMeta,
 } from './src/search.ts';
@@ -157,6 +166,57 @@ describe('search matcher primitives', () => {
       '2026-03-03T00:00:00.000Z',
     ]);
     expect(evidenceTimestamps(match, 'file')).toEqual(['2026-03-02T00:00:00.000Z']);
+  });
+
+  describe('sortSearchMatches match-* ordering', () => {
+    const mk = (id: string, timestamp: string | null, evidence: SearchEvidence[]): SearchMatch => ({
+      session_id: id,
+      branch: null,
+      timestamp,
+      slug: null,
+      model: null,
+      session_ref: { session_id: id, project: '-tmp-project' },
+      matches: { tools: [], files: [], turns: [], evidence },
+    });
+    const ev = (kind: SearchEvidence['kind'], timestamp: string | null): SearchEvidence => ({ kind, turn: 1, block_index: 0, timestamp });
+    const order = (matches: SearchMatch[], mode: 'match-earliest' | 'match-newest') => sortSearchMatches([...matches], mode).map(m => m.session_id);
+
+    test('file evidence wins over other evidence when present', () => {
+      const a = mk('a', '2026-01-01T00:00:00.000Z', [ev('file', '2026-03-05T00:00:00.000Z'), ev('tool_output', '2026-01-01T00:00:00.000Z')]);
+      const b = mk('b', '2026-02-01T00:00:00.000Z', [ev('file', '2026-03-01T00:00:00.000Z'), ev('tool_output', '2026-04-01T00:00:00.000Z')]);
+      expect(order([a, b], 'match-earliest')).toEqual(['b', 'a']);
+      expect(order([a, b], 'match-newest')).toEqual(['a', 'b']);
+    });
+
+    test('without file evidence, earliest/newest is taken over non-intent evidence', () => {
+      const a = mk('a', '2026-01-01T00:00:00.000Z', [ev('text', '2026-05-02T00:00:00.000Z'), ev('tool_output', '2026-05-04T00:00:00.000Z')]);
+      const b = mk('b', '2026-06-01T00:00:00.000Z', [ev('bash', '2026-05-03T00:00:00.000Z')]);
+      // earliest: a=05-02, b=05-03; newest: a=05-04, b=05-03
+      expect(order([b, a], 'match-earliest')).toEqual(['a', 'b']);
+      expect(order([b, a], 'match-newest')).toEqual(['a', 'b']);
+      const c = mk('c', '2026-01-01T00:00:00.000Z', [ev('tool_input', '2026-05-10T00:00:00.000Z')]);
+      expect(order([a, c], 'match-newest')).toEqual(['c', 'a']);
+    });
+
+    test('intent-only evidence falls back to the session start', () => {
+      const a = mk('a', '2026-03-01T00:00:00.000Z', [ev('intent', '2026-03-01T00:00:00.000Z')]);
+      const b = mk('b', '2026-02-01T00:00:00.000Z', [ev('intent', '2026-02-01T00:00:00.000Z')]);
+      expect(order([a, b], 'match-earliest')).toEqual(['b', 'a']);
+      expect(order([a, b], 'match-newest')).toEqual(['a', 'b']);
+    });
+
+    test('intent evidence is ignored when other evidence exists', () => {
+      const a = mk('a', '2026-01-01T00:00:00.000Z', [ev('intent', '2026-01-01T00:00:00.000Z'), ev('text', '2026-06-01T00:00:00.000Z')]);
+      const b = mk('b', '2026-03-01T00:00:00.000Z', [ev('text', '2026-04-01T00:00:00.000Z')]);
+      expect(order([a, b], 'match-earliest')).toEqual(['b', 'a']);
+    });
+
+    test('file evidence with null timestamps falls back to the session start', () => {
+      const a = mk('a', '2026-03-01T00:00:00.000Z', [ev('file', null), ev('text', '2026-01-01T00:00:00.000Z')]);
+      const b = mk('b', '2026-02-01T00:00:00.000Z', [ev('file', null)]);
+      expect(order([a, b], 'match-earliest')).toEqual(['b', 'a']);
+      expect(order([a, b], 'match-newest')).toEqual(['a', 'b']);
+    });
   });
 
   test('SearchMeta contains only active search metadata fields', () => {
@@ -486,9 +546,257 @@ describe('determineOutcome', () => {
   });
 });
 
+describe('isFailedOutcome', () => {
+  test('error and empty outcomes are failures', () => {
+    expect(isFailedOutcome('error: boom')).toBe(true);
+    expect(isFailedOutcome('error: ')).toBe(true);
+    expect(isFailedOutcome('empty')).toBe(true);
+  });
+
+  test('success and no_result are not failures', () => {
+    expect(isFailedOutcome('success')).toBe(false);
+    expect(isFailedOutcome('success (3 lines)')).toBe(false);
+    expect(isFailedOutcome('no_result')).toBe(false);
+  });
+});
+
+describe('isFailedResult parity with isFailedOutcome(determineOutcome(r))', () => {
+  const cases: Array<{ name: string; result: { is_error?: boolean; content?: any } | null | undefined }> = [
+    { name: 'null', result: null },
+    { name: 'undefined', result: undefined },
+    { name: 'error string', result: { is_error: true, content: 'file not found' } },
+    { name: 'error array', result: { is_error: true, content: [{ type: 'text', text: 'bad input' }] } },
+    { name: 'error no content', result: { is_error: true } },
+    { name: 'empty string', result: { content: '' } },
+    { name: 'undefined content', result: { content: undefined } },
+    { name: 'empty array', result: { content: [] } },
+    { name: 'single line', result: { content: 'ok' } },
+    { name: 'multi line', result: { content: 'line1\nline2\nline3' } },
+    { name: 'array blocks', result: { content: [{ type: 'text', text: 'a\nb' }] } },
+    { name: 'array of non-text blocks', result: { content: [{ type: 'image' }] } },
+    { name: 'malformed [null]', result: { content: [null] } },
+    { name: 'malformed [{}]', result: { content: [{}] } },
+    { name: 'malformed error [null]', result: { is_error: true, content: [null] } },
+  ];
+
+  for (const { name, result } of cases) {
+    test(name, () => {
+      expect(isFailedResult(result as any)).toBe(isFailedOutcome(determineOutcome((result ?? null) as any)));
+    });
+  }
+
+  test('missing result is not a failure', () => {
+    expect(isFailedResult(undefined)).toBe(false);
+    expect(isFailedResult(null)).toBe(false);
+  });
+});
+
+describe('malformed tool_result content tolerance', () => {
+  test('extractContentText tolerates [null] and [{}] sub-blocks', () => {
+    expect(extractContentText([null] as any)).toBe('');
+    expect(extractContentText([{}] as any)).toBe('');
+    expect(extractContentText([null, { type: 'text', text: 'a' }, {}, { type: 'text', text: 'b' }] as any)).toBe('ab');
+  });
+
+  test('determineOutcome tolerates [null] and [{}] sub-blocks', () => {
+    expect(determineOutcome({ content: [null] as any })).toBe('success');
+    expect(determineOutcome({ content: [{}] as any })).toBe('success');
+    expect(determineOutcome({ is_error: true, content: [null] as any })).toBe('error: ');
+    expect(determineOutcome({ is_error: true, content: [{}] as any })).toBe('error: ');
+  });
+});
+
+describe('buildToolResultLocations', () => {
+  const entries: any[] = [
+    { type: 'summary', summary: 'ignored' },
+    { type: 'user', timestamp: '2026-01-01T00:00:00Z', message: { role: 'user', content: 'hello' } },
+    {
+      type: 'assistant',
+      timestamp: '2026-01-01T00:00:01Z',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'a', name: 'Bash', input: { command: 'ls' } },
+          { type: 'tool_use', id: 'b', name: 'Bash', input: { command: 'pwd' } },
+        ],
+      },
+    },
+    { type: 'system', subtype: 'noise' },
+    {
+      type: 'user',
+      timestamp: '2026-01-01T00:00:02Z',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'a', content: 'out a' },
+          { type: 'tool_result', tool_use_id: 'b', is_error: true, content: [{ type: 'text', text: 'err b' }] },
+          null,
+        ],
+      },
+    },
+  ];
+
+  test('turn follows userAssistantEntries numbering for raw entries', () => {
+    const map = buildToolResultLocations(entries);
+    expect(map.get('a')?.turn).toBe(3);
+    expect(map.get('b')?.turn).toBe(3);
+  });
+
+  test('turn is identical for already-filtered entries', () => {
+    const map = buildToolResultLocations(userAssistantEntries(entries));
+    expect(map.get('a')?.turn).toBe(3);
+  });
+
+  test('locates every result in one entry with string and array content', () => {
+    const map = buildToolResultLocations(entries);
+    expect(map.size).toBe(2);
+    expect(map.get('a')).toEqual({ is_error: false, content: 'out a', result_ts: '2026-01-01T00:00:02Z', turn: 3 });
+    expect(map.get('b')).toEqual({
+      is_error: true,
+      content: [{ type: 'text', text: 'err b' }],
+      result_ts: '2026-01-01T00:00:02Z',
+      turn: 3,
+    });
+  });
+
+  test('ignores user entries with string content', () => {
+    const map = buildToolResultLocations([
+      { type: 'user', message: { role: 'user', content: 'tool_use_id: a' } } as any,
+    ]);
+    expect(map.size).toBe(0);
+  });
+
+  test('a result written before its tool_use still pairs', () => {
+    const map = buildToolResultLocations([
+      { type: 'user', timestamp: 't1', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'early', content: 'x' }] } },
+      { type: 'assistant', timestamp: 't2', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'early', name: 'Bash', input: {} }] } },
+    ] as any);
+    expect(map.get('early')?.turn).toBe(1);
+  });
+
+  test('duplicate ids resolve last-wins', () => {
+    const map = buildToolResultLocations([
+      { type: 'user', timestamp: 't1', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'd', content: 'first' }] } },
+      { type: 'user', timestamp: 't2', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'd', content: 'second' }] } },
+    ] as any);
+    expect(map.get('d')?.content).toBe('second');
+    expect(map.get('d')?.turn).toBe(2);
+  });
+});
+
 // ============================================================================
 // parseIntArg
 // ============================================================================
+
+describe('evaluateResultSelectors', () => {
+  const ok = (content: any, is_error = false) => ({ is_error, content, result_ts: '2026-04-01T10:02:00Z' });
+
+  test('matcher only: substring matches case-insensitively and returns a snippet', () => {
+    const r = evaluateResultSelectors(ok('Build FAILED here'), { outputMatcher: parseSubstringMatcher('failed'), failed: false });
+    expect(r).toEqual({ matched: true, snippet: 'Build FAILED here' });
+    expect(evaluateResultSelectors(ok('all good'), { outputMatcher: parseSubstringMatcher('failed'), failed: false })).toEqual({ matched: false });
+  });
+
+  test('matcher only: regex is case-sensitive', () => {
+    const matcher = parseRegexMatcher('FAIL \\d', '--output-regex');
+    expect(evaluateResultSelectors(ok('FAIL 3'), { outputMatcher: matcher, failed: false }).matched).toBe(true);
+    expect(evaluateResultSelectors(ok('fail 3'), { outputMatcher: matcher, failed: false }).matched).toBe(false);
+  });
+
+  test('failed only: matches is_error results and uses the leading text as snippet', () => {
+    const r = evaluateResultSelectors(ok('old_string not found', true), { outputMatcher: null, failed: true });
+    expect(r).toEqual({ matched: true, snippet: 'old_string not found' });
+    expect(evaluateResultSelectors(ok('fine'), { outputMatcher: null, failed: true })).toEqual({ matched: false });
+  });
+
+  test('failed only: truncates the snippet to the evidence window', () => {
+    const long = 'x'.repeat(500);
+    const r = evaluateResultSelectors(ok(long, true), { outputMatcher: null, failed: true });
+    expect(r.matched && r.snippet?.length).toBe(200);
+  });
+
+  test('both selectors are ANDed', () => {
+    const selectors = { outputMatcher: parseSubstringMatcher('boom'), failed: true };
+    expect(evaluateResultSelectors(ok('boom', true), selectors).matched).toBe(true);
+    expect(evaluateResultSelectors(ok('boom', false), selectors).matched).toBe(false);
+    expect(evaluateResultSelectors(ok('other', true), selectors).matched).toBe(false);
+  });
+
+  test('missing result never matches, even for --failed', () => {
+    expect(evaluateResultSelectors(undefined, { outputMatcher: null, failed: true })).toEqual({ matched: false });
+    expect(evaluateResultSelectors(undefined, { outputMatcher: parseSubstringMatcher('x'), failed: false })).toEqual({ matched: false });
+  });
+
+  test('empty failed output yields an undefined snippet', () => {
+    const r = evaluateResultSelectors(ok('', false), { outputMatcher: null, failed: true });
+    expect(r).toEqual({ matched: true, snippet: undefined });
+    expect(r.matched && 'snippet' in r && r.snippet).toBeUndefined();
+  });
+
+  test('snippet is a 200-char window centered on the match', () => {
+    const text = `${'a'.repeat(400)}NEEDLE${'b'.repeat(400)}`;
+    const r = evaluateResultSelectors(ok(text), { outputMatcher: parseSubstringMatcher('needle'), failed: false });
+    expect(r.matched).toBe(true);
+    if (r.matched) {
+      expect(r.snippet?.length).toBe(200);
+      expect(r.snippet).toContain('NEEDLE');
+      expect(r.snippet?.indexOf('NEEDLE')).toBeGreaterThan(90);
+      expect(r.snippet?.indexOf('NEEDLE')).toBeLessThan(105);
+    }
+  });
+
+  test('array content and malformed sub-blocks do not throw', () => {
+    const matcher = parseSubstringMatcher('hello');
+    expect(evaluateResultSelectors(ok([{ type: 'text', text: 'hello world' }]), { outputMatcher: matcher, failed: false }).matched).toBe(true);
+    expect(evaluateResultSelectors(ok([null, {}] as any), { outputMatcher: matcher, failed: false }).matched).toBe(false);
+    expect(evaluateResultSelectors(ok([null] as any, true), { outputMatcher: null, failed: true })).toEqual({ matched: true, snippet: undefined });
+  });
+});
+
+describe('matchedToolCalls with toolOutput', () => {
+  const ev = (kind: SearchEvidence['kind'], turn: number, block_index: number, agent_id?: string): SearchEvidence => ({
+    kind, turn, block_index, timestamp: null, tool: 'Bash', input_summary: 'cmd', ...(agent_id !== undefined ? { agent_id } : {}),
+  });
+
+  test('tool_output alone returns one item per call', () => {
+    const out = matchedToolCalls([ev('tool_output', 2, 0), ev('tool_output', 2, 1), ev('tool_input', 4, 0)], { toolInput: false, bash: false, toolOutput: true });
+    expect(out.map(e => [e.turn, e.block_index])).toEqual([[2, 0], [2, 1]]);
+    expect(out.every(e => e.kind === 'tool_output')).toBe(true);
+  });
+
+  test('intersects tool_output with tool_input and bash by call key', () => {
+    const evidence = [
+      ev('tool_input', 2, 0), ev('bash', 2, 0), ev('tool_output', 2, 0),
+      ev('tool_input', 2, 1), ev('tool_output', 2, 1),
+      ev('bash', 4, 0),
+    ];
+    expect(matchedToolCalls(evidence, { toolInput: true, bash: false, toolOutput: true }).map(e => [e.turn, e.block_index])).toEqual([[2, 0], [2, 1]]);
+    expect(matchedToolCalls(evidence, { toolInput: true, bash: true, toolOutput: true }).map(e => [e.turn, e.block_index])).toEqual([[2, 0]]);
+  });
+
+  test('agent_id is part of the call key', () => {
+    const evidence = [ev('tool_input', 2, 0, 'sub1'), ev('tool_output', 2, 0), ev('tool_output', 2, 0, 'sub2')];
+    expect(matchedToolCalls(evidence, { toolInput: true, bash: false, toolOutput: true })).toEqual([]);
+    const both = [ev('tool_input', 2, 0, 'sub1'), ev('tool_output', 2, 0, 'sub1')];
+    expect(matchedToolCalls(both, { toolInput: true, bash: false, toolOutput: true })).toHaveLength(1);
+  });
+
+  test('toolOutput omitted behaves as before', () => {
+    const out = matchedToolCalls([ev('tool_input', 2, 0), ev('tool_output', 2, 0)], { toolInput: true, bash: false });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.kind).toBe('tool_input');
+  });
+});
+
+describe('toolInputSamplesFromEvidence with tool_output', () => {
+  test('includes tool_output items with the ToolInputMatch shape', () => {
+    const samples = toolInputSamplesFromEvidence([
+      { kind: 'tool_output', turn: 2, block_index: 1, timestamp: null, tool: 'Bash', input_summary: 'npm test', tool_use_id: 'bash_b', result_turn: 3 },
+      { kind: 'text', turn: 1, block_index: 0, timestamp: null, tool: 'Ignored' },
+    ]);
+    expect(samples).toEqual([{ tool: 'Bash', input_summary: 'npm test', turn: 2 }]);
+  });
+});
 
 describe('parseIntArg', () => {
   test('undefined returns undefined', () => {
@@ -2223,6 +2531,116 @@ describe('scanSearchTarget', () => {
   });
 });
 
+describe('scanSearchTarget result selectors', () => {
+  const sessionId = '22222222-3333-4444-5555-666666666666';
+  const writeSession = (root: string): string => {
+    const sessionFile = join(root, `${sessionId}.jsonl`);
+    writeFileSync(sessionFile, [
+      JSON.stringify({ type: 'user', sessionId, timestamp: '2026-03-01T10:00:00.000Z', message: { role: 'user', content: 'run things' } }),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-03-01T10:01:00.000Z',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', name: 'Bash', id: 'ok_call', input: { command: 'echo hello' } },
+            { type: 'tool_use', name: 'Bash', id: 'bad_call', input: { command: 'false' } },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-03-01T10:01:05.000Z',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'ok_call', content: 'Hello World Marker' },
+            { type: 'tool_result', tool_use_id: 'bad_call', is_error: true, content: [null, {}, { type: 'text', text: 'exit code 1 boom' }] },
+          ],
+        },
+      }),
+    ].join('\n') + '\n');
+    return sessionFile;
+  };
+
+  const withFixture = async (fn: (target: { filePath: string; sessionId: string }) => Promise<void>) => {
+    const root = join(tmpdir(), uniqueTempName('cc-session-tool-output-scan'));
+    mkdirSync(root, { recursive: true });
+    try {
+      await fn({ filePath: writeSession(root), sessionId });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  test('outputMatch is case-insensitive and emits tool_output evidence for the call', async () => {
+    await withFixture(async target => {
+      const { match } = await scanSearchTarget(target, { outputMatch: 'hello world marker' }, null);
+      expect(match?.session_id).toBe(sessionId);
+      const outputs = match!.matches.evidence.filter(e => e.kind === 'tool_output');
+      expect(outputs).toHaveLength(1);
+      expect(outputs[0]).toMatchObject({ tool_use_id: 'ok_call', turn: 2, block_index: 0, result_turn: 3, is_error: false });
+      expect(match!.matches.evidence.some(e => e.kind === 'tool_input')).toBe(false);
+    });
+  });
+
+  test('outputRegex is case-sensitive', async () => {
+    await withFixture(async target => {
+      expect((await scanSearchTarget(target, { outputRegex: 'Hello World' }, null)).match).not.toBeNull();
+      expect((await scanSearchTarget(target, { outputRegex: 'hello world' }, null)).match).toBeNull();
+    });
+  });
+
+  test('failed selects only failing calls and tolerates malformed result sub-blocks', async () => {
+    await withFixture(async target => {
+      const { match } = await scanSearchTarget(target, { failed: true }, null);
+      const outputs = match!.matches.evidence.filter(e => e.kind === 'tool_output');
+      expect(outputs.map(e => e.tool_use_id)).toEqual(['bad_call']);
+      expect(outputs[0]).toMatchObject({ is_error: true, snippet: 'exit code 1 boom' });
+    });
+  });
+
+  test('result selectors bind to the same call as --bash', async () => {
+    await withFixture(async target => {
+      expect((await scanSearchTarget(target, { bash: 'echo hello', failed: true }, null)).match).toBeNull();
+      expect((await scanSearchTarget(target, { bash: 'false', failed: true }, null)).match).not.toBeNull();
+    });
+  });
+
+  test('null content blocks do not drop the session under --failed, --text, or both', async () => {
+    const root = join(tmpdir(), uniqueTempName('cc-session-tool-null-block-scan'));
+    mkdirSync(root, { recursive: true });
+    try {
+      const nullSessionId = '33333333-4444-4555-8666-777777777777';
+      const filePath = join(root, `${nullSessionId}.jsonl`);
+      writeFileSync(filePath, [
+        JSON.stringify({ type: 'user', sessionId: nullSessionId, timestamp: '2026-03-01T10:00:00.000Z', message: { role: 'user', content: [null, { type: 'text', text: 'please run things' }] } }),
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: '2026-03-01T10:01:00.000Z',
+          message: { role: 'assistant', content: [null, { type: 'text', text: 'running now' }, { type: 'tool_use', name: 'Bash', id: 'n_call', input: { command: 'false' } }] },
+        }),
+        JSON.stringify({ type: 'user', timestamp: '2026-03-01T10:01:05.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'n_call', is_error: true, content: 'boom' }] } }),
+      ].join('\n') + '\n');
+      const target = { filePath, sessionId: nullSessionId };
+      for (const args of [{ failed: true }, { failed: true, text: 'running' }, { text: 'running' }]) {
+        expect((await scanSearchTarget(target, args, null)).match?.session_id).toBe(nullSessionId);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('empty outputMatch does not enable bound mode', async () => {
+    await withFixture(async target => {
+      const { match } = await scanSearchTarget(target, { tool: 'Bash', outputMatch: '' }, null);
+      expect(match).not.toBeNull();
+      expect(match!.matches.evidence.some(e => e.kind === 'tool_output')).toBe(false);
+      expect(match!.matches.evidence.filter(e => e.kind === 'tool_input')).toHaveLength(2);
+    });
+  });
+});
+
 describe('worktree project path resolution integration', () => {
   test('fixture worktree root encodes to the hand-built Claude project name', () => {
     expect(mangleProjectPath(RELATED_WORKTREE_ROOT)).toBe(relatedWorktreeDirName);
@@ -2637,6 +3055,9 @@ describe('help contract integration', () => {
     expect(searchHelp).toContain('unified evidence');
     expect(searchHelp).toContain('worktrees and subagents by default');
     expect(searchHelp).toContain('same matching file access');
+    expect(searchHelp).toContain('--output-match');
+    expect(searchHelp).toContain('--failed');
+    expect(searchHelp).toContain('does NOT search tool output');
 
     const toolsProcess = await runCliHelp(['tools', '--help']);
     const toolsHelp = toolsProcess.stdout + toolsProcess.stderr;
@@ -4616,7 +5037,7 @@ describe('search integration', () => {
     const withoutToolInput = parseOutput((await runCli(['search', '--file', 'hello.ts', '--aggregate', 'count-per-session', '--project', FAKE_PROJECT])).stdout);
     expect(withoutToolInput.ok).toBe(false);
     expect(withoutToolInput.error.code).toBe('INVALID_ARGS');
-    expect(withoutToolInput.error.message).toContain('--aggregate requires --tool, --input-match, --input-regex, --bash, or --bash-regex');
+    expect(withoutToolInput.error.message).toContain('--aggregate requires --tool, --input-match, --input-regex, --bash, --bash-regex, --output-match, --output-regex, or --failed');
 
     const invalidMode = parseOutput((await runCli(['search', '--tool', 'Read', '--aggregate', 'totals', '--project', FAKE_PROJECT])).stdout);
     expect(invalidMode.ok).toBe(false);
@@ -4713,6 +5134,332 @@ describe('search integration', () => {
 // ============================================================================
 // listSubagents unit tests
 // ============================================================================
+
+describe('search tool output integration', () => {
+  const OUTPUT_FIXTURE_ROOT = join(tmpdir(), uniqueTempName('cc-session-output-fixture'));
+  const OUTPUT_FIXTURE_HOME = join(OUTPUT_FIXTURE_ROOT, 'home');
+  const OUTPUT_PROJECT = join(OUTPUT_FIXTURE_ROOT, 'output-project');
+  const OUTPUT_CLAUDE_DIR = join(claudeProjectsRoot(OUTPUT_FIXTURE_HOME), mangleProjectPath(OUTPUT_PROJECT));
+  const OUT_A = 'a0a0a0a0-0000-4000-8000-00000000000a';
+  const OUT_B = 'b0b0b0b0-0000-4000-8000-00000000000b';
+  const OUT_C = 'c0c0c0c0-0000-4000-8000-00000000000c';
+  const OUT_D = 'd0d0d0d0-0000-4000-8000-00000000000d';
+  const run = (args: string[]) => runCli(['search', ...args, '--project', OUTPUT_PROJECT], { HOME: OUTPUT_FIXTURE_HOME });
+  const search = async (args: string[]) => parseOutput((await run(args)).stdout);
+  const ids = (result: any): string[] => result.data.map((s: any) => s.session_id);
+  const evidenceOf = (result: any, sessionId: string): any[] => result.data.find((s: any) => s.session_id === sessionId)?.matches.evidence ?? [];
+  const f = (name: string) => join(OUTPUT_PROJECT, 'src', name);
+  const minute = (n: number) => `2026-04-01T10:0${n}:00.000Z`;
+  const user = (turn: number, content: unknown) => JSON.stringify({
+    type: 'user', sessionId: OUT_A, timestamp: minute(turn - 1), cwd: OUTPUT_PROJECT, gitBranch: 'main', message: { role: 'user', content },
+  });
+  const assistant = (turn: number, content: unknown[]) => JSON.stringify({
+    type: 'assistant', timestamp: minute(turn - 1), cwd: OUTPUT_PROJECT, message: { role: 'assistant', content },
+  });
+  const use = (name: string, id: string, input: Record<string, unknown>) => ({ type: 'tool_use', name, id, input });
+  const result = (id: string, content: unknown, is_error?: boolean) => ({
+    type: 'tool_result', tool_use_id: id, content, ...(is_error ? { is_error: true } : {}),
+  });
+
+  beforeAll(() => {
+    mkdirSync(OUTPUT_CLAUDE_DIR, { recursive: true });
+    writeFileSync(join(OUTPUT_CLAUDE_DIR, `${OUT_A}.jsonl`), [
+      user(1, 'Install deps and fix tests'),
+      assistant(2, [use('Bash', 'bash_a', { command: 'npm install' }), use('Bash', 'bash_b', { command: 'npm test' })]),
+      user(3, [result('bash_a', 'ok added 3 packages SHARED_NEEDLE'), result('bash_b', 'FAIL x expected 1', true)]),
+      assistant(4, [
+        use('Read', 'read_x', { file_path: f('x.ts') }),
+        use('Edit', 'edit_y', { file_path: f('y.ts'), old_string: 'a', new_string: 'b' }),
+        use('Read', 'read_z', { file_path: f('z.ts') }),
+        use('Write', 'write_w1', { file_path: f('w.ts'), content: 'one' }),
+      ]),
+      user(5, [
+        result('read_x', 'x contents'),
+        result('edit_y', 'old_string not found', true),
+        result('write_w1', 'File created successfully'),
+      ]),
+      assistant(6, [{ type: 'text', text: 'retrying the install' }]),
+      assistant(7, [use('Write', 'write_w2', { file_path: f('w.ts'), content: 'two' })]),
+      user(8, [result('write_w2', 'File has not been read yet', true)]),
+    ].join('\n') + '\n');
+
+    const subDir = join(OUTPUT_CLAUDE_DIR, OUT_A, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    writeFileSync(join(subDir, 'agent-out_sub.jsonl'), [
+      JSON.stringify({ type: 'user', sessionId: OUT_A, timestamp: '2026-04-01T10:10:00.000Z', cwd: OUTPUT_PROJECT, message: { role: 'user', content: 'Build it' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-04-01T10:11:00.000Z', cwd: OUTPUT_PROJECT, message: { role: 'assistant', content: [use('Bash', 'sub_bash', { command: 'swift build' })] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-04-01T10:11:05.000Z', cwd: OUTPUT_PROJECT, message: { role: 'user', content: [result('sub_bash', 'error: build failed SUBAGENT_MARKER', true)] } }),
+    ].join('\n') + '\n');
+    writeFileSync(join(subDir, 'agent-out_sub.meta.json'), JSON.stringify({ agentType: 'builder', description: 'Build subagent' }));
+
+    writeFileSync(join(OUTPUT_CLAUDE_DIR, `${OUT_B}.jsonl`), [
+      JSON.stringify({ type: 'user', sessionId: OUT_B, timestamp: '2026-03-31T08:00:00.000Z', cwd: OUTPUT_PROJECT, gitBranch: 'main', message: { role: 'user', content: 'Late session' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-04-03T09:00:00.000Z', cwd: OUTPUT_PROJECT, message: { role: 'assistant', content: [use('Bash', 'late_bash', { command: 'echo late' })] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-04-03T09:00:05.000Z', cwd: OUTPUT_PROJECT, message: { role: 'user', content: [result('late_bash', 'SHARED_NEEDLE seen late')] } }),
+    ].join('\n') + '\n');
+
+    writeFileSync(join(OUTPUT_CLAUDE_DIR, `${OUT_C}.jsonl`), [
+      JSON.stringify({ type: 'user', sessionId: OUT_C, timestamp: '2026-04-02T12:00:00.000Z', cwd: OUTPUT_PROJECT, gitBranch: 'main', message: { role: 'user', content: 'Find docs' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-04-02T12:01:00.000Z', cwd: OUTPUT_PROJECT, message: { role: 'assistant', content: [use('Glob', 'glob_hit', { pattern: '**/*.md' }), use('Glob', 'glob_empty', { pattern: '**/*.rst' })] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-04-02T12:01:05.000Z', cwd: OUTPUT_PROJECT, message: { role: 'user', content: [result('glob_hit', 'README.md'), result('glob_empty', '')] } }),
+    ].join('\n') + '\n');
+
+    // Null content blocks in both roles: scoped search builds a worktree context over every block.
+    writeFileSync(join(OUTPUT_CLAUDE_DIR, `${OUT_D}.jsonl`), [
+      JSON.stringify({ type: 'user', sessionId: OUT_D, timestamp: '2026-04-02T14:00:00.000Z', cwd: OUTPUT_PROJECT, gitBranch: 'main', message: { role: 'user', content: [null, { type: 'text', text: 'Check nulls' }] } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-04-02T14:01:00.000Z', cwd: OUTPUT_PROJECT, message: { role: 'assistant', content: [null, { type: 'text', text: 'nullblock prose' }, use('Bash', 'null_bash', { command: 'make nulls' })] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-04-02T14:01:05.000Z', cwd: OUTPUT_PROJECT, message: { role: 'user', content: [result('null_bash', 'NULLBLOCK_ERR exit 2', true)] } }),
+    ].join('\n') + '\n');
+  });
+
+  afterAll(() => {
+    rmSync(OUTPUT_FIXTURE_ROOT, { recursive: true, force: true });
+  });
+
+  describe('binding', () => {
+    // Each half matches OUT_A on its own, on different calls; only the bound combination must miss it.
+    const expectBoundMiss = async (callSelector: string[], resultSelector: string[]) => {
+      expect(ids(await search(callSelector))).toContain(OUT_A);
+      expect(ids(await search(resultSelector))).toContain(OUT_A);
+      const bound = await search([...callSelector, ...resultSelector]);
+      expect(bound.ok).toBe(true);
+      expect(ids(bound)).not.toContain(OUT_A);
+    };
+
+    test('--bash with --output-match binds to the same call', async () => {
+      await expectBoundMiss(['--bash', 'npm install'], ['--output-match', 'FAIL']);
+    });
+
+    test('--input-match with --failed binds to the same call', async () => {
+      await expectBoundMiss(['--input-match', 'npm install'], ['--failed']);
+    });
+
+    test('--file with --failed binds to the same call', async () => {
+      await expectBoundMiss(['--file', 'src/x.ts'], ['--failed']);
+    });
+
+    test('--tool Read --failed does not match a successful read or a read with no result', async () => {
+      await expectBoundMiss(['--tool', 'Read'], ['--failed']);
+    });
+
+    test('--file src/y.ts --failed matches with exactly file + tool_output evidence for the failed edit', async () => {
+      const r = await search(['--file', 'src/y.ts', '--failed']);
+      expect(ids(r)).toContain(OUT_A);
+      const evidence = evidenceOf(r, OUT_A);
+      expect(evidence.map(e => e.kind).sort()).toEqual(['file', 'tool_output']);
+      expect(evidence.find(e => e.kind === 'tool_output')).toMatchObject({ tool_use_id: 'edit_y', tool: 'Edit', is_error: true });
+      expect(evidence.find(e => e.kind === 'file')).toMatchObject({ operation: 'edit', turn: 4, block_index: 1 });
+    });
+
+    test('positive control: --tool Bash --input-match "npm test" --failed matches', async () => {
+      expect(ids(await search(['--tool', 'Bash', '--input-match', 'npm test', '--failed']))).toContain(OUT_A);
+    });
+
+    test('evidence lists only the bound call', async () => {
+      const r = await search(['--tool', 'Bash', '--output-match', 'FAIL x']);
+      const evidence = evidenceOf(r, OUT_A);
+      expect(evidence.map(e => e.kind).sort()).toEqual(['tool_input', 'tool_output']);
+      for (const item of evidence) {
+        expect(item).toMatchObject({ turn: 2, block_index: 1, timestamp: minute(1) });
+      }
+      expect(evidence.find(e => e.kind === 'tool_output')).toMatchObject({
+        tool_use_id: 'bash_b',
+        result_turn: 3,
+        result_timestamp: minute(2),
+        is_error: true,
+        snippet: 'FAIL x expected 1',
+      });
+      expect(r.data.find((s: any) => s.session_id === OUT_A).matches.turns).toEqual([2]);
+    });
+
+    test('parallel results are distinguished by tool_use_id', async () => {
+      const r = await search(['--output-match', 'added 3 packages']);
+      const outputs = evidenceOf(r, OUT_A).filter(e => e.kind === 'tool_output');
+      expect(outputs).toHaveLength(1);
+      expect(outputs[0]).toMatchObject({ tool_use_id: 'bash_a', block_index: 0, result_turn: 3 });
+    });
+
+    test('null content blocks do not drop a session from scoped search', async () => {
+      const r = await search(['--output-match', 'NULLBLOCK_ERR']);
+      expect(r.ok).toBe(true);
+      expect(ids(r)).toEqual([OUT_D]);
+      expect(evidenceOf(r, OUT_D).find(e => e.kind === 'tool_output')).toMatchObject({ tool_use_id: 'null_bash', block_index: 2, is_error: true });
+      expect(ids(await search(['--text', 'nullblock prose', '--failed']))).toEqual([OUT_D]);
+    });
+
+    test('--text and --failed stay session-level', async () => {
+      expect(ids(await search(['--text', 'retrying the install', '--failed']))).toContain(OUT_A);
+    });
+  });
+
+  describe('matching', () => {
+    test('--output-regex is validated and case-sensitive; --output-match is case-insensitive', async () => {
+      expect(ids(await search(['--output-regex', 'added \\d+ packages']))).toContain(OUT_A);
+      expect(ids(await search(['--output-regex', 'expected \\d']))).toContain(OUT_A);
+      expect(ids(await search(['--output-regex', 'EXPECTED']))).not.toContain(OUT_A);
+      expect(ids(await search(['--output-match', 'EXPECTED']))).toContain(OUT_A);
+    });
+
+    test('--failed matches a non-error empty result and omits the empty snippet', async () => {
+      const r = await search(['--tool', 'Glob', '--failed']);
+      expect(ids(r)).toEqual([OUT_C]);
+      const outputs = evidenceOf(r, OUT_C).filter(e => e.kind === 'tool_output');
+      expect(outputs).toHaveLength(1);
+      expect(outputs[0]).toMatchObject({ tool_use_id: 'glob_empty', tool: 'Glob', is_error: false, result_turn: 3 });
+      expect(outputs[0]).not.toHaveProperty('snippet');
+    });
+
+    test('--failed snippet is the leading output text', async () => {
+      const r = await search(['--failed', '--tool', 'Edit']);
+      const output = evidenceOf(r, OUT_A).find(e => e.kind === 'tool_output');
+      expect(output.snippet).toBe('old_string not found');
+    });
+  });
+
+  describe('--origin', () => {
+    test('--file --origin keeps all write evidence and sorts by the earliest', async () => {
+      const r = await search(['--file', 'src/w.ts', '--origin']);
+      expect(ids(r)).toEqual([OUT_A]);
+      const turns = evidenceOf(r, OUT_A).filter(e => e.kind === 'file').map(e => e.turn).sort();
+      expect(turns).toEqual([4, 7]);
+    });
+
+    test('--file --origin --failed keeps only the failed write call', async () => {
+      const r = await search(['--file', 'src/w.ts', '--origin', '--failed']);
+      expect(ids(r)).toEqual([OUT_A]);
+      const evidence = evidenceOf(r, OUT_A);
+      expect(evidence.map(e => e.kind).sort()).toEqual(['file', 'tool_output']);
+      expect(evidence.every(e => e.turn === 7)).toBe(true);
+      expect(evidence.find(e => e.kind === 'tool_output').tool_use_id).toBe('write_w2');
+    });
+  });
+
+  describe('subagents', () => {
+    test('--output-match finds subagent tool output with provenance', async () => {
+      const r = await search(['--output-match', 'SUBAGENT_MARKER']);
+      expect(ids(r)).toEqual([OUT_A]);
+      const output = evidenceOf(r, OUT_A).find(e => e.kind === 'tool_output');
+      expect(output).toMatchObject({ agent_id: 'out_sub', is_subagent: true, parent_session_id: OUT_A, tool_use_id: 'sub_bash' });
+    });
+
+    test('--no-subagents excludes subagent output', async () => {
+      expect((await search(['--output-match', 'SUBAGENT_MARKER', '--no-subagents'])).data).toEqual([]);
+    });
+  });
+
+  describe('count-per-session', () => {
+    test('counts matched calls under result selectors', async () => {
+      const r = await search(['--tool', 'Bash', '--failed', '--aggregate', 'count-per-session']);
+      expect(r.ok).toBe(true);
+      const row = r.data.find((s: any) => s.session_id === OUT_A);
+      expect(row.counts.tool_inputs).toBe(2);
+      expect(row.sample_matches.map((m: any) => m.tool)).toEqual(['Bash', 'Bash']);
+      expect(r.data.find((s: any) => s.session_id === OUT_B)).toBeUndefined();
+    });
+
+    test('--failed alone is an accepted selector', async () => {
+      const r = await search(['--failed', '--aggregate', 'count-per-session']);
+      expect(r.ok).toBe(true);
+      expect(r.data.find((s: any) => s.session_id === OUT_A).counts.tool_inputs).toBe(4);
+    });
+  });
+
+  describe('validation', () => {
+    test('--output-match and --output-regex are mutually exclusive', async () => {
+      const r = await search(['--output-match', 'x', '--output-regex', 'y']);
+      expect(r.ok).toBe(false);
+      expect(r.error.code).toBe('INVALID_ARGS');
+      expect(r.error.message).toContain('--output-match and --output-regex are mutually exclusive');
+    });
+
+    test('invalid --output-regex is rejected', async () => {
+      const r = await search(['--output-regex', '(']);
+      expect(r.ok).toBe(false);
+      expect(r.error.code).toBe('INVALID_ARGS');
+      expect(r.error.message).toContain('Invalid --output-regex regex');
+    });
+
+    test.each(['--output-match', '--output-regex'])('empty %s is rejected instead of turning bound mode off', async flag => {
+      const r = await search([flag, '']);
+      expect(r.ok).toBe(false);
+      expect(r.error.code).toBe('INVALID_ARGS');
+      expect(r.error.message).toBe(`flag ${flag} for command search requires a non-empty value`);
+    });
+  });
+
+  describe('match-* sort', () => {
+    test('--sort match-earliest orders by the time of the matching call, not the session start', async () => {
+      expect(ids(await search(['--output-match', 'SHARED_NEEDLE', '--sort', 'match-earliest']))).toEqual([OUT_A, OUT_B]);
+    });
+
+    test('--sort match-newest orders by the time of the matching call, not the session start', async () => {
+      expect(ids(await search(['--output-match', 'SHARED_NEEDLE', '--sort', 'match-newest']))).toEqual([OUT_B, OUT_A]);
+    });
+  });
+
+  describe('never-matching bound combinations', () => {
+    const rejected: Array<[string, string[], string]> = [
+      ['--bash with --file', ['--bash', 'npm', '--file', 'x', '--failed'], '--bash and --file can never match the same tool call'],
+      ['--bash with a non-Bash --tool', ['--bash', 'npm', '--tool', 'Read', '--failed'], '--tool Read can never name a Bash call'],
+      ['--file with a non-file --tool', ['--file', 'x', '--tool', 'Bash', '--failed'], '--tool Bash can never name a file tool'],
+      ['--operation contradicting --tool', ['--file', 'x', '--operation', 'edit', '--tool', 'Write', '--failed'], '--tool Write contradicts --operation edit'],
+      ['--origin (implies write) contradicting --tool', ['--file', 'x', '--origin', '--tool', 'Read', '--failed'], '--tool Read contradicts --origin (implies --operation write)'],
+      ['--output-regex with --bash-regex and --file', ['--bash-regex', 'npm', '--file', 'x', '--output-regex', 'y'], '--bash and --file can never match the same tool call'],
+    ];
+    for (const [name, args, message] of rejected) {
+      test(`rejects ${name}`, async () => {
+        const r = await search(args);
+        expect(r.ok).toBe(false);
+        expect(r.error.code).toBe('INVALID_ARGS');
+        expect(r.error.message).toContain(message);
+      });
+    }
+
+    test('rejects --aggregate counters with result selectors', async () => {
+      const r = await search(['--failed', '--aggregate', 'counters', '--counter', 'a=b']);
+      expect(r.ok).toBe(false);
+      expect(r.error.code).toBe('INVALID_ARGS');
+      expect(r.error.message).toContain('--aggregate counters does not support --output-match, --output-regex, or --failed');
+    });
+
+    test('still accepts compatible bound combinations', async () => {
+      for (const args of [
+        ['--bash', 'npm', '--tool', 'Bash', '--failed'],
+        ['--file', 'x', '--tool', 'Edit', '--failed'],
+        ['--file', 'x', '--tool', 'Write', '--operation', 'write', '--failed'],
+        ['--file', 'x', '--origin', '--tool', 'Write', '--failed'],
+      ]) {
+        const r = await search(args);
+        expect(r.ok).toBe(true);
+      }
+    });
+
+    test('session-level --tool Bash --file without result selectors is still accepted', async () => {
+      const r = await search(['--tool', 'Bash', '--file', 'x']);
+      expect(r.ok).toBe(true);
+    });
+  });
+});
+
+describe('search tool output on shared fixture (read-only)', () => {
+  test('--output-match finds tool output that --text cannot see', async () => {
+    const output = parseOutput((await runCli(['search', '--output-match', 'old_string not found', '--project', FAKE_PROJECT])).stdout);
+    expect(output.data.map((s: any) => s.session_id)).toContain(SESSION_ID);
+    const text = parseOutput((await runCli(['search', '--text', 'old_string not found', '--project', FAKE_PROJECT])).stdout);
+    expect(text.data.map((s: any) => s.session_id)).not.toContain(SESSION_ID);
+  });
+
+  test('at-least-one-filter message lists the result selectors and --failed alone satisfies it', async () => {
+    const none = parseOutput((await runCli(['search', '--project', FAKE_PROJECT])).stdout);
+    expect(none.ok).toBe(false);
+    expect(none.error.code).toBe('INVALID_ARGS');
+    expect(none.error.message).toContain('--output-match, --output-regex, --failed');
+
+    const failed = parseOutput((await runCli(['search', '--failed', '--project', FAKE_PROJECT])).stdout);
+    expect(failed.ok).toBe(true);
+    expect(failed.data.map((s: any) => s.session_id)).toContain(SESSION_ID);
+  });
+});
 
 describe('listSubagents', () => {
   test('returns empty array when subagents directory does not exist', async () => {
