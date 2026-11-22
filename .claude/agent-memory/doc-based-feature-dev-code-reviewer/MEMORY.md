@@ -1,0 +1,1 @@
+- [Review verification techniques](project_review_verification_techniques.md) — piped CLI JSON cut at ~128 KB (redirect to a file); scoped searches include the live session
