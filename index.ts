@@ -35,7 +35,6 @@ import {
   attachCounterTranscriptResults,
   bucketCounterRows,
   evaluateResultSelectors,
-  evidenceTimestamps,
   matchedToolCalls,
   parseCounterArgs,
   parseRegexMatcher,
@@ -2365,22 +2364,34 @@ function compareNullableTimestamp(a: string | null | undefined, b: string | null
   return direction === 'asc' ? a.localeCompare(b) : b.localeCompare(a);
 }
 
-function matchTimestamp(match: SearchMatch, mode: 'earliest' | 'newest'): string | null {
-  const timestamps = evidenceTimestamps(match, 'file');
-  if (timestamps.length === 0) return match.timestamp;
-  return mode === 'earliest' ? timestamps[0]! : timestamps[timestamps.length - 1]!;
+function matchSortTimestamp(match: SearchMatch, mode: 'earliest' | 'newest'): string | null {
+  const evidence = match.matches.evidence;
+  const fileEvidence = evidence.filter(e => e.kind === 'file');
+  const pool = fileEvidence.length > 0 ? fileEvidence : evidence.filter(e => e.kind !== 'intent');
+  let best: string | null = null;
+  for (const { timestamp } of pool) {
+    if (!timestamp) continue;
+    if (best === null || (mode === 'earliest' ? timestamp < best : timestamp > best)) best = timestamp;
+  }
+  return best ?? match.timestamp;
 }
 
 export function sortSearchMatches(matches: SearchMatch[], mode: SearchSortMode): SearchMatch[] {
+  const matchKeys = new Map<SearchMatch, string | null>();
+  if (mode === 'match-earliest' || mode === 'match-newest') {
+    const keyMode = mode === 'match-earliest' ? 'earliest' : 'newest';
+    for (const match of matches) matchKeys.set(match, matchSortTimestamp(match, keyMode));
+  }
+
   return matches.sort((a, b) => {
     if (mode === 'match-earliest') {
-      const byMatch = compareNullableTimestamp(matchTimestamp(a, 'earliest'), matchTimestamp(b, 'earliest'), 'asc');
+      const byMatch = compareNullableTimestamp(matchKeys.get(a), matchKeys.get(b), 'asc');
       if (byMatch !== 0) return byMatch;
       return compareNullableTimestamp(a.timestamp, b.timestamp, 'desc');
     }
 
     if (mode === 'match-newest') {
-      const byMatch = compareNullableTimestamp(matchTimestamp(a, 'newest'), matchTimestamp(b, 'newest'), 'desc');
+      const byMatch = compareNullableTimestamp(matchKeys.get(a), matchKeys.get(b), 'desc');
       if (byMatch !== 0) return byMatch;
       return compareNullableTimestamp(a.timestamp, b.timestamp, 'desc');
     }
@@ -2453,7 +2464,7 @@ const searchCommand = defineCommand({
     since: { type: 'string', description: 'Sessions from the last duration (e.g. 1d, 2h, 1w)' },
     operation: { type: 'string', description: 'With --file, bind operation to the same matching file access: read/edit/write/grep/glob' },
     origin: { type: 'boolean', description: 'With --file, return earliest matching write evidence', default: false },
-    sort: { type: 'string', description: 'Sort mode: session-newest, match-earliest, match-newest, project' },
+    sort: { type: 'string', description: 'Sort mode: session-newest, match-earliest, match-newest, project; match-* use matching evidence time' },
     aggregate: { type: 'string', description: 'Aggregate mode: count-per-session, counters' },
     counter: { type: 'string', description: 'Named raw-input counter as NAME=substring' },
     'counter-regex': { type: 'string', description: 'Named raw-input counter as NAME=regex' },

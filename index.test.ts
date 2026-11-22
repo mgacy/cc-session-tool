@@ -18,7 +18,7 @@ import {
   normalizeFileQuery, matchFileAccess, projectMatchesGlob, selectProjectContexts,
   stableJsonStringify, toolInputMatches, deriveWorktreeRootFromPath,
   extractWorktreeStatePaths, collectObservedWorktreeRoots, absolutePathCandidatesFor,
-  scanSearchTarget, extractContentText,
+  scanSearchTarget, extractContentText, sortSearchMatches,
 } from './index.ts';
 import {
   buildToolResultLocations,
@@ -149,6 +149,57 @@ describe('search matcher primitives', () => {
       '2026-03-03T00:00:00.000Z',
     ]);
     expect(evidenceTimestamps(match, 'file')).toEqual(['2026-03-02T00:00:00.000Z']);
+  });
+
+  describe('sortSearchMatches match-* ordering', () => {
+    const mk = (id: string, timestamp: string | null, evidence: SearchEvidence[]): SearchMatch => ({
+      session_id: id,
+      branch: null,
+      timestamp,
+      slug: null,
+      model: null,
+      session_ref: { session_id: id, project: '-tmp-project' },
+      matches: { tools: [], files: [], turns: [], evidence },
+    });
+    const ev = (kind: SearchEvidence['kind'], timestamp: string | null): SearchEvidence => ({ kind, turn: 1, block_index: 0, timestamp });
+    const order = (matches: SearchMatch[], mode: 'match-earliest' | 'match-newest') => sortSearchMatches([...matches], mode).map(m => m.session_id);
+
+    test('file evidence wins over other evidence when present', () => {
+      const a = mk('a', '2026-01-01T00:00:00.000Z', [ev('file', '2026-03-05T00:00:00.000Z'), ev('tool_output', '2026-01-01T00:00:00.000Z')]);
+      const b = mk('b', '2026-02-01T00:00:00.000Z', [ev('file', '2026-03-01T00:00:00.000Z'), ev('tool_output', '2026-04-01T00:00:00.000Z')]);
+      expect(order([a, b], 'match-earliest')).toEqual(['b', 'a']);
+      expect(order([a, b], 'match-newest')).toEqual(['a', 'b']);
+    });
+
+    test('without file evidence, earliest/newest is taken over non-intent evidence', () => {
+      const a = mk('a', '2026-01-01T00:00:00.000Z', [ev('text', '2026-05-02T00:00:00.000Z'), ev('tool_output', '2026-05-04T00:00:00.000Z')]);
+      const b = mk('b', '2026-06-01T00:00:00.000Z', [ev('bash', '2026-05-03T00:00:00.000Z')]);
+      // earliest: a=05-02, b=05-03; newest: a=05-04, b=05-03
+      expect(order([b, a], 'match-earliest')).toEqual(['a', 'b']);
+      expect(order([b, a], 'match-newest')).toEqual(['a', 'b']);
+      const c = mk('c', '2026-01-01T00:00:00.000Z', [ev('tool_input', '2026-05-10T00:00:00.000Z')]);
+      expect(order([a, c], 'match-newest')).toEqual(['c', 'a']);
+    });
+
+    test('intent-only evidence falls back to the session start', () => {
+      const a = mk('a', '2026-03-01T00:00:00.000Z', [ev('intent', '2026-03-01T00:00:00.000Z')]);
+      const b = mk('b', '2026-02-01T00:00:00.000Z', [ev('intent', '2026-02-01T00:00:00.000Z')]);
+      expect(order([a, b], 'match-earliest')).toEqual(['b', 'a']);
+      expect(order([a, b], 'match-newest')).toEqual(['a', 'b']);
+    });
+
+    test('intent evidence is ignored when other evidence exists', () => {
+      const a = mk('a', '2026-01-01T00:00:00.000Z', [ev('intent', '2026-01-01T00:00:00.000Z'), ev('text', '2026-06-01T00:00:00.000Z')]);
+      const b = mk('b', '2026-03-01T00:00:00.000Z', [ev('text', '2026-04-01T00:00:00.000Z')]);
+      expect(order([a, b], 'match-earliest')).toEqual(['b', 'a']);
+    });
+
+    test('file evidence with null timestamps falls back to the session start', () => {
+      const a = mk('a', '2026-03-01T00:00:00.000Z', [ev('file', null), ev('text', '2026-01-01T00:00:00.000Z')]);
+      const b = mk('b', '2026-02-01T00:00:00.000Z', [ev('file', null)]);
+      expect(order([a, b], 'match-earliest')).toEqual(['b', 'a']);
+      expect(order([a, b], 'match-newest')).toEqual(['a', 'b']);
+    });
   });
 
   test('SearchMeta contains only active search metadata fields', () => {
@@ -4980,6 +5031,16 @@ describe('search tool output integration', () => {
       expect(r.ok).toBe(false);
       expect(r.error.code).toBe('INVALID_ARGS');
       expect(r.error.message).toContain('At least one search filter is required');
+    });
+  });
+
+  describe('match-* sort', () => {
+    test('--sort match-earliest orders by the time of the matching call, not the session start', async () => {
+      expect(ids(await search(['--output-match', 'SHARED_NEEDLE', '--sort', 'match-earliest']))).toEqual([OUT_A, OUT_B]);
+    });
+
+    test('--sort match-newest orders by the time of the matching call, not the session start', async () => {
+      expect(ids(await search(['--output-match', 'SHARED_NEEDLE', '--sort', 'match-newest']))).toEqual([OUT_B, OUT_A]);
     });
   });
 
