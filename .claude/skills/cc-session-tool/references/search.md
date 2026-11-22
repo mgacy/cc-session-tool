@@ -39,7 +39,7 @@ At least one **selector** is required: `--tool`, `--input-match` / `--input-rege
 | `--origin` | With `--file`, returns earliest matching transcript **write** evidence | Implies `--operation write`. Defaults to one result. Transcript evidence, **not** VCS creation history. |
 | `--text <text>` / `--text-regex` | User/assistant text and thinking | Case-insensitive substring or regex. |
 | `--intent-match <text>` / `--intent-regex` | Session intent sources (slug, first prompt token, first user message) | |
-| `--bash <text>` / `--bash-regex` | Bash command inputs | Shorthand for finding Bash commands in match rows. Not counted by `--aggregate`; use `--tool Bash --input-match` for audits (see [Aggregation modes](#aggregation-modes)). |
+| `--bash <text>` / `--bash-regex` | Bash command inputs | Shorthand for finding Bash commands in match rows. For audits with `--aggregate`, use `--tool Bash --input-match` instead (see [Aggregation modes](#aggregation-modes)). |
 
 ## File identity matching (the worktree story)
 
@@ -80,7 +80,7 @@ Both count matching tool calls, not occurrences of the text: `bun test && bun te
 
 Per-session rollup with `counts.tool_inputs` and a small `sample_matches` array. Useful for "how often did session X do Y" audits.
 
-Requires `--tool`, `--input-match`, or `--input-regex`, and counts only the tool calls those flags match; `--bash` matches are not counted. For Bash audits use `--tool Bash --input-match '<text>'`: `--bash` alone is rejected, and `--tool Bash --bash '<text>'` counts every Bash call in the session.
+Requires `--tool`, `--input-match`, or `--input-regex`, and counts the tool calls those flags match. For Bash audits use `--tool Bash --input-match '<text>'`, and don't combine `--bash` or `--bash-regex` with `--aggregate`.
 
 ### `--aggregate counters`
 
