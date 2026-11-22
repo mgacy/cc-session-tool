@@ -63,7 +63,10 @@ import {
 } from './src/transcript.ts';
 import {
   buildResultLookup as toolLogBuildResultLookup,
+  determineOutcome as toolLogDetermineOutcome,
+  extractContentText as toolLogExtractContentText,
   inputSummary as toolLogInputSummary,
+  isFailedOutcome,
   safeInputSummary,
   stableJsonStringify as toolLogStableJsonStringify,
   type ToolResultInfo,
@@ -853,6 +856,8 @@ export function truncateContent(text: string, maxLen: number): string {
 
 export const inputSummary = toolLogInputSummary;
 export const stableJsonStringify = toolLogStableJsonStringify;
+export const determineOutcome = toolLogDetermineOutcome;
+export const extractContentText = toolLogExtractContentText;
 
 export function toolInputMatches(input: Record<string, unknown>, query: string): boolean {
   return stableJsonStringify(input).toLowerCase().includes(query.toLowerCase());
@@ -860,34 +865,6 @@ export function toolInputMatches(input: Record<string, unknown>, query: string):
 
 function toolInputMatchesMatcher(input: Record<string, unknown>, matcher: TextMatcher | null): boolean {
   return testTextMatcher(matcher, stableJsonStringify(input));
-}
-
-/** Determine outcome from a tool_result. */
-export function determineOutcome(resultInfo: { is_error?: boolean; content?: string | ContentBlock[] } | null): string {
-  if (resultInfo == null) return 'no_result';
-  if (resultInfo.is_error) {
-    let errText = '';
-    if (typeof resultInfo.content === 'string') {
-      errText = resultInfo.content;
-    } else if (Array.isArray(resultInfo.content)) {
-      errText = resultInfo.content.filter(b => b.type === 'text').map(b => b.text ?? '').join('');
-    }
-    return 'error: ' + errText.slice(0, 60);
-  }
-  if (resultInfo.content === '' || resultInfo.content == null || (Array.isArray(resultInfo.content) && resultInfo.content.length === 0)) {
-    return 'empty';
-  }
-  // Success heuristics
-  if (typeof resultInfo.content === 'string') {
-    const lines = resultInfo.content.split('\n').length;
-    return lines > 1 ? `success (${lines} lines)` : 'success';
-  }
-  if (Array.isArray(resultInfo.content)) {
-    const text = resultInfo.content.filter(b => b.type === 'text').map(b => b.text ?? '').join('');
-    const lines = text.split('\n').length;
-    return lines > 1 ? `success (${lines} lines)` : 'success';
-  }
-  return 'success';
 }
 
 /** Extract the file path from a tool_use block's input, if applicable. */
@@ -965,16 +942,6 @@ export function parseDateArg(value: string | undefined, name: string, boundary: 
     return new Date(value).toISOString();
   }
   throw cliError('INVALID_ARGS', `Invalid ${name} date '${value}' -- expected ISO 8601, with a timezone when a time is given (e.g. 2026-01-09 or 2026-01-09T14:30:00Z)`);
-}
-
-/** Extract text from a content block's content field (string or array). */
-function extractContentText(content: string | ContentBlock[] | undefined): string {
-  if (content == null) return '';
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content.filter(b => b.type === 'text').map(b => b.text ?? '').join('');
-  }
-  return '';
 }
 
 /** Extract session metadata (branch, timestamp, version, slug) from raw JSONL text. */
@@ -1631,7 +1598,7 @@ const toolsCommand = defineCommand({
       if (args.name) calls = calls.filter(c => c.tool === args.name);
       if (nameMatcher) calls = calls.filter(c => testTextMatcher(nameMatcher, c.tool));
       if (inputMatcher) calls = calls.filter(c => toolInputMatchesMatcher(c.raw_input, inputMatcher));
-      if (args.failed) calls = calls.filter(c => c.outcome === 'empty' || c.outcome.startsWith('error:'));
+      if (args.failed) calls = calls.filter(c => isFailedOutcome(c.outcome));
       if (turnRange) calls = calls.filter(c => c.turn >= turnRange.start && c.turn <= turnRange.end);
 
       const total = calls.length;

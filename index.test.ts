@@ -18,8 +18,13 @@ import {
   normalizeFileQuery, matchFileAccess, projectMatchesGlob, selectProjectContexts,
   stableJsonStringify, toolInputMatches, deriveWorktreeRootFromPath,
   extractWorktreeStatePaths, collectObservedWorktreeRoots, absolutePathCandidatesFor,
-  scanSearchTarget,
+  scanSearchTarget, extractContentText,
 } from './index.ts';
+import {
+  buildToolResultLocations,
+  isFailedOutcome,
+  isFailedResult,
+} from './src/tool-log.ts';
 import {
   applyTruncationPolicy,
   buildSessionSummary,
@@ -466,6 +471,144 @@ describe('determineOutcome', () => {
 
   test('success with array content blocks', () => {
     expect(determineOutcome({ content: [{ type: 'text', text: 'a\nb' }] })).toBe('success (2 lines)');
+  });
+});
+
+describe('isFailedOutcome', () => {
+  test('error and empty outcomes are failures', () => {
+    expect(isFailedOutcome('error: boom')).toBe(true);
+    expect(isFailedOutcome('error: ')).toBe(true);
+    expect(isFailedOutcome('empty')).toBe(true);
+  });
+
+  test('success and no_result are not failures', () => {
+    expect(isFailedOutcome('success')).toBe(false);
+    expect(isFailedOutcome('success (3 lines)')).toBe(false);
+    expect(isFailedOutcome('no_result')).toBe(false);
+  });
+});
+
+describe('isFailedResult parity with isFailedOutcome(determineOutcome(r))', () => {
+  const cases: Array<{ name: string; result: { is_error?: boolean; content?: any } | null | undefined }> = [
+    { name: 'null', result: null },
+    { name: 'undefined', result: undefined },
+    { name: 'error string', result: { is_error: true, content: 'file not found' } },
+    { name: 'error array', result: { is_error: true, content: [{ type: 'text', text: 'bad input' }] } },
+    { name: 'error no content', result: { is_error: true } },
+    { name: 'empty string', result: { content: '' } },
+    { name: 'undefined content', result: { content: undefined } },
+    { name: 'empty array', result: { content: [] } },
+    { name: 'single line', result: { content: 'ok' } },
+    { name: 'multi line', result: { content: 'line1\nline2\nline3' } },
+    { name: 'array blocks', result: { content: [{ type: 'text', text: 'a\nb' }] } },
+    { name: 'array of non-text blocks', result: { content: [{ type: 'image' }] } },
+    { name: 'malformed [null]', result: { content: [null] } },
+    { name: 'malformed [{}]', result: { content: [{}] } },
+    { name: 'malformed error [null]', result: { is_error: true, content: [null] } },
+  ];
+
+  for (const { name, result } of cases) {
+    test(name, () => {
+      expect(isFailedResult(result as any)).toBe(isFailedOutcome(determineOutcome((result ?? null) as any)));
+    });
+  }
+
+  test('missing result is not a failure', () => {
+    expect(isFailedResult(undefined)).toBe(false);
+    expect(isFailedResult(null)).toBe(false);
+  });
+});
+
+describe('malformed tool_result content tolerance', () => {
+  test('extractContentText tolerates [null] and [{}] sub-blocks', () => {
+    expect(extractContentText([null] as any)).toBe('');
+    expect(extractContentText([{}] as any)).toBe('');
+    expect(extractContentText([null, { type: 'text', text: 'a' }, {}, { type: 'text', text: 'b' }] as any)).toBe('ab');
+  });
+
+  test('determineOutcome tolerates [null] and [{}] sub-blocks', () => {
+    expect(determineOutcome({ content: [null] as any })).toBe('success');
+    expect(determineOutcome({ content: [{}] as any })).toBe('success');
+    expect(determineOutcome({ is_error: true, content: [null] as any })).toBe('error: ');
+    expect(determineOutcome({ is_error: true, content: [{}] as any })).toBe('error: ');
+  });
+});
+
+describe('buildToolResultLocations', () => {
+  const entries: any[] = [
+    { type: 'summary', summary: 'ignored' },
+    { type: 'user', timestamp: '2026-01-01T00:00:00Z', message: { role: 'user', content: 'hello' } },
+    {
+      type: 'assistant',
+      timestamp: '2026-01-01T00:00:01Z',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'a', name: 'Bash', input: { command: 'ls' } },
+          { type: 'tool_use', id: 'b', name: 'Bash', input: { command: 'pwd' } },
+        ],
+      },
+    },
+    { type: 'system', subtype: 'noise' },
+    {
+      type: 'user',
+      timestamp: '2026-01-01T00:00:02Z',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'a', content: 'out a' },
+          { type: 'tool_result', tool_use_id: 'b', is_error: true, content: [{ type: 'text', text: 'err b' }] },
+          null,
+        ],
+      },
+    },
+  ];
+
+  test('turn follows userAssistantEntries numbering for raw entries', () => {
+    const map = buildToolResultLocations(entries);
+    expect(map.get('a')?.turn).toBe(3);
+    expect(map.get('b')?.turn).toBe(3);
+  });
+
+  test('turn is identical for already-filtered entries', () => {
+    const map = buildToolResultLocations(userAssistantEntries(entries));
+    expect(map.get('a')?.turn).toBe(3);
+  });
+
+  test('locates every result in one entry with string and array content', () => {
+    const map = buildToolResultLocations(entries);
+    expect(map.size).toBe(2);
+    expect(map.get('a')).toEqual({ is_error: false, content: 'out a', result_ts: '2026-01-01T00:00:02Z', turn: 3 });
+    expect(map.get('b')).toEqual({
+      is_error: true,
+      content: [{ type: 'text', text: 'err b' }],
+      result_ts: '2026-01-01T00:00:02Z',
+      turn: 3,
+    });
+  });
+
+  test('ignores user entries with string content', () => {
+    const map = buildToolResultLocations([
+      { type: 'user', message: { role: 'user', content: 'tool_use_id: a' } } as any,
+    ]);
+    expect(map.size).toBe(0);
+  });
+
+  test('a result written before its tool_use still pairs', () => {
+    const map = buildToolResultLocations([
+      { type: 'user', timestamp: 't1', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'early', content: 'x' }] } },
+      { type: 'assistant', timestamp: 't2', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'early', name: 'Bash', input: {} }] } },
+    ] as any);
+    expect(map.get('early')?.turn).toBe(1);
+  });
+
+  test('duplicate ids resolve last-wins', () => {
+    const map = buildToolResultLocations([
+      { type: 'user', timestamp: 't1', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'd', content: 'first' }] } },
+      { type: 'user', timestamp: 't2', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'd', content: 'second' }] } },
+    ] as any);
+    expect(map.get('d')?.content).toBe('second');
+    expect(map.get('d')?.turn).toBe(2);
   });
 });
 
