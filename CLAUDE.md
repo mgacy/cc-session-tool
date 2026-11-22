@@ -42,7 +42,7 @@ CLI entrypoint and command wiring live in `index.ts` using `citty`. Shared trans
 | `tokens` | Per-turn token usage timeline (optional cumulative mode) |
 | `messages` | Filtered, truncated message content by role/type/turn |
 | `slice` | Raw entries for a turn range |
-| `search` | Find sessions matching structured queries (tool, input, file, text, bash filters), scoped to the logical project plus associated Claude worktrees by default |
+| `search` | Find sessions matching structured queries (tool, input, output, failed, file, text, bash filters), scoped to the logical project plus associated Claude worktrees by default |
 | `subagents` | List subagents for a session with metadata |
 | `stats` | Corpus-wide aggregates from the SQLite transcript index: `stats tokens` (rollups, optional `--bucket day\|week`, `--by model\|session`) and `stats trajectories` (prev-tool/next-tool pair counts) |
 | `index` | SQLite index escape hatches: `index status` (path, counts, freshness) and `index rebuild` (drop and re-index; default scope all projects) |
@@ -52,6 +52,8 @@ All session-scoped commands accept a positional session identifier (UUID, UUID p
 The `list` and `search` commands are agent-first and worktree-aware by default. A scoped query from the logical project checkout includes associated Claude-managed worktree transcript directories. Use `list --main-only` only when you intentionally want to ignore worktree sessions. Search compares absolute main-tree file queries to worktree-local accesses by exact canonical path candidates first, then shared project-relative identity. Use `search --file <absolute-main-tree-path> --operation write` as the primary workflow for finding worktree writes to the same logical file; use `--all-projects` for broad audits, not routine worktree lookup.
 
 In `search --all-projects`, an explicit `--project <path>` is a query identity anchor for absolute file matching only. It must not be treated as a scan limit, and without it the command must not silently use CWD or `project_path_guess` as the authoritative project root for unrelated projects.
+
+`--output-match`/`--output-regex`/`--failed` match tool results and bind to the same call as other tool-call selectors; `--text` does not cover tool results.
 
 Use `search --file <path> --operation <read|edit|write|grep|glob>` to bind file-operation filtering to the same matching file access. Use `--origin` to return the earliest matching transcript write evidence for a file; this is transcript evidence, not VCS creation history. Use `--sort session-newest|match-earliest|match-newest|project` for deterministic ordering.
 

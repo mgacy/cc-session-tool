@@ -18,7 +18,7 @@ Match the user's intent to a command before reading flags. Most investigations a
 | List recent sessions (current project + its worktrees)          | `list`                |
 | Cross-project listing                                           | `list --all-projects` |
 | Index project transcript directories themselves                 | `projects`            |
-| Find which sessions touched a file, ran a tool, said a phrase   | `search`              |
+| Find which sessions touched a file, ran a tool, said a phrase, or saw an error/output | `search` |
 | Get a fast triage summary of one session                        | `summary`             |
 | See the turn-by-turn skeleton with tool/edit stats              | `shape`               |
 | Inspect tool calls with condensed inputs and outcomes           | `tools`               |
@@ -159,8 +159,25 @@ cc-session-tool search --tool Bash \
   --bucket day
 ```
 
+### "Which sessions hit error X?"
+
+```bash
+# Tool output is matched by --output-match, not --text; bound to the same Bash call
+cc-session-tool search --tool Bash --output-match "permission denied" --sort match-earliest
+
+# Or: Bash calls matching a command whose result failed
+cc-session-tool search --bash "bun test" --failed
+
+# Follow up on a tool_output evidence item: read the full result at result_turn
+cc-session-tool messages DA2738E3 --claude-project <session_ref.project> \
+  --turn <result_turn> --type tool_result --max-tool-result 4000
+```
+
+See `references/search.md` ("Tool output and failures") for binding rules, limits, and rejected combinations.
+
 ## Pitfalls to avoid
 
+- **`--text` does not search tool output.** Errors, refusals and tool results are matched by `--output-match` / `--output-regex` or `--failed`. An empty `--text` result is not evidence that something never happened. Output of user `!` commands is user text, so `--text` does match it.
 - **Don't read JSONL files directly.** Transcripts are huge; always go through the CLI.
 - **Don't rely on `project_path_guess`** for follow-up commands. Use `project` / `session_ref.project` with `--claude-project`.
 - **Don't pass `--operation` without `--file`** — the filter only binds when there's a matching file access to bind to.
