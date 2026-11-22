@@ -49,7 +49,7 @@ cc-session-tool list [flags]
 | `--min-lines <n>` | 0 | Sessions with at least N lines. |
 | `--include-subagents` | false | Adds `subagent_count` per session. |
 
-Output rows are sorted newest first. When multiple project contexts are scanned, rows include `project`, `project_path_guess` (display only), `project_role` (`main` / `worktree` / `global`), and `session_ref` for stable follow-up. `_meta.projects_scanned` / `_meta.projects_skipped` are always present; `--include-project-lists` adds the `included_projects` / `skipped_projects` arrays. See SKILL.md "Output envelope".
+Output rows are sorted newest first. With `--all-projects`, or when `_meta.projects_scanned` is greater than 1, rows include `project`, `project_path_guess` (display only), `project_role` (`main` / `worktree` / `global`), and `session_ref` for stable follow-up. `_meta.projects_scanned` / `_meta.projects_skipped` are always present; `--include-project-lists` adds the `included_projects` / `skipped_projects` arrays. See SKILL.md "Output envelope".
 
 ---
 

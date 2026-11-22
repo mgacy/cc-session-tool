@@ -119,7 +119,7 @@ Worktree / all-project responses add:
 
 Every response carries `_meta.projects_scanned` / `_meta.projects_skipped`; `--include-project-lists` adds the project arrays. See SKILL.md "Output envelope".
 
-`--origin` results add `matches.file_evidence` (the earliest matching write entry).
+`--origin` returns the session with the earliest matching write (one row unless `--last` raises it); its `matches.evidence` holds only that write evidence.
 
 ## Common recipes
 

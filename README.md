@@ -93,7 +93,7 @@ cc-session-tool list [--project <path>] [--main-only] [--all-projects] [--projec
 - `--claude-project` is accepted only by the session commands in the last row; `list` and `search` reject it, and `search` scopes the same way as `list`.
 - Don't turn `project_path_guess` into a `--project` value: it is display-only and lossy. With only a row's fields, use the raw-basename row. A repo-root path also covers that repo's Claude worktrees (`--main-only` skips them). A worktree path covers only that worktree; see **Worktree checkouts** above.
 
-**Output:** Sessions sorted by timestamp (newest first). When `--include-subagents` is set, each session includes a `subagent_count` field; otherwise the field is omitted entirely. Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated. When multiple project contexts are included, rows include `project`, `project_path_guess`, `project_role`, and `session_ref`; `_meta.projects_scanned` / `_meta.projects_skipped` are always present; see [Project coverage metadata](#project-coverage-metadata). `project_path_guess` is display-only; use raw `project` or `session_ref.project` with `--claude-project` on session commands (not `list`) for follow-up.
+**Output:** Sessions sorted by timestamp (newest first). When `--include-subagents` is set, each session includes a `subagent_count` field; otherwise the field is omitted entirely. Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated. With `--all-projects`, or when `_meta.projects_scanned` is greater than 1, rows include `project`, `project_path_guess`, `project_role`, and `session_ref`. `_meta.projects_scanned` / `_meta.projects_skipped` are always present; see [Project coverage metadata](#project-coverage-metadata). `project_path_guess` is display-only; use raw `project` or `session_ref.project` with `--claude-project` on session commands (not `list`) for follow-up.
 
 ```json
 {
@@ -568,11 +568,25 @@ cc-session-tool search --bash "bun test" --failed
       "branch": "feature/auth",
       "timestamp": "2026-03-07T22:31:26.359Z",
       "slug": "snuggly-floating-barto",
+      "model": "claude-sonnet-4-5",
+      "session_ref": {
+        "session_id": "DA2738E3-...",
+        "project": "-workspace-app--claude-worktrees-feature-a"
+      },
       "matches": {
-        "tools": ["Read", "Edit"],
-        "files": ["/workspace/app/src/auth.ts"],
-        "normalized_files": ["src/auth.ts"],
+        "tools": [],
+        "files": ["/workspace/app/.claude/worktrees/feature-a/src/auth.ts"],
+        "turns": [6, 8],
         "evidence": [
+          {
+            "kind": "file",
+            "rawPath": "/workspace/app/.claude/worktrees/feature-a/src/auth.ts",
+            "logicalPath": "src/auth.ts",
+            "operation": "read",
+            "turn": 6,
+            "block_index": 0,
+            "timestamp": "2026-03-07T22:33:00.000Z"
+          },
           {
             "kind": "file",
             "rawPath": "/workspace/app/.claude/worktrees/feature-a/src/auth.ts",
@@ -584,8 +598,11 @@ cc-session-tool search --bash "bun test" --failed
           }
         ],
         "operations": ["read", "edit"],
-        "turns": [6, 8]
-      }
+        "normalized_files": ["src/auth.ts"]
+      },
+      "project": "-workspace-app--claude-worktrees-feature-a",
+      "project_path_guess": "/workspace/app//claude/worktrees/feature/a",
+      "project_role": "worktree"
     }
   ],
   "_meta": { "total": 1, "returned": 1, "hasMore": false, "projects_scanned": 3, "projects_skipped": 0 }
@@ -610,7 +627,7 @@ A `tool_output` evidence item:
 }
 ```
 
-With `--aggregate count-per-session`, `data` is a per-session summary instead of full match rows:
+With `--aggregate count-per-session`, `data` is a per-session summary instead of full match rows (no `session_ref`; worktree and all-project rows keep `project`, `project_path_guess` and `project_role`):
 
 ```json
 {
@@ -624,7 +641,10 @@ With `--aggregate count-per-session`, `data` is a per-session summary instead of
       "counts": { "tool_inputs": 3 },
       "sample_matches": [
         { "tool": "Bash", "input_summary": "bun test index.test.ts", "turn": 9 }
-      ]
+      ],
+      "project": "-workspace-app--claude-worktrees-feature-a",
+      "project_path_guess": "/workspace/app//claude/worktrees/feature/a",
+      "project_role": "worktree"
     }
   ],
   "_meta": { "total": 1, "returned": 1, "hasMore": false, "projects_scanned": 3, "projects_skipped": 0 }
@@ -656,23 +676,35 @@ cc-session-tool tools DA2738E3 --claude-project -workspace-app--claude-worktrees
   "data": [
     {
       "session_id": "DA2738E3-...",
+      "branch": "feature/auth",
+      "timestamp": "2026-03-07T22:31:26.359Z",
+      "slug": "snuggly-floating-barto",
+      "model": "claude-sonnet-4-5",
       "session_ref": {
         "session_id": "DA2738E3-...",
         "project": "-workspace-app--claude-worktrees-feature-a"
       },
       "matches": {
+        "tools": [],
         "files": ["/workspace/app/.claude/worktrees/feature-a/src/auth.ts"],
-        "file_evidence": [
+        "turns": [6],
+        "evidence": [
           {
+            "kind": "file",
             "rawPath": "/workspace/app/.claude/worktrees/feature-a/src/auth.ts",
             "logicalPath": "src/auth.ts",
             "operation": "write",
             "turn": 6,
+            "block_index": 0,
             "timestamp": "2026-03-07T22:33:00.000Z"
           }
         ],
-        "turns": [6]
-      }
+        "operations": ["write"],
+        "normalized_files": ["src/auth.ts"]
+      },
+      "project": "-workspace-app--claude-worktrees-feature-a",
+      "project_path_guess": "/workspace/app//claude/worktrees/feature/a",
+      "project_role": "worktree"
     }
   ],
   "_meta": { "total": 1, "returned": 1, "hasMore": false, "projects_scanned": 3, "projects_skipped": 0 }
