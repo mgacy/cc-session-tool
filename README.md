@@ -215,7 +215,7 @@ Tool call log with condensed input summaries and outcome detection.
 cc-session-tool tools <session> [--project <path> | --claude-project <project>] [--name <tool>|--name-match <text>] [--input-match <text>|--input-regex <regex>] [--failed] [--turn <N|N-M>] [--max-outcome <n>]
 ```
 
-`--input-match` and `--input-regex` search the raw structured tool input, including values omitted or truncated in `input_summary`. `--name` and `--name-match` are mutually exclusive, as are the two input filters. `--max-outcome <n>` sets how many characters of an error's text `outcome` shows (default 60; `0` shows only the marker for errors with text). It never changes `outcome_hash`.
+`--input-match` and `--input-regex` search the raw structured tool input, including values omitted or truncated in `input_summary`. `--name` and `--name-match` are mutually exclusive, as are the two input filters. `--max-outcome <n>` sets how many characters of error text `outcome` shows (default 60).
 
 **Output:**
 
@@ -270,12 +270,12 @@ cc-session-tool tools <session> [--project <path> | --claude-project <project>] 
 | `Read`         | `file='<basename>' offset=N limit=N`            |
 | `Edit`         | `file='<basename>' old=(N chars) new=(N chars)` |
 | `Write`        | `file='<basename>' (N chars)`                   |
-| `Bash`         | First 40 + last 40 chars of the command, joined by `...[truncated, N chars]...` when longer than 80 |
+| `Bash`         | First 40 + last 40 chars of command             |
 | `Glob`         | `pattern='...' path='...'`                      |
-| `Agent`/`Task` | `prompt='<first 80>...[truncated, N chars]'` (marker inside the quotes when longer than 80) |
+| `Agent`/`Task` | `prompt='...'` (first 80 chars)                 |
 | `WebFetch`     | `url='...'`                                     |
 | `WebSearch`    | `query='...'`                                   |
-| Other          | First 80 chars of JSON-encoded input, then `...[truncated, N chars]` when longer |
+| Other          | First 80 chars of JSON-encoded input            |
 
 **Outcome values:**
 
@@ -284,31 +284,20 @@ cc-session-tool tools <session> [--project <path> | --claude-project <project>] 
 | `success`           | Non-empty content                                     |
 | `success (N lines)` | N lines of content                                    |
 | `empty`             | Empty content                                         |
-| `error: <message>`  | Error: first 60 chars (`--max-outcome`), then `...[truncated, N chars]` when longer |
+| `error: <message>`  | Error (first 60 chars)                                |
 | `no_result`         | No matching `tool_result` found (interrupted session) |
 
-In every truncation marker, `N` is the full original length.
+**`duration_ms`:** Milliseconds between assistant entry and corresponding tool_result. `null` if timestamps are missing.
 
-**`duration_ms`:** Milliseconds between assistant entry and corresponding tool_result. `null` if timestamps are missing or the result was written before its `tool_use`.
+**`outcome_hash`:** A hash of the full error text, so errors whose truncated `outcome` strings match still differ here; `null` for non-errors.
 
-**`outcome_hash`:** The first 12 hex chars of SHA-256 over the UTF-8 bytes of the full error text. It is `null` unless `outcome` starts with `error:`, and it does not depend on `--max-outcome`.
-
-- Identical error text always gives the same hash.
-- A different hash means different text, not necessarily a different cause: errors with embedded timings, paths or line numbers get one hash per row. Read the text (`--max-outcome` or the follow-up recipe below) before naming failure categories.
-- "No text" errors (e.g. image-only content) share the empty-string hash `e3b0c44298fc`.
-- To group rows: `jq '.data.tool_calls | group_by(.outcome_hash)'`.
-
-**`tool_use_id` and `result_turn`:** `tool_use_id` is the call's id, also present on the matching `tool_result` in `messages`; it is `null` if the block has no id. `result_turn` is the turn holding that result, numbered like `turn`; it is `null` when there is no result. `result_turn` can be smaller than `turn`, because a result is occasionally written before its `tool_use`.
-
-To read a call's full result, reuse the exact session selector you passed to `tools`, including `:<agent-id>` for a subagent (`result_turn` is numbered within the subagent transcript, so dropping the suffix silently reads the parent's turn), and the same `--project` / `--claude-project`:
+To read a call's full result, use the same selector and project flag you gave `tools`. For a subagent that includes `:<agent-id>`; without it, `result_turn` silently points into the parent transcript.
 
 ```bash
 cc-session-tool messages <session>[:<agent-id>] [--project <path> | --claude-project <project>] --turn <result_turn> --type tool_result --max-tool-result <N>
 ```
 
-Pick the block whose `tool_use_id` matches. Take `N` from the outcome's `...[truncated, N chars]` marker so the full text arrives in one call. Rows without a marker (e.g. `success (N lines)`) give no `N`, and omitting `--max-tool-result` truncates at 200 chars; for these use `slice <session>[:<agent-id>] --turn <result_turn>`, which does not truncate, and pick the `tool_result` block by `tool_use_id`. `slice` returns the whole turn raw, including every parallel `tool_result`, so a busy turn can be large. An error whose outcome has no marker needs no follow-up: its `outcome` already holds the full text. A call's full input is reachable via `slice <session>[:<agent-id>] --turn <turn>`.
-
-For long sessions, narrow with `--failed`, `--name` or `--turn`, and prefer the follow-up recipe over a large `--max-outcome`. See [Output Format](#output-format) for output-size limits.
+Take `N` (the full length) from the outcome's `...[truncated, N chars]` marker, and pick the block whose `tool_use_id` matches.
 
 ---
 
@@ -526,7 +515,7 @@ cc-session-tool search [--project <path>] [--all-projects] [--project-glob <patt
 | `--all-projects` | false   | Search every top-level Claude project directory under `~/.claude/projects` for broad audits. Without an explicit `--project`, absolute file queries do not infer a logical project anchor from CWD or `project_path_guess`. |
 | `--project-glob` | —       | With `--all-projects`, filter by raw Claude project basename or display-only `project_path_guess`. Supports `*` and `?`. |
 | `--tool`         | —       | Match tool names by case-insensitive substring. |
-| `--input-match`  | —       | Match raw structured tool input by case-insensitive substring, including fields omitted or truncated by `input_summary`. Evidence and sample `input_summary` values use the same per-tool formats as [`tools`](#tools-session). |
+| `--input-match`  | —       | Match raw structured tool input by case-insensitive substring, including fields omitted or truncated by `input_summary`. |
 | `--input-regex`  | —       | Match raw structured tool input by regex. Mutually exclusive with `--input-match`. |
 | `--output-match` | —       | Match tool result text by case-insensitive substring. Binds to the same tool call as the other tool-call selectors (see below). |
 | `--output-regex` | —       | Match tool result text by case-sensitive regex. Mutually exclusive with `--output-match`. |
@@ -556,7 +545,11 @@ At least one selector is required: `--tool`, raw-input, output (`--output-match`
 
 **Tool output and failures.** With `--output-match`, `--output-regex` or `--failed`, the tool-call selectors (`--tool`, `--input-*`, `--bash*`, `--file`, `--operation`) must match the same call whose result matches, and evidence lists only those calls; `--tool Bash --output-match X` ignores a `Read` that returned `X`. `--text*`, `--intent-*`, `--branch` and date filters still apply session-wide. `count-per-session` then counts the matched calls. Matching covers the text `messages --type tool_result` shows; outputs persisted to disk match only on their 2 KB preview, and API errors are not tool results. `--failed` alone matches about half of all sessions, so pair it with another selector.
 
-Each matched call yields `tool_output` evidence (example below). Its `turn` is the call's turn, as in `tools`; the result is at `result_turn`. Read it in full with the follow-up recipe in the [`tools`](#tools-session) section, using `--claude-project <session_ref.project>` and the selector `<session_id>`, or `<session_id>:<agent_id>` when the evidence has an `agent_id` (a subagent hit; without the suffix the recipe silently reads the parent's turn). `tool_output` evidence has no truncation marker, so use the recipe's `slice` branch.
+Each matched call yields `tool_output` evidence (example below). Its `turn` is the call's turn, as in `tools`; the result is at `result_turn`. Read it in full with:
+
+```bash
+cc-session-tool messages <session>[:<agent_id>] --claude-project <session_ref.project> --turn <result_turn> --type tool_result --max-tool-result 4000
+```
 
 For absolute `--file` queries inside the logical project, search compares exact canonical path candidates first, then exact project-relative logical identity. For example, `/workspace/app/src/auth.ts` in the main checkout matches `/workspace/app/.claude/worktrees/feature-a/src/auth.ts` from a related Claude worktree as the same logical file `src/auth.ts`. If a worktree path reaches the same file through a symlinked directory, the realpath candidate can also match even when the lexical absolute paths differ. If both sides normalize to logical paths and they differ, search does not fall back to substring matching.
 
@@ -932,8 +925,6 @@ Errors:
   "error": { "code": "NOT_FOUND", "message": "..." }
 }
 ```
-
-Any command's default output can exceed Claude Code's Bash capture limit of about 30,000 characters, so narrow long results with the command's filters.
 
 ### Exit Codes
 
