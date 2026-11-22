@@ -173,7 +173,7 @@ export function extractSessionIntent(entries: SessionEntry[], metadata?: Pick<Se
   }
 
   const blocks = normalizedBlocks(entries);
-  const firstUserText = blocks.find(block => block.role === 'user' && block.block.type === 'text' && typeof block.block.text === 'string');
+  const firstUserText = blocks.find(block => block.role === 'user' && block.block?.type === 'text' && typeof block.block.text === 'string');
   if (firstUserText?.block.text) {
     const text = firstUserText.block.text;
     const firstPromptToken = text.trim().split(/\s+/).find(Boolean);

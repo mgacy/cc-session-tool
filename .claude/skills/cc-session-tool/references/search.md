@@ -121,7 +121,7 @@ Default full-match rows include, where relevant:
 - `session_id`, `branch`, `timestamp`, `slug`
 - `matches.tools`, `matches.files`, `matches.normalized_files`
 - `matches.evidence` — array of evidence items `{ kind, rawPath, logicalPath, operation, turn, block_index, timestamp }`
-- `tool_output` evidence (bound mode) adds `tool_use_id`, `result_turn`, `result_timestamp`, `is_error` and a `snippet` (omitted when empty). Its `turn` / `block_index` / `timestamp` describe the **`tool_use`** call, like every other evidence kind; `result_turn` / `result_timestamp` locate the `tool_result`. `matches.turns` holds call turns.
+- `tool_output` evidence (bound mode) adds `tool_use_id`, `result_turn`, `result_timestamp`, `is_error` and a `snippet` (omitted when empty). Its `turn` / `block_index` / `timestamp` describe the **`tool_use`** call, like every other evidence kind; `result_turn` / `result_timestamp` locate the `tool_result`. `matches.turns` holds call turns, and `matches.tools` lists the tools of the matched calls even without `--tool`.
 - `matches.operations`, `matches.turns`
 
 Worktree / all-project responses add:

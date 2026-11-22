@@ -2475,6 +2475,30 @@ describe('scanSearchTarget result selectors', () => {
     });
   });
 
+  test('null content blocks do not drop the session under --failed, --text, or both', async () => {
+    const root = join(tmpdir(), uniqueTempName('cc-session-tool-null-block-scan'));
+    mkdirSync(root, { recursive: true });
+    try {
+      const nullSessionId = '33333333-4444-4555-8666-777777777777';
+      const filePath = join(root, `${nullSessionId}.jsonl`);
+      writeFileSync(filePath, [
+        JSON.stringify({ type: 'user', sessionId: nullSessionId, timestamp: '2026-03-01T10:00:00.000Z', message: { role: 'user', content: [null, { type: 'text', text: 'please run things' }] } }),
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: '2026-03-01T10:01:00.000Z',
+          message: { role: 'assistant', content: [null, { type: 'text', text: 'running now' }, { type: 'tool_use', name: 'Bash', id: 'n_call', input: { command: 'false' } }] },
+        }),
+        JSON.stringify({ type: 'user', timestamp: '2026-03-01T10:01:05.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'n_call', is_error: true, content: 'boom' }] } }),
+      ].join('\n') + '\n');
+      const target = { filePath, sessionId: nullSessionId };
+      for (const args of [{ failed: true }, { failed: true, text: 'running' }, { text: 'running' }]) {
+        expect((await scanSearchTarget(target, args, null)).match?.session_id).toBe(nullSessionId);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('empty outputMatch does not enable bound mode', async () => {
     await withFixture(async target => {
       const { match } = await scanSearchTarget(target, { tool: 'Bash', outputMatch: '' }, null);
@@ -4830,6 +4854,7 @@ describe('search tool output integration', () => {
   const OUTPUT_CLAUDE_DIR = join(claudeProjectsRoot(OUTPUT_FIXTURE_HOME), mangleProjectPath(OUTPUT_PROJECT));
   const OUT_A = 'a0a0a0a0-0000-4000-8000-00000000000a';
   const OUT_B = 'b0b0b0b0-0000-4000-8000-00000000000b';
+  const OUT_C = 'c0c0c0c0-0000-4000-8000-00000000000c';
   const run = (args: string[]) => runCli(['search', ...args, '--project', OUTPUT_PROJECT], { HOME: OUTPUT_FIXTURE_HOME });
   const search = async (args: string[]) => parseOutput((await run(args)).stdout);
   const ids = (result: any): string[] => result.data.map((s: any) => s.session_id);
@@ -4883,6 +4908,12 @@ describe('search tool output integration', () => {
       JSON.stringify({ type: 'assistant', timestamp: '2026-04-03T09:00:00.000Z', cwd: OUTPUT_PROJECT, message: { role: 'assistant', content: [use('Bash', 'late_bash', { command: 'echo late' })] } }),
       JSON.stringify({ type: 'user', timestamp: '2026-04-03T09:00:05.000Z', cwd: OUTPUT_PROJECT, message: { role: 'user', content: [result('late_bash', 'SHARED_NEEDLE seen late')] } }),
     ].join('\n') + '\n');
+
+    writeFileSync(join(OUTPUT_CLAUDE_DIR, `${OUT_C}.jsonl`), [
+      JSON.stringify({ type: 'user', sessionId: OUT_C, timestamp: '2026-04-02T12:00:00.000Z', cwd: OUTPUT_PROJECT, gitBranch: 'main', message: { role: 'user', content: 'Find docs' } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-04-02T12:01:00.000Z', cwd: OUTPUT_PROJECT, message: { role: 'assistant', content: [use('Glob', 'glob_hit', { pattern: '**/*.md' }), use('Glob', 'glob_empty', { pattern: '**/*.rst' })] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-04-02T12:01:05.000Z', cwd: OUTPUT_PROJECT, message: { role: 'user', content: [result('glob_hit', 'README.md'), result('glob_empty', '')] } }),
+    ].join('\n') + '\n');
   });
 
   afterAll(() => {
@@ -4890,20 +4921,29 @@ describe('search tool output integration', () => {
   });
 
   describe('binding', () => {
+    // Each half matches OUT_A on its own, on different calls; only the bound combination must miss it.
+    const expectBoundMiss = async (callSelector: string[], resultSelector: string[]) => {
+      expect(ids(await search(callSelector))).toContain(OUT_A);
+      expect(ids(await search(resultSelector))).toContain(OUT_A);
+      const bound = await search([...callSelector, ...resultSelector]);
+      expect(bound.ok).toBe(true);
+      expect(ids(bound)).not.toContain(OUT_A);
+    };
+
     test('--bash with --output-match binds to the same call', async () => {
-      expect(ids(await search(['--bash', 'npm install', '--output-match', 'FAIL']))).not.toContain(OUT_A);
+      await expectBoundMiss(['--bash', 'npm install'], ['--output-match', 'FAIL']);
     });
 
     test('--input-match with --failed binds to the same call', async () => {
-      expect(ids(await search(['--input-match', 'npm install', '--failed']))).not.toContain(OUT_A);
+      await expectBoundMiss(['--input-match', 'npm install'], ['--failed']);
     });
 
     test('--file with --failed binds to the same call', async () => {
-      expect(ids(await search(['--file', 'src/x.ts', '--failed']))).not.toContain(OUT_A);
+      await expectBoundMiss(['--file', 'src/x.ts'], ['--failed']);
     });
 
     test('--tool Read --failed does not match a successful read or a read with no result', async () => {
-      expect(ids(await search(['--tool', 'Read', '--failed']))).not.toContain(OUT_A);
+      await expectBoundMiss(['--tool', 'Read'], ['--failed']);
     });
 
     test('--file src/y.ts --failed matches with exactly file + tool_output evidence for the failed edit', async () => {
@@ -4954,6 +4994,15 @@ describe('search tool output integration', () => {
       expect(ids(await search(['--output-regex', 'expected \\d']))).toContain(OUT_A);
       expect(ids(await search(['--output-regex', 'EXPECTED']))).not.toContain(OUT_A);
       expect(ids(await search(['--output-match', 'EXPECTED']))).toContain(OUT_A);
+    });
+
+    test('--failed matches a non-error empty result and omits the empty snippet', async () => {
+      const r = await search(['--tool', 'Glob', '--failed']);
+      expect(ids(r)).toEqual([OUT_C]);
+      const outputs = evidenceOf(r, OUT_C).filter(e => e.kind === 'tool_output');
+      expect(outputs).toHaveLength(1);
+      expect(outputs[0]).toMatchObject({ tool_use_id: 'glob_empty', tool: 'Glob', is_error: false, result_turn: 3 });
+      expect(outputs[0]).not.toHaveProperty('snippet');
     });
 
     test('--failed snippet is the leading output text', async () => {

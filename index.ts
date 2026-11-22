@@ -72,6 +72,7 @@ import {
   safeInputSummary,
   stableJsonStringify as toolLogStableJsonStringify,
   type ToolResultInfo,
+  type ToolResultLocation,
 } from './src/tool-log.ts';
 import {
   openIndexDb,
@@ -2009,7 +2010,7 @@ async function scanSearchTranscript(target: SearchTarget, args: PreparedSearchAr
 
     for (const normalized of normalizedBlocks(entries)) {
       if (args.textMatcher && (textRole === 'all' || normalized.role === textRole)) {
-        if (normalized.block.type === 'text' && typeof normalized.block.text === 'string' && testTextMatcher(args.textMatcher, normalized.block.text)) {
+        if (normalized.block?.type === 'text' && typeof normalized.block.text === 'string' && testTextMatcher(args.textMatcher, normalized.block.text)) {
           matchedEvidence.push(addEvidenceProvenance({
             kind: 'text',
             turn: normalized.turn,
@@ -2020,7 +2021,7 @@ async function scanSearchTranscript(target: SearchTarget, args: PreparedSearchAr
           }, target));
           matchedTurns.add(normalized.turn);
         }
-        if (normalized.block.type === 'thinking' && typeof normalized.block.thinking === 'string' && testTextMatcher(args.textMatcher, normalized.block.thinking)) {
+        if (normalized.block?.type === 'thinking' && typeof normalized.block.thinking === 'string' && testTextMatcher(args.textMatcher, normalized.block.thinking)) {
           matchedEvidence.push(addEvidenceProvenance({
             kind: 'thinking',
             turn: normalized.turn,
@@ -2075,7 +2076,7 @@ async function scanSearchTranscript(target: SearchTarget, args: PreparedSearchAr
         let bashOkMemo: boolean | undefined;
         const bashOk = (): boolean => {
           if (bashOkMemo === undefined) {
-            const command = name === 'Bash' ? (input as Record<string, any>)?.command : undefined;
+            const command = name === 'Bash' ? (input as Record<string, any>).command : undefined;
             bashOkMemo = !args.bashMatcher || (typeof command === 'string' && testTextMatcher(args.bashMatcher, command));
           }
           return bashOkMemo;
@@ -2105,7 +2106,7 @@ async function scanSearchTranscript(target: SearchTarget, args: PreparedSearchAr
           return fileState;
         };
 
-        let boundResult: ReturnType<NonNullable<typeof resultLocations>['get']>;
+        let boundResult: ToolResultLocation | undefined;
         let boundSnippet: string | undefined;
         if (bound) {
           // Cheap tests first; output text is never extracted for a call that name/bash/--failed rejected.
@@ -2446,8 +2447,8 @@ const searchCommand = defineCommand({
     tool: { type: 'string', description: 'Sessions using a specific tool (case-insensitive substring)' },
     'input-match': { type: 'string', description: 'Sessions with raw structured tool input containing a case-insensitive substring' },
     'input-regex': { type: 'string', description: 'Sessions with raw structured tool input matching a regex' },
-    'output-match': { type: 'string', description: 'Tool result text contains substring (case-insensitive); binds to the --tool/--input/--bash/--file call' },
-    'output-regex': { type: 'string', description: 'Tool result text matches regex; binds to the --tool/--input/--bash/--file call' },
+    'output-match': { type: 'string', description: 'Tool result text contains substring (case-insensitive); binds to the --tool/--input-*/--bash*/--file call' },
+    'output-regex': { type: 'string', description: 'Tool result text matches regex; binds to the --tool/--input-*/--bash*/--file call' },
     failed: { type: 'boolean', description: 'Tool call failed (is_error or empty result, as tools --failed); binds like --output-match', default: false },
     file: { type: 'string', description: 'Sessions that touched a file (substring match on path)' },
     text: { type: 'string', description: 'Search user/assistant text and thinking (substring); does NOT search tool output, use --output-match' },
