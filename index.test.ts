@@ -3006,6 +3006,13 @@ describe('list integration', () => {
     expect(result._meta).not.toHaveProperty('included_projects');
     expect(result._meta).not.toHaveProperty('skipped_projects');
     expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_6]);
+
+    // In all-projects mode, scanned + skipped accounts for every project directory.
+    const unfiltered = await runCli(['list', '--all-projects']);
+    expect(unfiltered.exitCode).toBe(0);
+    const unfilteredMeta = parseOutput(unfiltered.stdout)._meta;
+    expect(unfilteredMeta.projects_skipped).toBe(0);
+    expect(result._meta.projects_scanned + result._meta.projects_skipped).toBe(unfilteredMeta.projects_scanned);
   });
 
   test('list --project-glob without --all-projects returns invalid args', async () => {
@@ -3079,7 +3086,9 @@ describe('projects integration', () => {
 
   test('projects --project --glob reports what the glob excluded', async () => {
     const args = ['projects', '--project', RELATED_PROJECT, '--glob', relatedWorktreeDirName];
-    const result = parseOutput((await runCli(args)).stdout);
+    const run = await runCli(args);
+    expect(run.exitCode).toBe(0);
+    const result = parseOutput(run.stdout);
     expect(result.ok).toBe(true);
     expect(result.data.map((p: any) => p.project)).toEqual([relatedWorktreeDirName]);
     expect(result._meta.projects_scanned).toBe(1);
@@ -3087,7 +3096,10 @@ describe('projects integration', () => {
     expect(result._meta).not.toHaveProperty('included_projects');
     expect(result._meta).not.toHaveProperty('skipped_projects');
 
-    const withLists = parseOutput((await runCli([...args, '--include-project-lists'])).stdout);
+    const runWithLists = await runCli([...args, '--include-project-lists']);
+    expect(runWithLists.exitCode).toBe(0);
+    const withLists = parseOutput(runWithLists.stdout);
+    expect(withLists.ok).toBe(true);
     expect(withLists._meta.projects_scanned).toBe(1);
     expect(withLists._meta.projects_skipped).toBe(2);
     expect(withLists._meta.included_projects.map((p: any) => p.project)).toEqual([relatedWorktreeDirName]);
@@ -7052,7 +7064,7 @@ describe('real command tree (resolver + parser)', () => {
     expect(Object.keys(LEAF_REQUIRED_ARGS)).toHaveLength(15);
   });
 
-  // Leaves that select projects and therefore accept --include-project-lists; grows as each leaf is wired.
+  // Exactly the project-selecting leaves accept --include-project-lists; every session leaf rejects it.
   const PROJECT_LIST_LEAF_PATHS = new Set(['list', 'projects', 'search', 'index status', 'index rebuild', 'stats tokens', 'stats trajectories']);
 
   for (const [leafPath, required] of Object.entries(LEAF_REQUIRED_ARGS)) {
@@ -7061,7 +7073,7 @@ describe('real command tree (resolver + parser)', () => {
       const resolved = await resolveCliCommand(cliMain, [...leafPath.split(' '), ...required, '--include-project-lists']);
       const parse = () => parseCommandArgs(resolved.rawArgs, resolved.argsDef, leafPath);
       if (accepts) {
-        expect(parse).not.toThrow();
+        expect(parse()['include-project-lists']).toBe(true);
       } else {
         expect(parse).toThrow(CliArgsError);
       }

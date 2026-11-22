@@ -468,6 +468,7 @@ type ErrorCode = keyof typeof ERROR_CODES;
 const SEARCH_OPERATIONS: SearchOperation[] = ['read', 'edit', 'write', 'grep', 'glob'];
 const SEARCH_SORT_MODES: SearchSortMode[] = ['session-newest', 'match-earliest', 'match-newest', 'project'];
 const SEARCH_SCAN_CONCURRENCY = 50;
+// Must stay above listCommand: defineCommand() spreads it at module load.
 const INCLUDE_PROJECT_LISTS_ARG = {
   'include-project-lists': {
     type: 'boolean',
@@ -2774,10 +2775,10 @@ function indexMeta(base: ResponseMeta, handle: IndexHandle, scanMeta: ProjectSca
 }
 
 const INDEX_SCOPE_ARGS = {
-  ...INCLUDE_PROJECT_LISTS_ARG,
   project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
   'all-projects': { type: 'boolean', description: 'Operate on all Claude project directories', default: false },
   db: { type: 'string', description: 'Index database path (default: CC_SESSION_TOOL_DB or the user cache directory)' },
+  ...INCLUDE_PROJECT_LISTS_ARG,
 } as const;
 
 const indexStatusCommand = defineCommand({
