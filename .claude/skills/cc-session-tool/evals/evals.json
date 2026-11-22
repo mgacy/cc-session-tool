@@ -11,8 +11,8 @@
     {
       "id": 1,
       "name": "subagent-investigation",
-      "prompt": "There's a Claude Code session in this project (the current working directory) whose UUID starts with c2ebf50e. It spawned a bunch of subagents and I want to audit them. For each subagent, tell me: its agent_id, what it was asked to do, how many tool calls it made, and whether any of its tool calls errored. Don't fix anything — just report.",
-      "expected_output": "Lists every subagent of session c2ebf50e, with agent_id, description, tool count, and a flag for whether any tool errored. Uses subagents + tools/shape with colon notation (e.g., c2ebf50e:<agent-id>), not direct file reads.",
+      "prompt": "I want to audit the subagents from the most recent Claude Code session in this project (the current working directory) that spawned any. Tell me which session that is (its UUID), then for each subagent tell me: its agent_id, what it was asked to do, how many tool calls it made, and whether any of its tool calls errored. Don't fix anything — just report.",
+      "expected_output": "Finds the most recent session in the project with subagent_count > 0 (e.g., via list --include-subagents) and reports its UUID. Lists every subagent of that session, with agent_id, description, tool count, and a flag for whether any tool errored. Uses subagents + tools/shape with colon notation (<session>:<agent-id>), not direct file reads.",
       "files": []
     },
     {
