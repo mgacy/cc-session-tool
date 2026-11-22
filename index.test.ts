@@ -48,12 +48,16 @@ import {
   aggregateCounterRows,
   attachCounterTranscriptResults,
   bucketCounterRows,
+  evaluateResultSelectors,
   evidenceTimestamps,
+  matchedToolCalls,
   parseCounterArgs,
   parseRegexMatcher,
   parseSubstringMatcher,
   snippetForMatch,
   testTextMatcher,
+  toolInputSamplesFromEvidence,
+  type SearchEvidence,
   type SearchMatch,
   type SearchMeta,
 } from './src/search.ts';
@@ -615,6 +619,116 @@ describe('buildToolResultLocations', () => {
 // ============================================================================
 // parseIntArg
 // ============================================================================
+
+describe('evaluateResultSelectors', () => {
+  const ok = (content: any, is_error = false) => ({ is_error, content, result_ts: '2026-04-01T10:02:00Z' });
+
+  test('matcher only: substring matches case-insensitively and returns a snippet', () => {
+    const r = evaluateResultSelectors(ok('Build FAILED here'), { outputMatcher: parseSubstringMatcher('failed'), failed: false });
+    expect(r).toEqual({ matched: true, snippet: 'Build FAILED here' });
+    expect(evaluateResultSelectors(ok('all good'), { outputMatcher: parseSubstringMatcher('failed'), failed: false })).toEqual({ matched: false });
+  });
+
+  test('matcher only: regex is case-sensitive', () => {
+    const matcher = parseRegexMatcher('FAIL \\d', '--output-regex');
+    expect(evaluateResultSelectors(ok('FAIL 3'), { outputMatcher: matcher, failed: false }).matched).toBe(true);
+    expect(evaluateResultSelectors(ok('fail 3'), { outputMatcher: matcher, failed: false }).matched).toBe(false);
+  });
+
+  test('failed only: matches is_error results and uses the leading text as snippet', () => {
+    const r = evaluateResultSelectors(ok('old_string not found', true), { outputMatcher: null, failed: true });
+    expect(r).toEqual({ matched: true, snippet: 'old_string not found' });
+    expect(evaluateResultSelectors(ok('fine'), { outputMatcher: null, failed: true })).toEqual({ matched: false });
+  });
+
+  test('failed only: truncates the snippet to the evidence window', () => {
+    const long = 'x'.repeat(500);
+    const r = evaluateResultSelectors(ok(long, true), { outputMatcher: null, failed: true });
+    expect(r.matched && r.snippet?.length).toBe(200);
+  });
+
+  test('both selectors are ANDed', () => {
+    const selectors = { outputMatcher: parseSubstringMatcher('boom'), failed: true };
+    expect(evaluateResultSelectors(ok('boom', true), selectors).matched).toBe(true);
+    expect(evaluateResultSelectors(ok('boom', false), selectors).matched).toBe(false);
+    expect(evaluateResultSelectors(ok('other', true), selectors).matched).toBe(false);
+  });
+
+  test('missing result never matches, even for --failed', () => {
+    expect(evaluateResultSelectors(undefined, { outputMatcher: null, failed: true })).toEqual({ matched: false });
+    expect(evaluateResultSelectors(undefined, { outputMatcher: parseSubstringMatcher('x'), failed: false })).toEqual({ matched: false });
+  });
+
+  test('empty failed output yields an undefined snippet', () => {
+    const r = evaluateResultSelectors(ok('', false), { outputMatcher: null, failed: true });
+    expect(r).toEqual({ matched: true, snippet: undefined });
+    expect(r.matched && 'snippet' in r && r.snippet).toBeUndefined();
+  });
+
+  test('snippet is a 200-char window centered on the match', () => {
+    const text = `${'a'.repeat(400)}NEEDLE${'b'.repeat(400)}`;
+    const r = evaluateResultSelectors(ok(text), { outputMatcher: parseSubstringMatcher('needle'), failed: false });
+    expect(r.matched).toBe(true);
+    if (r.matched) {
+      expect(r.snippet?.length).toBe(200);
+      expect(r.snippet).toContain('NEEDLE');
+      expect(r.snippet?.indexOf('NEEDLE')).toBeGreaterThan(90);
+      expect(r.snippet?.indexOf('NEEDLE')).toBeLessThan(105);
+    }
+  });
+
+  test('array content and malformed sub-blocks do not throw', () => {
+    const matcher = parseSubstringMatcher('hello');
+    expect(evaluateResultSelectors(ok([{ type: 'text', text: 'hello world' }]), { outputMatcher: matcher, failed: false }).matched).toBe(true);
+    expect(evaluateResultSelectors(ok([null, {}] as any), { outputMatcher: matcher, failed: false }).matched).toBe(false);
+    expect(evaluateResultSelectors(ok([null] as any, true), { outputMatcher: null, failed: true })).toEqual({ matched: true, snippet: undefined });
+  });
+});
+
+describe('matchedToolCalls with toolOutput', () => {
+  const ev = (kind: SearchEvidence['kind'], turn: number, block_index: number, agent_id?: string): SearchEvidence => ({
+    kind, turn, block_index, timestamp: null, tool: 'Bash', input_summary: 'cmd', ...(agent_id !== undefined ? { agent_id } : {}),
+  });
+
+  test('tool_output alone returns one item per call', () => {
+    const out = matchedToolCalls([ev('tool_output', 2, 0), ev('tool_output', 2, 1), ev('tool_input', 4, 0)], { toolInput: false, bash: false, toolOutput: true });
+    expect(out.map(e => [e.turn, e.block_index])).toEqual([[2, 0], [2, 1]]);
+    expect(out.every(e => e.kind === 'tool_output')).toBe(true);
+  });
+
+  test('intersects tool_output with tool_input and bash by call key', () => {
+    const evidence = [
+      ev('tool_input', 2, 0), ev('bash', 2, 0), ev('tool_output', 2, 0),
+      ev('tool_input', 2, 1), ev('tool_output', 2, 1),
+      ev('bash', 4, 0),
+    ];
+    expect(matchedToolCalls(evidence, { toolInput: true, bash: false, toolOutput: true }).map(e => [e.turn, e.block_index])).toEqual([[2, 0], [2, 1]]);
+    expect(matchedToolCalls(evidence, { toolInput: true, bash: true, toolOutput: true }).map(e => [e.turn, e.block_index])).toEqual([[2, 0]]);
+  });
+
+  test('agent_id is part of the call key', () => {
+    const evidence = [ev('tool_input', 2, 0, 'sub1'), ev('tool_output', 2, 0), ev('tool_output', 2, 0, 'sub2')];
+    expect(matchedToolCalls(evidence, { toolInput: true, bash: false, toolOutput: true })).toEqual([]);
+    const both = [ev('tool_input', 2, 0, 'sub1'), ev('tool_output', 2, 0, 'sub1')];
+    expect(matchedToolCalls(both, { toolInput: true, bash: false, toolOutput: true })).toHaveLength(1);
+  });
+
+  test('toolOutput omitted behaves as before', () => {
+    const out = matchedToolCalls([ev('tool_input', 2, 0), ev('tool_output', 2, 0)], { toolInput: true, bash: false });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.kind).toBe('tool_input');
+  });
+});
+
+describe('toolInputSamplesFromEvidence with tool_output', () => {
+  test('includes tool_output items with the ToolInputMatch shape', () => {
+    const samples = toolInputSamplesFromEvidence([
+      { kind: 'tool_output', turn: 2, block_index: 1, timestamp: null, tool: 'Bash', input_summary: 'npm test', tool_use_id: 'bash_b', result_turn: 3 },
+      { kind: 'text', turn: 1, block_index: 0, timestamp: null, tool: 'Ignored' },
+    ]);
+    expect(samples).toEqual([{ tool: 'Bash', input_summary: 'npm test', turn: 2 }]);
+  });
+});
 
 describe('parseIntArg', () => {
   test('undefined returns undefined', () => {
