@@ -1,6 +1,6 @@
 import type {
   SearchProjectContext,
-  PublicProjectRef,
+  ProjectScanMeta,
   ProjectRef,
   SearchOperation,
   SearchProjectRole,
@@ -128,11 +128,7 @@ export type ResponseMeta = {
   hasMore: boolean;
 };
 
-export type SearchMeta = ResponseMeta & {
-  projects_scanned?: number;
-  included_projects?: PublicProjectRef[];
-  skipped_projects?: PublicProjectRef[];
-};
+export type SearchMeta = ResponseMeta & ProjectScanMeta;
 
 export type SearchTranscriptTarget = {
   filePath: string;

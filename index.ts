@@ -3,6 +3,8 @@ import { defineCommand, runMain, type ParsedArgs } from 'citty';
 import { join, basename, dirname } from 'path';
 import { readdirSync, existsSync } from 'fs';
 import {
+  buildProjectScanMeta,
+  type ProjectScanMeta,
   absolutePathCandidatesFor as projectAbsolutePathCandidatesFor,
   buildScopedSearchScope as projectBuildScopedSearchScope,
   buildSearchSessionContext as projectBuildSearchSessionContext,
@@ -437,7 +439,6 @@ export type ProjectSelectionOptions = {
 
 export type ProjectSelection = {
   contexts: SearchProjectContext[];
-  includedProjects: PublicProjectRef[];
   skippedProjects: PublicProjectRef[];
 };
 
@@ -457,11 +458,7 @@ type PreparedSearchArgs = SearchArgs & {
   outputMatcher?: TextMatcher | null;
 };
 
-export type ListMeta = ResponseMeta & {
-  projects_scanned?: number;
-  included_projects?: PublicProjectRef[];
-  skipped_projects?: PublicProjectRef[];
-};
+export type ListMeta = ResponseMeta & ProjectScanMeta;
 
 // ============================================================================
 // Error Codes
@@ -479,6 +476,25 @@ type ErrorCode = keyof typeof ERROR_CODES;
 const SEARCH_OPERATIONS: SearchOperation[] = ['read', 'edit', 'write', 'grep', 'glob'];
 const SEARCH_SORT_MODES: SearchSortMode[] = ['session-newest', 'match-earliest', 'match-newest', 'project'];
 const SEARCH_SCAN_CONCURRENCY = 50;
+
+// ============================================================================
+// Project Coverage Metadata
+// ============================================================================
+
+// Declared before the first command whose `args` literal spreads it: those literals
+// are evaluated at module load, so a later `const` would throw (TDZ).
+const INCLUDE_PROJECT_LISTS_ARG = {
+  'include-project-lists': {
+    type: 'boolean',
+    description: 'Add full _meta.included_projects / _meta.skipped_projects arrays (default: only projects_scanned / projects_skipped counts)',
+    default: false,
+  },
+} as const;
+
+/** `args` must come from a command that declares INCLUDE_PROJECT_LISTS_ARG; otherwise this does not type-check. */
+function projectScanMetaFor(selection: ProjectSelection, args: { 'include-project-lists': boolean }): ProjectScanMeta {
+  return buildProjectScanMeta(selection, { includeLists: args['include-project-lists'] });
+}
 
 // ============================================================================
 // Response Helpers
@@ -1184,6 +1200,7 @@ const listCommand = defineCommand({
     last: { type: 'string', description: 'Return only the last N sessions' },
     'min-lines': { type: 'string', description: 'Sessions with at least N lines' },
     'include-subagents': { type: 'boolean', description: 'Include subagent count per session', default: false },
+    ...INCLUDE_PROJECT_LISTS_ARG,
   },
   async run({ args }) {
     try {
@@ -1248,12 +1265,7 @@ const listCommand = defineCommand({
       // Apply --last limit after sorting
       const total = sessions.length;
       const returned = lastN != null ? sessions.slice(0, lastN) : sessions;
-      const responseMeta: ListMeta = meta(total, returned.length);
-      if (allProjects || selection.contexts.length > 1) {
-        responseMeta.projects_scanned = selection.contexts.length;
-        responseMeta.included_projects = selection.includedProjects;
-        responseMeta.skipped_projects = selection.skippedProjects;
-      }
+      const responseMeta: ListMeta = { ...meta(total, returned.length), ...projectScanMetaFor(selection, args) };
       output(success(returned, responseMeta));
     } catch (err: unknown) {
       handleCommandError(err);
@@ -1304,21 +1316,18 @@ const projectsCommand = defineCommand({
   args: {
     glob: { type: 'string', description: 'Filter by raw Claude project basename or display-only project_path_guess' },
     project: { type: 'string', description: 'Absolute project path; include its main and associated worktree projects' },
+    ...INCLUDE_PROJECT_LISTS_ARG,
   },
   async run({ args }) {
     try {
       const selection = selectProjectContexts({
         mode: args.project ? 'scoped-with-worktrees' : 'all-projects',
         projectPath: args.project,
-        projectGlob: args.project ? undefined : args.glob,
+        projectGlob: args.glob,
       });
-      let contexts = selection.contexts;
-      if (args.project && args.glob) {
-        contexts = contexts.filter(context => projectMatchesGlob(context.projectRef, args.glob!));
-      }
 
       const summaries: ProjectSummary[] = [];
-      for (const context of contexts) {
+      for (const context of selection.contexts) {
         try {
           summaries.push(await summarizeProjectContext(context));
         } catch {
@@ -1327,14 +1336,7 @@ const projectsCommand = defineCommand({
       }
       summaries.sort((a, b) => a.project.localeCompare(b.project));
 
-      const responseMeta: ListMeta = meta(summaries.length, summaries.length);
-      responseMeta.projects_scanned = contexts.length;
-      responseMeta.included_projects = contexts.map(context => ({
-        project: context.projectRef.project,
-        project_path_guess: context.projectRef.project_path_guess,
-        project_role: context.role,
-      }));
-      responseMeta.skipped_projects = args.project ? [] : selection.skippedProjects;
+      const responseMeta: ListMeta = { ...meta(summaries.length, summaries.length), ...projectScanMetaFor(selection, args) };
       output(success(summaries, responseMeta));
     } catch (err: unknown) {
       handleCommandError(err);
@@ -2483,6 +2485,7 @@ const searchCommand = defineCommand({
     bucket: { type: 'string', description: 'Bucket counter aggregates by: day, week' },
     'per-subagent': { type: 'boolean', description: 'Emit transcript-level counter rows instead of parent session rollups', default: false },
     last: { type: 'string', description: 'Return only the last N matches' },
+    ...INCLUDE_PROJECT_LISTS_ARG,
   },
   async run({ args }) {
     try {
@@ -2676,7 +2679,7 @@ const searchCommand = defineCommand({
       const resultLimit = origin ? lastN ?? 1 : lastN;
       const returned = resultLimit != null ? results.slice(0, resultLimit) : results;
       let responseData: unknown = returned;
-      let responseMeta: SearchMeta = meta(total, returned.length);
+      let baseMeta: ResponseMeta = meta(total, returned.length);
       if (aggregateMode === 'count-per-session') {
         responseData = aggregateSearchMatches(returned, aggregateMode, {
           toolInput: Boolean(args.tool || args['input-match'] || args['input-regex']),
@@ -2690,16 +2693,14 @@ const searchCommand = defineCommand({
           explicitSelector,
           perSubagent: Boolean(args['per-subagent']),
         });
-        responseData = bucketMode === 'none' ? counterRows : bucketCounterRows(counterRows, bucketMode);
-        responseMeta = meta(Array.isArray(responseData) ? responseData.length : 0, Array.isArray(responseData) ? responseData.length : 0);
+        const counterTable = bucketMode === 'none' ? counterRows : bucketCounterRows(counterRows, bucketMode);
+        responseData = counterTable;
+        baseMeta = meta(counterTable.length, counterTable.length);
       }
-      if (allProjects) {
-        responseMeta.projects_scanned = selection.contexts.length;
-        responseMeta.included_projects = selection.includedProjects;
-        responseMeta.skipped_projects = selection.skippedProjects;
-      } else {
-        responseMeta.included_projects = selection.includedProjects;
-      }
+      const responseMeta: SearchMeta = {
+        ...baseMeta,
+        ...projectScanMetaFor(selection, args),
+      };
       output(success(responseData, responseMeta));
     } catch (err: unknown) {
       handleCommandError(err);
@@ -2711,15 +2712,12 @@ const searchCommand = defineCommand({
 // Index + Stats Commands (SQLite transcript index)
 // ============================================================================
 
-export type IndexMeta = ResponseMeta & {
+export type IndexMeta = ResponseMeta & ProjectScanMeta & {
   index?: {
     db_path: string;
     mode: 'cache' | 'memory';
     refresh: RefreshStats;
   };
-  projects_scanned?: number;
-  included_projects?: PublicProjectRef[];
-  skipped_projects?: PublicProjectRef[];
 };
 
 type IndexScopeArgs = {
@@ -2783,27 +2781,23 @@ function publicDbPath(handle: IndexHandle): string {
   return handle.mode === 'memory' ? ':memory:' : handle.dbPath;
 }
 
-function indexMeta(base: ResponseMeta, handle: IndexHandle, selection: ProjectSelection, allProjects: boolean): IndexMeta {
-  const responseMeta: IndexMeta = {
+function indexMeta(base: ResponseMeta, handle: IndexHandle, scanMeta: ProjectScanMeta): IndexMeta {
+  return {
     ...base,
     index: {
       db_path: publicDbPath(handle),
       mode: handle.mode,
       refresh: handle.refresh,
     },
+    ...scanMeta,
   };
-  responseMeta.included_projects = selection.includedProjects;
-  if (allProjects) {
-    responseMeta.projects_scanned = selection.contexts.length;
-    responseMeta.skipped_projects = selection.skippedProjects;
-  }
-  return responseMeta;
 }
 
 const INDEX_SCOPE_ARGS = {
   project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
   'all-projects': { type: 'boolean', description: 'Operate on all Claude project directories', default: false },
   db: { type: 'string', description: 'Index database path (default: CC_SESSION_TOOL_DB or the user cache directory)' },
+  ...INCLUDE_PROJECT_LISTS_ARG,
 } as const;
 
 const indexStatusCommand = defineCommand({
@@ -2815,7 +2809,7 @@ const indexStatusCommand = defineCommand({
       const handle = acquireIndexForContexts(args.db, selection.contexts);
       try {
         const status: IndexStatus = queryIndexStatus(handle.db, publicDbPath(handle), selection.contexts);
-        output(success(status, indexMeta(meta(1, 1), handle, selection, Boolean(args['all-projects']))));
+        output(success(status, indexMeta(meta(1, 1), handle, projectScanMetaFor(selection, args))));
       } finally {
         handle.db.close();
       }
@@ -2840,7 +2834,7 @@ const indexRebuildCommand = defineCommand({
       const handle = acquireIndexForContexts(args.db, selection.contexts);
       try {
         const status: IndexStatus = queryIndexStatus(handle.db, publicDbPath(handle), selection.contexts);
-        output(success(status, indexMeta(meta(1, 1), handle, selection, allProjects)));
+        output(success(status, indexMeta(meta(1, 1), handle, projectScanMetaFor(selection, args))));
       } finally {
         handle.db.close();
       }
@@ -2897,7 +2891,7 @@ const statsTokensCommand = defineCommand({
           before: beforeCutoff,
           includeSubagents,
         });
-        output(success(rows, indexMeta(meta(rows.length, rows.length), handle, selection, Boolean(args['all-projects']))));
+        output(success(rows, indexMeta(meta(rows.length, rows.length), handle, projectScanMetaFor(selection, args))));
       } finally {
         handle.db.close();
       }
@@ -2941,7 +2935,7 @@ const statsTrajectoriesCommand = defineCommand({
           limit,
           includeSubagents,
         });
-        output(success(rows, indexMeta(meta(rows.length, rows.length), handle, selection, Boolean(args['all-projects']))));
+        output(success(rows, indexMeta(meta(rows.length, rows.length), handle, projectScanMetaFor(selection, args))));
       } finally {
         handle.db.close();
       }

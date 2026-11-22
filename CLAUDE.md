@@ -11,6 +11,7 @@ A CLI tool that queries Claude Code session transcripts stored as JSONL files in
 ```bash
 bun install          # Install dependencies
 bun run index.ts     # Run the CLI (or: bun run dev)
+bun run typecheck    # Type-check with tsc (runs in CI)
 bun test             # Run all tests
 bun test index.test.ts -t "shape"  # Run tests whose name matches a pattern
 bun build --compile index.ts --outfile cc-session-tool  # Compile to binary
