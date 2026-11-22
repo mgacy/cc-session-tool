@@ -215,7 +215,7 @@ Tool call log with condensed input summaries and outcome detection.
 cc-session-tool tools <session> [--project <path> | --claude-project <project>] [--name <tool>|--name-match <text>] [--input-match <text>|--input-regex <regex>] [--failed] [--turn <N|N-M>] [--max-outcome <n>]
 ```
 
-`--input-match` and `--input-regex` search the raw structured tool input, including values omitted or truncated in `input_summary`. `--name` and `--name-match` are mutually exclusive, as are the two input filters. `--max-outcome <n>` sets how many characters of an error's text `outcome` shows (default 60; `0` shows only the marker). It never changes `outcome_hash`.
+`--input-match` and `--input-regex` search the raw structured tool input, including values omitted or truncated in `input_summary`. `--name` and `--name-match` are mutually exclusive, as are the two input filters. `--max-outcome <n>` sets how many characters of an error's text `outcome` shows (default 60; `0` shows only the marker for errors with text). It never changes `outcome_hash`.
 
 **Output:**
 
@@ -289,7 +289,7 @@ cc-session-tool tools <session> [--project <path> | --claude-project <project>] 
 
 In every truncation marker, `N` is the full original length.
 
-**`duration_ms`:** Milliseconds between assistant entry and corresponding tool_result. `null` if timestamps are missing.
+**`duration_ms`:** Milliseconds between assistant entry and corresponding tool_result. `null` if timestamps are missing or the result was written before its `tool_use`.
 
 **`outcome_hash`:** The first 12 hex chars of SHA-256 over the UTF-8 bytes of the full error text. It is `null` unless `outcome` starts with `error:`, and it does not depend on `--max-outcome`.
 
@@ -556,7 +556,7 @@ At least one selector is required: `--tool`, raw-input, output (`--output-match`
 
 **Tool output and failures.** With `--output-match`, `--output-regex` or `--failed`, the tool-call selectors (`--tool`, `--input-*`, `--bash*`, `--file`, `--operation`) must match the same call whose result matches, and evidence lists only those calls; `--tool Bash --output-match X` ignores a `Read` that returned `X`. `--text*`, `--intent-*`, `--branch` and date filters still apply session-wide. `count-per-session` then counts the matched calls. Matching covers the text `messages --type tool_result` shows; outputs persisted to disk match only on their 2 KB preview, and API errors are not tool results. `--failed` alone matches about half of all sessions, so pair it with another selector.
 
-Each matched call yields `tool_output` evidence (example below). Its `turn` is the call's turn, as in `tools`; the result is at `result_turn`. Read it in full with the follow-up recipe in the [`tools`](#tools-session) section, using `--claude-project <session_ref.project>`. `tool_output` evidence has no truncation marker, so use the recipe's `slice` branch.
+Each matched call yields `tool_output` evidence (example below). Its `turn` is the call's turn, as in `tools`; the result is at `result_turn`. Read it in full with the follow-up recipe in the [`tools`](#tools-session) section, using `--claude-project <session_ref.project>` and the selector `<session_id>`, or `<session_id>:<agent_id>` when the evidence has an `agent_id` (a subagent hit; without the suffix the recipe silently reads the parent's turn). `tool_output` evidence has no truncation marker, so use the recipe's `slice` branch.
 
 For absolute `--file` queries inside the logical project, search compares exact canonical path candidates first, then exact project-relative logical identity. For example, `/workspace/app/src/auth.ts` in the main checkout matches `/workspace/app/.claude/worktrees/feature-a/src/auth.ts` from a related Claude worktree as the same logical file `src/auth.ts`. If a worktree path reaches the same file through a symlinked directory, the realpath candidate can also match even when the lexical absolute paths differ. If both sides normalize to logical paths and they differ, search does not fall back to substring matching.
 

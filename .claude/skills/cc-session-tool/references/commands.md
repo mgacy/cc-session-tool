@@ -108,7 +108,7 @@ cc-session-tool tools <session> [flags]
 | `--input-regex <regex>` | Regex equivalent. Mutually exclusive with `--input-match`. |
 | `--failed` | Only failed calls. |
 | `--turn <N\|N-M>` | Single turn or range. |
-| `--max-outcome <n>` | Chars of error text shown in `outcome` (default 60; `0` shows only the marker). Never changes `outcome_hash`. |
+| `--max-outcome <n>` | Chars of error text shown in `outcome` (default 60; `0` shows only the marker for errors with text). Never changes `outcome_hash`. |
 
 Each entry: `turn`, `tool`, `input_summary`, `outcome`, `outcome_hash`, `duration_ms`, `tool_use_id`, `result_turn`.
 
@@ -147,7 +147,7 @@ Pick the block with the matching `tool_use_id`; take `N` from the outcome's `...
 
 For long sessions, narrow with `--failed`, `--name` or `--turn`, and prefer this recipe over a large `--max-outcome`. See "Output envelope" in `SKILL.md` for output-size limits.
 
-`duration_ms` is the gap between the assistant entry and its matching tool_result; `null` if timestamps are missing.
+`duration_ms` is the gap between the assistant entry and its matching tool_result; `null` if timestamps are missing or the result was written before its `tool_use`.
 
 ---
 

@@ -106,7 +106,7 @@ Default full-match rows include, where relevant:
 - `session_id`, `branch`, `timestamp`, `slug`
 - `matches.tools`, `matches.files`, `matches.normalized_files`
 - `matches.evidence` — array of evidence items `{ kind, rawPath, logicalPath, operation, turn, block_index, timestamp }`
-- `tool_output` evidence adds `tool_use_id`, `result_turn`, `result_timestamp`, `is_error` and `snippet`. Its `turn` is the call's turn (as in `tools`); read the result at `result_turn` using the follow-up recipe in `references/commands.md` (`tools`). `tool_output` evidence has no truncation marker, so use the recipe's `slice` branch.
+- `tool_output` evidence adds `tool_use_id`, `result_turn`, `result_timestamp`, `is_error` and `snippet`. Its `turn` is the call's turn (as in `tools`); read the result at `result_turn` using the follow-up recipe in `references/commands.md` (`tools`), with the selector `<session_id>:<agent_id>` when the evidence has an `agent_id` (a subagent hit; without the suffix the recipe silently reads the parent's turn). `tool_output` evidence has no truncation marker, so use the recipe's `slice` branch.
 - `matches.operations`, `matches.turns`
 
 Worktree / all-project responses add:
