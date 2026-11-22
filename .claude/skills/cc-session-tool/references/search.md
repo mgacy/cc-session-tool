@@ -32,7 +32,7 @@ At least one **selector** is required: `--tool`, `--input-match` / `--input-rege
 | Flag | Matches | Notes |
 | --- | --- | --- |
 | `--tool <name>` | Tool names | Case-insensitive substring. |
-| `--input-match <text>` | Raw structured tool input | Sees values omitted/truncated in `input_summary`. Evidence and sample `input_summary` values use the `tools` formats (see `references/commands.md`, `tools`). |
+| `--input-match <text>` | Raw structured tool input | Sees values omitted/truncated in `input_summary`. |
 | `--input-regex <regex>` | Raw structured tool input | Mutually exclusive with `--input-match`. |
 | `--output-match <text>` | Tool result text | Case-insensitive substring. Binds to one call (see "Tool output and failures"). |
 | `--output-regex <regex>` | Tool result text | Case-sensitive. Mutually exclusive with `--output-match`. |
@@ -106,7 +106,10 @@ Default full-match rows include, where relevant:
 - `session_id`, `branch`, `timestamp`, `slug`
 - `matches.tools`, `matches.files`, `matches.normalized_files`
 - `matches.evidence` — array of evidence items `{ kind, rawPath, logicalPath, operation, turn, block_index, timestamp }`
-- `tool_output` evidence adds `tool_use_id`, `result_turn`, `result_timestamp`, `is_error` and `snippet`. Its `turn` is the call's turn (as in `tools`); read the result at `result_turn` using the follow-up recipe in `references/commands.md` (`tools`), with the selector `<session_id>:<agent_id>` when the evidence has an `agent_id` (a subagent hit; without the suffix the recipe silently reads the parent's turn). `tool_output` evidence has no truncation marker, so use the recipe's `slice` branch.
+- Tool-call evidence (`tool_input`, `bash`, `tool_output`) also carries `tool` and `input_summary`. `input_summary`, here and in `count-per-session` `sample_matches`, uses the `tools` formats in `references/commands.md`.
+- `tool_output` evidence adds `tool_use_id`, `result_turn`, `result_timestamp`, `is_error` and `snippet`. Its `turn` is the call's turn (as in `tools`); the result is at `result_turn`. `snippet` has no truncation marker to size a `messages` call, so read the full result with the `slice` branch of the follow-up recipe in `references/commands.md` (`tools`), addressed by:
+  - `<session_id>:<agent_id>` when the evidence has an `agent_id` (a subagent hit; without the suffix you silently read the parent's turn), else `<session_id>`;
+  - `--claude-project <session_ref.project>` when the row has `session_ref`, else the `--project` the search used.
 - `matches.operations`, `matches.turns`
 
 Worktree / all-project responses add:

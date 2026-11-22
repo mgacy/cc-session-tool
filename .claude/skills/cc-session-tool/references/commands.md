@@ -133,9 +133,11 @@ Each entry: `turn`, `tool`, `input_summary`, `outcome`, `outcome_hash`, `duratio
 
 - Identical text gives the same hash. A different hash means different text, not necessarily a different cause: embedded timings, paths or line numbers split one cause into many hashes. Read the text before naming failure categories.
 - "No text" errors (e.g. image-only) share the empty-string hash `e3b0c44298fc`.
-- Group rows with `jq '.data.tool_calls | group_by(.outcome_hash)'`.
+- Count rows per distinct error with `jq '.data.tool_calls | map(select(.outcome_hash)) | group_by(.outcome_hash) | map({count: length, outcome_hash: .[0].outcome_hash, outcome: .[0].outcome})'`.
 
 **`tool_use_id` / `result_turn`:** the call's id (also on the matching `tool_result` in `messages`; `null` if the block has no id) and the turn holding its result (same numbering as `turn`; `null` when there is no result). `result_turn` can be smaller than `turn`.
+
+`duration_ms` is the gap between the assistant entry and its matching tool_result; `null` if timestamps are missing or the result was written before its `tool_use`.
 
 **Reading a full result.** Reuse the exact selector given to `tools`, including `:<agent-id>` for a subagent (`result_turn` is numbered within the subagent transcript; dropping the suffix silently reads the parent's turn), and the same `--project` / `--claude-project`:
 
@@ -145,9 +147,7 @@ cc-session-tool messages <session>[:<agent-id>] [--project <path> | --claude-pro
 
 Pick the block with the matching `tool_use_id`; take `N` from the outcome's `...[truncated, N chars]` marker. Rows without a marker (e.g. `success (N lines)`) give no `N` and `messages` truncates at 200 chars by default, so use `slice <session>[:<agent-id>] --turn <result_turn>` instead (untruncated, but the whole turn including parallel results) and pick the block by `tool_use_id`. An untruncated error needs no follow-up. A call's full input: `slice <session>[:<agent-id>] --turn <turn>`.
 
-For long sessions, narrow with `--failed`, `--name` or `--turn`, and prefer this recipe over a large `--max-outcome`. See "Output envelope" in `SKILL.md` for output-size limits.
-
-`duration_ms` is the gap between the assistant entry and its matching tool_result; `null` if timestamps are missing or the result was written before its `tool_use`.
+For long sessions, narrow with `--failed`, `--name` or `--turn`, and prefer this recipe over a large `--max-outcome`, which lengthens every error row and can push output past the Bash capture limit.
 
 ---
 
@@ -198,6 +198,7 @@ cc-session-tool messages <session> [flags]
 | `--type <text\|thinking\|tool_use\|tool_result>` | all | Block type filter. |
 | `--turn <N\|N-M>` | all | Turn or range. |
 | `--max-content <chars>` | 200; unbounded for a single `--turn` | Truncate text/thinking content (suffix `...[truncated, N chars]`). |
+| `--max-tool-result <chars>` | `--max-content`, else 200 | Truncate `tool_result` content (same suffix). A single `--turn` does not lift it. |
 
 `tool_use` blocks keep `name` and `id` (not truncated). `tool_result` blocks keep `tool_use_id` and `is_error`, with truncated content.
 

@@ -100,7 +100,9 @@ Every command emits one of:
 { "ok": false, "error": { "code": "NOT_FOUND", "message": "..." } }
 ```
 
-Exit codes: `0` success, `1` format error, `2` invalid args, `3` not found. Always check `_meta.hasMore` — long results truncate. Any command's default output can exceed Claude Code's Bash capture limit of about 30,000 characters, so narrow long results with the command's filters.
+Exit codes: `0` success, `1` format error, `2` invalid args, `3` not found. Always check `_meta.hasMore` — long results truncate.
+
+Default output (especially `tools` and `search`) can exceed the Bash tool's output capture, about 30,000 characters by default, and the rest is cut off. Narrow with filters (`--failed`, `--name`, `--turn`), or redirect to a file and query it with `jq` rather than piping, since large piped output can also be cut.
 
 ## Common workflows
 
@@ -134,7 +136,7 @@ Search compares absolute main-tree paths against worktree-local paths via shared
 ```bash
 cc-session-tool tools DA2738E3                           # full tool log
 cc-session-tool tools DA2738E3 --name Grep --failed      # only failed greps
-cc-session-tool tools DA2738E3 --failed                  # group by outcome_hash; full text: see references/commands.md
+cc-session-tool tools DA2738E3 --failed                  # failed calls; equal outcome_hash = same error text
 cc-session-tool tools DA2738E3 --turn 1-14               # before first edit
 cc-session-tool files DA2738E3                           # files by path
 cc-session-tool files DA2738E3 --operation edit          # only edits
@@ -179,7 +181,7 @@ cc-session-tool search --tool Bash \
 - **Don't pass `--operation` without `--file`** — the filter only binds when there's a matching file access to bind to.
 - **`--origin` is transcript evidence, not VCS history.** It tells you the earliest _recorded write in a transcript_, not when the file was first committed.
 - **`--all-projects` plus `--project` does not narrow the scan.** In all-projects mode, `--project` is only a file-identity anchor for absolute paths; the scan still covers every project.
-- **Identical `outcome` strings are not necessarily the same failure, and different `outcome_hash` values are not necessarily different causes.** Read the text before categorizing (see `references/commands.md`).
+- **Tell errors apart by `outcome_hash`, not `outcome`.** Truncated outcomes that read the same can be different errors. The converse does not hold: one cause can yield many hashes (embedded paths, timings, line numbers), so read the full text before naming failure categories (recipe in `references/commands.md`, `tools`).
 - **`slice` without `--turn` is required to fail** — always pass a range.
 - **Validate inputs.** Session IDs accept `[a-zA-Z0-9-]`; agent IDs additionally allow `_`; `--claude-project` is a basename only (no path traversal).
 
