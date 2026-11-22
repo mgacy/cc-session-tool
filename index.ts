@@ -34,6 +34,7 @@ import {
   aggregateCounterRows,
   attachCounterTranscriptResults,
   bucketCounterRows,
+  evaluateResultSelectors,
   evidenceTimestamps,
   matchedToolCalls,
   parseCounterArgs,
@@ -44,6 +45,7 @@ import {
   testTextMatcher,
   toolInputSamplesFromEvidence,
   type CallSelectors,
+  type ResultSelectors,
   type TextMatcher,
   type SearchEvidence,
   type SearchEvidenceKind,
@@ -63,6 +65,7 @@ import {
 } from './src/transcript.ts';
 import {
   buildResultLookup as toolLogBuildResultLookup,
+  buildToolResultLocations,
   determineOutcome as toolLogDetermineOutcome,
   extractContentText as toolLogExtractContentText,
   inputSummary as toolLogInputSummary,
@@ -375,6 +378,9 @@ export type SearchArgs = {
   bashRegex?: string;
   inputMatch?: string;
   inputRegex?: string;
+  outputMatch?: string;
+  outputRegex?: string;
+  failed?: boolean;
   intentMatch?: string;
   intentRegex?: string;
   branch?: string;
@@ -438,6 +444,7 @@ type PreparedSearchArgs = SearchArgs & {
   bashMatcher?: TextMatcher | null;
   inputMatcher?: TextMatcher | null;
   intentMatcher?: TextMatcher | null;
+  outputMatcher?: TextMatcher | null;
 };
 
 export type ListMeta = ResponseMeta & {
@@ -864,6 +871,7 @@ export function toolInputMatches(input: Record<string, unknown>, query: string):
 }
 
 function toolInputMatchesMatcher(input: Record<string, unknown>, matcher: TextMatcher | null): boolean {
+  if (!matcher) return true;
   return testTextMatcher(matcher, stableJsonStringify(input));
 }
 
@@ -1939,6 +1947,7 @@ type TranscriptScan = {
     bash: boolean;
     input: boolean;
     intent: boolean;
+    output: boolean;
   };
 };
 
@@ -2031,6 +2040,13 @@ async function scanSearchTranscript(target: SearchTarget, args: PreparedSearchAr
     let bashHit = !args.bashMatcher;
     let inputHit = !args.inputMatcher;
 
+    // Result selectors bind every tool-call selector to the same tool_use (bound mode).
+    const resultSelectors: ResultSelectors = { outputMatcher: args.outputMatcher ?? null, failed: Boolean(args.failed) };
+    const bound = Boolean(resultSelectors.outputMatcher || resultSelectors.failed);
+    const resultLocations = bound ? buildToolResultLocations(uaEntries) : null;
+    let outputHit = !bound;
+    const fileSelector = Boolean(fileQuery || rawFileQuery);
+
     for (let ei = 0; ei < uaEntries.length; ei++) {
       const entry = uaEntries[ei]!;
       const turnNum = ei + 1;
@@ -2038,98 +2054,146 @@ async function scanSearchTranscript(target: SearchTarget, args: PreparedSearchAr
       if (!Array.isArray(content)) continue;
 
       for (let blockIndex = 0; blockIndex < content.length; blockIndex++) {
-        const block = (content as ContentBlock[])[blockIndex]!;
-        if (block.type === 'tool_use' && block.name) {
-          const rawInput = block.input ?? {};
-          allToolCalls.push({
+        const block = (content as ContentBlock[])[blockIndex];
+        if (block?.type !== 'tool_use' || !block.name) continue;
+        const name = block.name;
+        const input = block.input ?? {};
+
+        allToolCalls.push({
+          turn: turnNum,
+          block_index: blockIndex,
+          timestamp: entry.timestamp ?? null,
+          tool: name,
+          input_summary: safeInputSummary(name, input),
+          rawInput: input,
+          agentId: target.agentId ?? null,
+          parentSessionId: target.parentSessionId ?? null,
+          isSubagent: Boolean(target.agentId),
+        });
+
+        // Call-level predicates: each is computed at most once per call and only when its selector is present.
+        const nameOk = !toolQuery || name.toLowerCase().includes(toolQuery);
+        let bashOkMemo: boolean | undefined;
+        const bashOk = (): boolean => {
+          if (bashOkMemo === undefined) {
+            const command = name === 'Bash' ? (input as Record<string, any>)?.command : undefined;
+            bashOkMemo = !args.bashMatcher || (typeof command === 'string' && testTextMatcher(args.bashMatcher, command));
+          }
+          return bashOkMemo;
+        };
+        let inputOkMemo: boolean | undefined;
+        const inputOk = (): boolean => (inputOkMemo ??= !args.inputMatcher || toolInputMatchesMatcher(input, args.inputMatcher));
+        let fileState: { fileInfo: ReturnType<typeof extractFilePath>; fileMatch: ReturnType<typeof matchFileAccess>; ok: boolean } | undefined;
+        const fileEval = () => {
+          if (!fileState) {
+            const fileInfo = extractFilePath(name, input);
+            const access = fileInfo && sessionContext
+              ? normalizeFileAccess(fileInfo.path, fileInfo.operation, sessionContext)
+              : null;
+            const fileMatch = fileInfo && fileQuery && access
+              ? matchFileAccess(fileQuery, access)
+              : {
+                  matched: Boolean(fileInfo && rawFileQuery && fileInfo.path.toLowerCase().includes(rawFileQuery)),
+                  matchedBy: 'substring' as const,
+                  logicalPath: null,
+                };
+            fileState = {
+              fileInfo,
+              fileMatch,
+              ok: Boolean(fileInfo && fileMatch.matched && (!operationQuery || fileInfo.operation === operationQuery)),
+            };
+          }
+          return fileState;
+        };
+
+        let boundResult: ReturnType<NonNullable<typeof resultLocations>['get']>;
+        let boundSnippet: string | undefined;
+        if (bound) {
+          // Cheap tests first; output text is never extracted for a call that name/bash/--failed rejected.
+          if (!nameOk || !bashOk()) continue;
+          boundResult = block.id ? resultLocations!.get(block.id) : undefined;
+          const outcome = evaluateResultSelectors(boundResult, resultSelectors);
+          if (!outcome.matched) continue;
+          boundSnippet = outcome.snippet;
+          if (!inputOk()) continue;
+          if (fileSelector && !fileEval().ok) continue;
+        }
+
+        if (toolQuery && nameOk) {
+          matchedTools.add(name);
+          matchedTurns.add(turnNum);
+          toolHit = true;
+        }
+
+        if ((args.tool || args.inputMatcher) && nameOk && inputOk()) {
+          matchedEvidence.push(addEvidenceProvenance({
+            kind: 'tool_input',
             turn: turnNum,
             block_index: blockIndex,
             timestamp: entry.timestamp ?? null,
-            tool: block.name,
-            input_summary: safeInputSummary(block.name, rawInput),
-            rawInput,
-            agentId: target.agentId ?? null,
-            parentSessionId: target.parentSessionId ?? null,
-            isSubagent: Boolean(target.agentId),
-          });
+            tool: name,
+            input_summary: safeInputSummary(name, input),
+            snippet: args.inputMatcher ? snippetForMatch(stableJsonStringify(input), args.inputMatcher, SEARCH_EVIDENCE_SNIPPET_CHARS) : undefined,
+          }, target));
+          matchedTools.add(name);
+          matchedTurns.add(turnNum);
+          if (toolQuery) toolHit = true;
+          if (args.inputMatcher) inputHit = true;
         }
 
-        if (toolQuery && block.type === 'tool_use' && block.name) {
-          if (block.name.toLowerCase().includes(toolQuery)) {
-            matchedTools.add(block.name);
-            matchedTurns.add(turnNum);
-            toolHit = true;
-          }
-        }
-
-        if ((args.tool || args.inputMatcher) && block.type === 'tool_use' && block.name) {
-          const input = block.input ?? {};
-          const nameMatches = !toolQuery || block.name.toLowerCase().includes(toolQuery);
-          const inputMatches = toolInputMatchesMatcher(input, args.inputMatcher ?? null);
-          if (nameMatches && inputMatches) {
+        if (fileSelector) {
+          const { fileInfo, fileMatch, ok } = fileEval();
+          if (ok && fileInfo) {
+            matchedFiles.add(fileInfo.path);
+            if (fileMatch.logicalPath) matchedNormalizedFiles.add(fileMatch.logicalPath);
             matchedEvidence.push(addEvidenceProvenance({
-              kind: 'tool_input',
+              kind: 'file',
+              rawPath: fileInfo.path,
+              logicalPath: fileMatch.logicalPath,
+              operation: fileInfo.operation,
               turn: turnNum,
               block_index: blockIndex,
               timestamp: entry.timestamp ?? null,
-              tool: block.name,
-              input_summary: safeInputSummary(block.name, input),
-              snippet: args.inputMatcher ? snippetForMatch(stableJsonStringify(input), args.inputMatcher, SEARCH_EVIDENCE_SNIPPET_CHARS) : undefined,
             }, target));
-            matchedTools.add(block.name);
+            matchedOperations.add(fileInfo.operation);
             matchedTurns.add(turnNum);
-            if (toolQuery) toolHit = true;
-            if (args.inputMatcher) inputHit = true;
+            fileHit = true;
           }
         }
 
-        if ((fileQuery || rawFileQuery) && block.type === 'tool_use' && block.name) {
-          const fileInfo = extractFilePath(block.name, block.input ?? {});
-          const access = fileInfo && sessionContext
-            ? normalizeFileAccess(fileInfo.path, fileInfo.operation, sessionContext)
-            : null;
-          const fileMatch = fileInfo && fileQuery && access
-            ? matchFileAccess(fileQuery, access)
-            : {
-                matched: Boolean(fileInfo && rawFileQuery && fileInfo.path.toLowerCase().includes(rawFileQuery)),
-                matchedBy: 'substring' as const,
-                logicalPath: null,
-              };
-          if (fileInfo && fileMatch.matched) {
-            if (!operationQuery || fileInfo.operation === operationQuery) {
-              matchedFiles.add(fileInfo.path);
-              if (fileMatch.logicalPath) matchedNormalizedFiles.add(fileMatch.logicalPath);
-              matchedEvidence.push(addEvidenceProvenance({
-                kind: 'file',
-                rawPath: fileInfo.path,
-                logicalPath: fileMatch.logicalPath,
-                operation: fileInfo.operation,
-                turn: turnNum,
-                block_index: blockIndex,
-                timestamp: entry.timestamp ?? null,
-              }, target));
-              matchedOperations.add(fileInfo.operation);
-              matchedTurns.add(turnNum);
-              fileHit = true;
-            }
-          }
+        if (args.bashMatcher && bashOk()) {
+          const command = (input as Record<string, any>).command as string;
+          matchedEvidence.push(addEvidenceProvenance({
+            kind: 'bash',
+            turn: turnNum,
+            block_index: blockIndex,
+            timestamp: entry.timestamp ?? null,
+            tool: 'Bash',
+            input_summary: safeInputSummary('Bash', input),
+            snippet: snippetForMatch(command, args.bashMatcher, SEARCH_EVIDENCE_SNIPPET_CHARS),
+          }, target));
+          matchedTurns.add(turnNum);
+          bashHit = true;
         }
 
-        if (args.bashMatcher && block.type === 'tool_use' && block.name === 'Bash') {
-          const command = (block.input as Record<string, any>)?.command;
-          if (typeof command === 'string' && testTextMatcher(args.bashMatcher, command)) {
-            matchedEvidence.push(addEvidenceProvenance({
-              kind: 'bash',
-              turn: turnNum,
-              block_index: blockIndex,
-              timestamp: entry.timestamp ?? null,
-              tool: 'Bash',
-              input_summary: safeInputSummary('Bash', block.input ?? {}),
-              snippet: snippetForMatch(command, args.bashMatcher, SEARCH_EVIDENCE_SNIPPET_CHARS),
-            }, target));
-            matchedTurns.add(turnNum);
-            bashHit = true;
-          }
+        if (bound && boundResult) {
+          const item: SearchEvidence = {
+            kind: 'tool_output',
+            turn: turnNum,
+            block_index: blockIndex,
+            timestamp: entry.timestamp ?? null,
+            tool: name,
+            input_summary: safeInputSummary(name, input),
+            tool_use_id: block.id,
+            result_turn: boundResult.turn,
+            result_timestamp: boundResult.result_ts ?? null,
+            is_error: Boolean(boundResult.is_error),
+          };
+          if (boundSnippet !== undefined) item.snippet = boundSnippet;
+          matchedEvidence.push(addEvidenceProvenance(item, target));
+          matchedTools.add(name);
+          matchedTurns.add(turnNum);
+          outputHit = true;
         }
       }
     }
@@ -2151,6 +2215,7 @@ async function scanSearchTranscript(target: SearchTarget, args: PreparedSearchAr
         bash: bashHit,
         input: inputHit,
         intent: !args.intentMatcher || searchKindHit(matchedEvidence, 'intent'),
+        output: outputHit,
       },
     };
   } catch {
@@ -2179,7 +2244,7 @@ export async function scanSearchGroup(group: SearchSessionGroup, args: PreparedS
   }
 
   const hit = (name: keyof TranscriptScan['hits']) => scans.some(scan => scan.hits[name]);
-  if (!hit('tool') || !hit('file') || !hit('text') || !hit('bash') || !hit('input') || !hit('intent')) return null;
+  if (!hit('tool') || !hit('file') || !hit('text') || !hit('bash') || !hit('input') || !hit('intent') || !hit('output')) return null;
 
   const matchedTools = new Set<string>();
   const matchedFiles = new Set<string>();
@@ -2250,6 +2315,11 @@ export async function scanSearchTarget(target: SearchTarget, args: SearchArgs, a
     bashMatcher: parseSubstringMatcher(args.bash),
     inputMatcher: parseSubstringMatcher(args.inputMatch),
     intentMatcher: parseSubstringMatcher(args.intentMatch),
+    // Gated on truthiness like the CLI: an empty --output-match counts as absent.
+    outputMatcher: args.outputRegex
+      ? parseRegexMatcher(args.outputRegex, '--output-regex')
+      : args.outputMatch ? parseSubstringMatcher(args.outputMatch) : null,
+    failed: Boolean(args.failed),
     includeSubagents: false,
   };
   return {
@@ -2365,9 +2435,12 @@ const searchCommand = defineCommand({
     tool: { type: 'string', description: 'Sessions using a specific tool (case-insensitive substring)' },
     'input-match': { type: 'string', description: 'Sessions with raw structured tool input containing a case-insensitive substring' },
     'input-regex': { type: 'string', description: 'Sessions with raw structured tool input matching a regex' },
+    'output-match': { type: 'string', description: 'Tool result text contains substring (case-insensitive); binds to the --tool/--input/--bash/--file call' },
+    'output-regex': { type: 'string', description: 'Tool result text matches regex; binds to the --tool/--input/--bash/--file call' },
+    failed: { type: 'boolean', description: 'Tool call failed (is_error or empty result, as tools --failed); binds like --output-match', default: false },
     file: { type: 'string', description: 'Sessions that touched a file (substring match on path)' },
-    text: { type: 'string', description: 'Search in user/assistant text and thinking content (case-insensitive substring)' },
-    'text-regex': { type: 'string', description: 'Search in user/assistant text and thinking content with a regex' },
+    text: { type: 'string', description: 'Search user/assistant text and thinking (substring); does NOT search tool output, use --output-match' },
+    'text-regex': { type: 'string', description: 'Search user/assistant text and thinking (regex); does NOT search tool output, use --output-regex' },
     'text-role': { type: 'string', description: 'Restrict text search to user, assistant, or all' },
     'intent-match': { type: 'string', description: 'Search session intent sources by substring' },
     'intent-regex': { type: 'string', description: 'Search session intent sources by regex' },
@@ -2392,13 +2465,17 @@ const searchCommand = defineCommand({
     try {
       const rawArgs = args as Record<string, unknown>;
       const hasCounters = Boolean(rawArgs.counter) || Boolean(rawArgs['counter-regex']);
+      const hasResultSelectors = Boolean(args['output-match'] || args['output-regex'] || args.failed);
       // Validate at least one search filter is provided
-      if (!args.tool && !args['input-match'] && !args['input-regex'] && !args.file && !args.text && !args['text-regex'] && !args.bash && !args['bash-regex'] && !args['intent-match'] && !args['intent-regex'] && !hasCounters) {
-        throw cliError('INVALID_ARGS', 'At least one search filter is required (--tool, --input-match, --input-regex, --file, --text, --text-regex, --intent-match, --intent-regex, --bash, --bash-regex, --counter, or --counter-regex)');
+      if (!args.tool && !args['input-match'] && !args['input-regex'] && !hasResultSelectors && !args.file && !args.text && !args['text-regex'] && !args.bash && !args['bash-regex'] && !args['intent-match'] && !args['intent-regex'] && !hasCounters) {
+        throw cliError('INVALID_ARGS', 'At least one search filter is required (--tool, --input-match, --input-regex, --output-match, --output-regex, --failed, --file, --text, --text-regex, --intent-match, --intent-regex, --bash, --bash-regex, --counter, or --counter-regex)');
       }
 
       if (args['input-match'] && args['input-regex']) {
         throw cliError('INVALID_ARGS', '--input-match and --input-regex are mutually exclusive');
+      }
+      if (args['output-match'] && args['output-regex']) {
+        throw cliError('INVALID_ARGS', '--output-match and --output-regex are mutually exclusive');
       }
       if (args.text && args['text-regex']) {
         throw cliError('INVALID_ARGS', '--text and --text-regex are mutually exclusive');
@@ -2433,8 +2510,8 @@ const searchCommand = defineCommand({
       if (aggregateMode !== 'none' && aggregateMode !== 'count-per-session' && aggregateMode !== 'counters') {
         throw cliError('INVALID_ARGS', '--aggregate must be one of: count-per-session, counters');
       }
-      if (aggregateMode === 'count-per-session' && !args.tool && !args['input-match'] && !args['input-regex'] && !args.bash && !args['bash-regex']) {
-        throw cliError('INVALID_ARGS', '--aggregate requires --tool, --input-match, --input-regex, --bash, or --bash-regex');
+      if (aggregateMode === 'count-per-session' && !args.tool && !args['input-match'] && !args['input-regex'] && !args.bash && !args['bash-regex'] && !hasResultSelectors) {
+        throw cliError('INVALID_ARGS', '--aggregate requires --tool, --input-match, --input-regex, --bash, --bash-regex, --output-match, --output-regex, or --failed');
       }
       const bucketMode = (args.bucket ?? 'none') as SearchBucketMode;
       if (bucketMode !== 'none' && bucketMode !== 'day' && bucketMode !== 'week') {
@@ -2490,6 +2567,11 @@ const searchCommand = defineCommand({
         throw cliError('INVALID_ARGS', '--counter and --counter-regex require --aggregate counters');
       }
 
+      // Null exactly when the raw values are falsy, matching hasResultSelectors.
+      const outputMatcher = args['output-regex']
+        ? parseCliRegexMatcher(args['output-regex'], '--output-regex')
+        : args['output-match'] ? parseSubstringMatcher(args['output-match']) : null;
+
       const searchArgs: PreparedSearchArgs = {
         tool: args.tool,
         inputMatch: args['input-match'],
@@ -2497,6 +2579,10 @@ const searchCommand = defineCommand({
         inputMatcher: args['input-regex']
           ? parseCliRegexMatcher(args['input-regex'], '--input-regex')
           : parseSubstringMatcher(args['input-match']),
+        outputMatch: args['output-match'],
+        outputRegex: args['output-regex'],
+        outputMatcher,
+        failed: Boolean(args.failed),
         file: args.file,
         text: args.text,
         textRegex: args['text-regex'],
@@ -2548,6 +2634,7 @@ const searchCommand = defineCommand({
         responseData = aggregateSearchMatches(returned, aggregateMode, {
           toolInput: Boolean(args.tool || args['input-match'] || args['input-regex']),
           bash: Boolean(args.bash || args['bash-regex']),
+          toolOutput: hasResultSelectors,
         });
       } else if (aggregateMode === 'counters') {
         const explicitSelector = Boolean(args.tool || args['input-match'] || args['input-regex'] || args.file || args.text || args['text-regex'] || args.bash || args['bash-regex'] || args['intent-match'] || args['intent-regex']);
