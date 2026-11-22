@@ -7,7 +7,7 @@ description: Use cc-session-tool to inspect Claude Code session transcripts. Tri
 
 A CLI that queries Claude Code session transcripts and returns compact JSON. Designed for agent consumption — every command returns a `{ ok, data, _meta }` envelope so output is mechanical to parse.
 
-The CLI must be on PATH as `cc-session-tool`; inside the cc-session-tool repository, `bun run index.ts <command>` works without installing it. Run any subcommand with `--help` for full flag reference, or consult `references/commands.md` in this skill for a condensed catalog.
+The CLI runs as `cc-session-tool` on PATH; inside the cc-session-tool repository, `bun run index.ts <command>` also works. If neither is available, tell the user rather than reading the JSONL files directly. Run any subcommand with `--help` for full flag reference, or consult `references/commands.md` in this skill for a condensed catalog.
 
 ## When to reach for which command
 

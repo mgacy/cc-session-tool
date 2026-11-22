@@ -80,7 +80,7 @@ Both count matching tool calls, not occurrences of the text: `bun test && bun te
 
 Per-session rollup with `counts.tool_inputs` and a small `sample_matches` array. Useful for "how often did session X do Y" audits.
 
-Requires `--tool`, `--input-match`, or `--input-regex`, and counts the tool calls those flags match. For Bash audits use `--tool Bash --input-match '<text>'`, and don't combine `--bash` or `--bash-regex` with `--aggregate`.
+Counts the tool calls matched by `--tool`, `--input-match`, or `--input-regex`; `--tool Bash` alone counts every Bash call. For Bash audits use `--tool Bash --input-match '<text>'`, and don't combine `--bash` or `--bash-regex` with `--aggregate` (the count currently ignores their matches).
 
 ### `--aggregate counters`
 
