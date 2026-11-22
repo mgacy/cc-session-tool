@@ -38,6 +38,7 @@ cc-session-tool list [flags]
 | `--main-only` | false | With scoped `--project`, skip worktrees. Incompatible with `--all-projects`. |
 | `--all-projects` | false | List sessions from every top-level Claude project directory under `~/.claude/projects`. |
 | `--project-glob <pat>` | — | With `--all-projects`, filter by raw Claude project basename or display-only `project_path_guess`. Supports `*` and `?`. |
+| `--include-project-lists` | false | Add the `_meta.included_projects` / `_meta.skipped_projects` arrays (default: counts only). |
 | `--intent-match <text>` | — | Filter session intent sources (slug, first prompt token, first user message) by case-insensitive substring. |
 | `--intent-regex <regex>` | — | Regex equivalent. Mutually exclusive with `--intent-match`. |
 | `--branch <name>` | all | Filter by git branch. |
@@ -48,7 +49,7 @@ cc-session-tool list [flags]
 | `--min-lines <n>` | 0 | Sessions with at least N lines. |
 | `--include-subagents` | false | Adds `subagent_count` per session. |
 
-Output rows are sorted newest first. When multiple project contexts are scanned, rows include `project`, `project_path_guess` (display only), `project_role` (`main` / `worktree` / `global`), and `session_ref` for stable follow-up. `_meta.included_projects` records what was scanned.
+Output rows are sorted newest first. With `--all-projects`, or when `_meta.projects_scanned` is greater than 1, rows include `project`, `project_path_guess` (display only), `project_role` (`main` / `worktree` / `global`), and `session_ref` for stable follow-up.
 
 ---
 
@@ -57,7 +58,7 @@ Output rows are sorted newest first. When multiple project contexts are scanned,
 Summarize Claude project transcript directories and expose stable raw project handles for use with `--claude-project`.
 
 ```bash
-cc-session-tool projects [--glob <pattern>] [--project <path>]
+cc-session-tool projects [--glob <pattern>] [--project <path>] [--include-project-lists]
 ```
 
 Without `--project`, scans every top-level Claude project directory under `~/.claude/projects`. With `--project`, returns the main project plus associated worktrees. Sorted by raw `project` basename.

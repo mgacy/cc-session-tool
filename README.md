@@ -63,7 +63,7 @@ All commands use consistent turn numbering:
 Index sessions by reading metadata from the first few lines of each file. A scoped `list --project <repo>` includes the repo's associated Claude-managed worktree transcript directories by default, matching `search`; use `--main-only` to inspect only the main project transcript directory.
 
 ```bash
-cc-session-tool list [--project <path>] [--main-only] [--all-projects] [--project-glob <pattern>] [--intent-match <text>|--intent-regex <regex>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>] [--min-lines <n>] [--include-subagents]
+cc-session-tool list [--project <path>] [--main-only] [--all-projects] [--project-glob <pattern>] [--include-project-lists] [--intent-match <text>|--intent-regex <regex>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>] [--min-lines <n>] [--include-subagents]
 ```
 
 | Option        | Default | Description                                                    |
@@ -72,6 +72,7 @@ cc-session-tool list [--project <path>] [--main-only] [--all-projects] [--projec
 | `--all-projects` | false | List sessions from every top-level Claude project directory under `~/.claude/projects`. |
 | `--main-only` | false | With scoped `--project`, skip associated Claude worktree transcript directories. Cannot be combined with `--all-projects`. |
 | `--project-glob` | —     | With `--all-projects`, filter by raw Claude project basename or display-only `project_path_guess`. Supports `*` and `?`. |
+| `--include-project-lists` | false | Add the full `_meta.included_projects` / `_meta.skipped_projects` arrays (default: only the `projects_scanned` / `projects_skipped` counts). See [Project coverage metadata](#project-coverage-metadata). |
 | `--intent-match` | —     | Filter session intent sources (`slug`, first prompt token, first user message) by case-insensitive substring. |
 | `--intent-regex` | —     | Filter session intent sources by regex. Mutually exclusive with `--intent-match`. |
 | `--after`     | —       | Sessions after ISO 8601 date (mutually exclusive with `--since`) |
@@ -86,13 +87,13 @@ cc-session-tool list [--project <path>] [--main-only] [--all-projects] [--projec
 | What you have | Use | If the value is wrong |
 | --- | --- | --- |
 | The checkout or worktree path, e.g. `<repo>/.claude/worktrees/<name>` (**preferred**) | `list --project <path>` | `NOT_FOUND` |
-| Only a raw Claude basename: the `project` / `session_ref.project` field of a `search`, `list` or `projects` row | `list --all-projects --project-glob <basename>` | `ok:true` with empty `data` and `_meta.projects_scanned: 0`. Confirm `_meta.projects_scanned === 1` before trusting an empty result. `_meta.skipped_projects` lists every other project, so the response grows with the number of projects. |
+| Only a raw Claude basename: the `project` / `session_ref.project` field of a `search`, `list` or `projects` row | `list --all-projects --project-glob <basename>` | `ok:true` with empty `data` and `_meta.projects_scanned: 0`. Confirm `_meta.projects_scanned === 1` before trusting an empty result. `_meta.projects_skipped` counts the other projects. |
 | A session to inspect, plus its raw basename | `shape`, `summary`, `tools`, `files`, `tokens`, `messages`, `slice` or `subagents` with `<session> --claude-project <basename>` | `NOT_FOUND` |
 
 - `--claude-project` is accepted only by the session commands in the last row; `list` and `search` reject it, and `search` scopes the same way as `list`.
 - Don't turn `project_path_guess` into a `--project` value: it is display-only and lossy. With only a row's fields, use the raw-basename row. A repo-root path also covers that repo's Claude worktrees (`--main-only` skips them). A worktree path covers only that worktree; see **Worktree checkouts** above.
 
-**Output:** Sessions sorted by timestamp (newest first). When `--include-subagents` is set, each session includes a `subagent_count` field; otherwise the field is omitted entirely. Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated. When multiple project contexts are included, rows include `project`, `project_path_guess`, `project_role`, and `session_ref`; `_meta.included_projects` records the selected Claude project contexts. `project_path_guess` is display-only; use raw `project` or `session_ref.project` with `--claude-project` on session commands (not `list`) for follow-up.
+**Output:** Sessions sorted by timestamp (newest first). When `--include-subagents` is set, each session includes a `subagent_count` field; otherwise the field is omitted entirely. Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated. With `--all-projects`, or when `_meta.projects_scanned` is greater than 1, rows include `project`, `project_path_guess`, `project_role`, and `session_ref`. `_meta.projects_scanned` / `_meta.projects_skipped` are always present; see [Project coverage metadata](#project-coverage-metadata). `project_path_guess` is display-only; use raw `project` or `session_ref.project` with `--claude-project` on session commands (not `list`) for follow-up.
 
 ```json
 {
@@ -108,7 +109,7 @@ cc-session-tool list [--project <path>] [--main-only] [--all-projects] [--projec
       "slug": "snuggly-floating-barto"
     }
   ],
-  "_meta": { "total": 1, "returned": 1, "hasMore": false }
+  "_meta": { "total": 1, "returned": 1, "hasMore": false, "projects_scanned": 1, "projects_skipped": 0 }
 }
 ```
 
@@ -119,10 +120,10 @@ cc-session-tool list [--project <path>] [--main-only] [--all-projects] [--projec
 Summarize Claude project transcript directories and expose stable raw project handles.
 
 ```bash
-cc-session-tool projects [--glob <pattern>] [--project <path>]
+cc-session-tool projects [--glob <pattern>] [--project <path>] [--include-project-lists]
 ```
 
-Without `--project`, `projects` scans all top-level Claude project directories under `~/.claude/projects`. With `--project`, it returns the main project plus associated Claude worktree transcript directories. Rows are sorted by raw `project` basename.
+Without `--project`, `projects` scans all top-level Claude project directories under `~/.claude/projects`. With `--project`, it returns the main project plus associated Claude worktree transcript directories. Rows are sorted by raw `project` basename. `--glob` applies in both modes. `_meta.projects_scanned` / `_meta.projects_skipped` are always present; see [Project coverage metadata](#project-coverage-metadata). Unfiltered `projects` returns one row per directory, so to enumerate names use `--glob <pattern>` or `--project <path>`.
 
 | Field | Description |
 | ----- | ----------- |
@@ -480,7 +481,7 @@ cc-session-tool slice <session> --turn <N|N-M> [--project <path> | --claude-proj
 Find sessions matching structured filters. By default, search is scoped to the logical project derived from `--project <path>` or the current working directory, and it also includes associated Claude-managed worktree transcript directories. This agent-first default means a query from the main checkout can find work performed from a Claude worktree without `--all-projects`.
 
 ```bash
-cc-session-tool search [--project <path>] [--all-projects] [--project-glob <pattern>] [--tool <name>] [--input-match <text>|--input-regex <regex>] [--output-match <text>|--output-regex <regex>] [--failed] [--file <path>] [--text <text>|--text-regex <regex>] [--intent-match <text>|--intent-regex <regex>] [--bash <text>|--bash-regex <regex>] [--no-subagents] [--operation <op>] [--origin] [--sort <mode>] [--aggregate count-per-session|counters] [--counter NAME=text] [--counter-regex NAME=regex] [--bucket day|week] [--per-subagent] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>]
+cc-session-tool search [--project <path>] [--all-projects] [--project-glob <pattern>] [--include-project-lists] [--tool <name>] [--input-match <text>|--input-regex <regex>] [--output-match <text>|--output-regex <regex>] [--failed] [--file <path>] [--text <text>|--text-regex <regex>] [--intent-match <text>|--intent-regex <regex>] [--bash <text>|--bash-regex <regex>] [--no-subagents] [--operation <op>] [--origin] [--sort <mode>] [--aggregate count-per-session|counters] [--counter NAME=text] [--counter-regex NAME=regex] [--bucket day|week] [--per-subagent] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>]
 ```
 
 | Option           | Default | Description |
@@ -488,6 +489,7 @@ cc-session-tool search [--project <path>] [--all-projects] [--project-glob <patt
 | `--project`      | CWD     | Logical project path for scoped search. Scoped searches include associated Claude worktrees by default. With `--all-projects`, this becomes a file-identity query anchor, not a scan limit. |
 | `--all-projects` | false   | Search every top-level Claude project directory under `~/.claude/projects` for broad audits. Without an explicit `--project`, absolute file queries do not infer a logical project anchor from CWD or `project_path_guess`. |
 | `--project-glob` | —       | With `--all-projects`, filter by raw Claude project basename or display-only `project_path_guess`. Supports `*` and `?`. |
+| `--include-project-lists` | false | Add the full `_meta.included_projects` / `_meta.skipped_projects` arrays (default: only the `projects_scanned` / `projects_skipped` counts). See [Project coverage metadata](#project-coverage-metadata). |
 | `--tool`         | —       | Match tool names by case-insensitive substring. |
 | `--input-match`  | —       | Match raw structured tool input by case-insensitive substring, including fields omitted or truncated by `input_summary`. |
 | `--input-regex`  | —       | Match raw structured tool input by regex. Mutually exclusive with `--input-match`. |
@@ -566,11 +568,25 @@ cc-session-tool search --bash "bun test" --failed
       "branch": "feature/auth",
       "timestamp": "2026-03-07T22:31:26.359Z",
       "slug": "snuggly-floating-barto",
+      "model": "claude-sonnet-4-5",
+      "session_ref": {
+        "session_id": "DA2738E3-...",
+        "project": "-workspace-app--claude-worktrees-feature-a"
+      },
       "matches": {
-        "tools": ["Read", "Edit"],
-        "files": ["/workspace/app/src/auth.ts"],
-        "normalized_files": ["src/auth.ts"],
+        "tools": [],
+        "files": ["/workspace/app/.claude/worktrees/feature-a/src/auth.ts"],
+        "turns": [6, 8],
         "evidence": [
+          {
+            "kind": "file",
+            "rawPath": "/workspace/app/.claude/worktrees/feature-a/src/auth.ts",
+            "logicalPath": "src/auth.ts",
+            "operation": "read",
+            "turn": 6,
+            "block_index": 0,
+            "timestamp": "2026-03-07T22:33:00.000Z"
+          },
           {
             "kind": "file",
             "rawPath": "/workspace/app/.claude/worktrees/feature-a/src/auth.ts",
@@ -582,11 +598,14 @@ cc-session-tool search --bash "bun test" --failed
           }
         ],
         "operations": ["read", "edit"],
-        "turns": [6, 8]
-      }
+        "normalized_files": ["src/auth.ts"]
+      },
+      "project": "-workspace-app--claude-worktrees-feature-a",
+      "project_path_guess": "/workspace/app//claude/worktrees/feature/a",
+      "project_role": "worktree"
     }
   ],
-  "_meta": { "total": 1, "returned": 1, "hasMore": false }
+  "_meta": { "total": 1, "returned": 1, "hasMore": false, "projects_scanned": 3, "projects_skipped": 0 }
 }
 ```
 
@@ -608,7 +627,7 @@ A `tool_output` evidence item:
 }
 ```
 
-With `--aggregate count-per-session`, `data` is a per-session summary instead of full match rows:
+With `--aggregate count-per-session`, `data` is a per-session summary instead of full match rows (no `session_ref`; worktree and all-project rows keep `project`, `project_path_guess` and `project_role`):
 
 ```json
 {
@@ -622,14 +641,17 @@ With `--aggregate count-per-session`, `data` is a per-session summary instead of
       "counts": { "tool_inputs": 3 },
       "sample_matches": [
         { "tool": "Bash", "input_summary": "bun test index.test.ts", "turn": 9 }
-      ]
+      ],
+      "project": "-workspace-app--claude-worktrees-feature-a",
+      "project_path_guess": "/workspace/app//claude/worktrees/feature/a",
+      "project_role": "worktree"
     }
   ],
-  "_meta": { "total": 1, "returned": 1, "hasMore": false }
+  "_meta": { "total": 1, "returned": 1, "hasMore": false, "projects_scanned": 3, "projects_skipped": 0 }
 }
 ```
 
-Scoped responses include `_meta.included_projects`, showing the main project and associated worktree Claude project contexts that were scanned. All-project responses include every scanned Claude project unless narrowed by `--project-glob`; an explicit `--project` in all-project mode is only used to normalize absolute file queries against that logical checkout. Worktree or all-project result rows can include:
+Every response carries `_meta.projects_scanned` / `_meta.projects_skipped` (see [Project coverage metadata](#project-coverage-metadata)). Scoped searches cover the main project and its associated worktree Claude project contexts; all-project searches cover every Claude project unless narrowed by `--project-glob`; an explicit `--project` in all-project mode is only used to normalize absolute file queries against that logical checkout. Worktree or all-project result rows can include:
 
 | Field | Description |
 | ----- | ----------- |
@@ -644,7 +666,7 @@ Use `session_ref.project` with `--claude-project` rather than relying on `projec
 cc-session-tool tools DA2738E3 --claude-project -workspace-app--claude-worktrees-feature-a
 ```
 
-All-project responses also include `_meta.projects_scanned`. `--project-glob` matches Claude project identity fields, not filesystem globs over project files. Do not derive follow-up commands or roots from `project_path_guess`; it is for display and rough filtering only.
+`--project-glob` matches Claude project identity fields, not filesystem globs over project files. Do not derive follow-up commands or roots from `project_path_guess`; it is for display and rough filtering only.
 
 `--origin` reports the earliest matching transcript write evidence that satisfies the filters. It is not VCS creation history.
 
@@ -654,26 +676,38 @@ All-project responses also include `_meta.projects_scanned`. `--project-glob` ma
   "data": [
     {
       "session_id": "DA2738E3-...",
+      "branch": "feature/auth",
+      "timestamp": "2026-03-07T22:31:26.359Z",
+      "slug": "snuggly-floating-barto",
+      "model": "claude-sonnet-4-5",
       "session_ref": {
         "session_id": "DA2738E3-...",
         "project": "-workspace-app--claude-worktrees-feature-a"
       },
       "matches": {
+        "tools": [],
         "files": ["/workspace/app/.claude/worktrees/feature-a/src/auth.ts"],
-        "file_evidence": [
+        "turns": [6],
+        "evidence": [
           {
+            "kind": "file",
             "rawPath": "/workspace/app/.claude/worktrees/feature-a/src/auth.ts",
             "logicalPath": "src/auth.ts",
             "operation": "write",
             "turn": 6,
+            "block_index": 0,
             "timestamp": "2026-03-07T22:33:00.000Z"
           }
         ],
-        "turns": [6]
-      }
+        "operations": ["write"],
+        "normalized_files": ["src/auth.ts"]
+      },
+      "project": "-workspace-app--claude-worktrees-feature-a",
+      "project_path_guess": "/workspace/app//claude/worktrees/feature/a",
+      "project_role": "worktree"
     }
   ],
-  "_meta": { "total": 1, "returned": 1, "hasMore": false }
+  "_meta": { "total": 1, "returned": 1, "hasMore": false, "projects_scanned": 3, "projects_skipped": 0 }
 }
 ```
 
@@ -719,14 +753,14 @@ cc-session-tool subagents <session> [--project <path> | --claude-project <projec
 
 Corpus-wide aggregates served from a SQLite index over the transcripts (`session` / `turn` / `tool_use` tables). The index is built and refreshed lazily on use: each invocation stats every `.jsonl` in scope and re-parses only files whose mtime+size watermark changed. The JSONL transcripts remain the source of truth -- if the cache database is corrupt or unusable, the command transparently falls back to rebuilding it (or to a throwaway in-memory index) and still answers.
 
-The database lives at `~/Library/Caches/cc-session-tool/index.db` on macOS (`~/.cache/cc-session-tool/index.db` elsewhere), overridable with `--db <path>` or the `CC_SESSION_TOOL_DB` env var. `_meta.index` on every response reports the database path, `mode` (`cache` or `memory`), and `refresh` counts. `refresh.failures` lists any transcripts that could not be parsed (with `file_path` and `reason`), so a wholly-unparseable file is identifiable rather than silently dropped from the rollup.
+The database lives at `~/Library/Caches/cc-session-tool/index.db` on macOS (`~/.cache/cc-session-tool/index.db` elsewhere), overridable with `--db <path>` or the `CC_SESSION_TOOL_DB` env var. `_meta.index` on every response reports the database path, `mode` (`cache` or `memory`), and `refresh` counts. `refresh.failures` lists any transcripts that could not be parsed (with `file_path` and `reason`), so a wholly-unparseable file is identifiable rather than silently dropped from the rollup. Like every project-selecting command, `stats` always returns `_meta.projects_scanned` / `_meta.projects_skipped`; see [Project coverage metadata](#project-coverage-metadata).
 
 #### `stats tokens`
 
 Token-usage rollups across many sessions.
 
 ```bash
-cc-session-tool stats tokens [--project <path> | --all-projects] [--bucket day|week] [--by model|session] [--after <date>] [--before <date>] [--since <duration>] [--no-subagents] [--db <path>]
+cc-session-tool stats tokens [--project <path> | --all-projects] [--bucket day|week] [--by model|session] [--after <date>] [--before <date>] [--since <duration>] [--no-subagents] [--include-project-lists] [--db <path>]
 ```
 
 | Option | Default | Description |
@@ -735,6 +769,7 @@ cc-session-tool stats tokens [--project <path> | --all-projects] [--bucket day|w
 | `--by` | none | Group rows by per-turn `model` or by `session` (one row per transcript, subagents separate). |
 | `--after` / `--before` / `--since` | — | Bound by turn timestamp, **inclusive**. `--after`/`--before` take zero-padded ISO 8601: a bare date (`2026-01-09`) covers the whole UTC day (`--after` from `00:00:00.000Z`, `--before` through `23:59:59.999Z`), and a value carrying a time must include a timezone (`2026-01-09T14:30:00Z` or an offset). `--since` and `--after` are mutually exclusive. |
 | `--no-subagents` | include | Exclude subagent transcripts from the rollup. |
+| `--include-project-lists` | false | Add the full `_meta.included_projects` / `_meta.skipped_projects` arrays (default: only the `projects_scanned` / `projects_skipped` counts). See [Project coverage metadata](#project-coverage-metadata). |
 
 Each row reports `turns` (assistant turns), `turns_with_usage`, the four token sums, and `cache_hit_rate` (`cache_read / (input + cache_read + cache_creation)`). Token sums are `null` -- never `0` -- when no turn in the group carried `message.usage`, so "no data" is distinguishable from "zero tokens".
 
@@ -751,7 +786,7 @@ cc-session-tool stats tokens --bucket week
 Tool-sequence pair counts (`prev_tool -> tool`) over consecutive `tool_use` blocks within each transcript, computed with SQL window functions over `(session, agent, turn, block_index)` order.
 
 ```bash
-cc-session-tool stats trajectories [--project <path> | --all-projects] [--prev <tool>] [--next <tool>] [--operation read|edit|write|grep|glob] [--path-match <substr>] [--limit <n>] [--no-subagents] [--db <path>]
+cc-session-tool stats trajectories [--project <path> | --all-projects] [--prev <tool>] [--next <tool>] [--operation read|edit|write|grep|glob] [--path-match <substr>] [--limit <n>] [--no-subagents] [--include-project-lists] [--db <path>]
 ```
 
 | Option | Default | Description |
@@ -761,6 +796,7 @@ cc-session-tool stats trajectories [--project <path> | --all-projects] [--prev <
 | `--operation` | — | File operation of the current call. |
 | `--path-match` | — | Substring of the current call's raw file path. |
 | `--limit` | 50 | Maximum pairs returned, ordered by count descending. |
+| `--include-project-lists` | false | Add the full `_meta.included_projects` / `_meta.skipped_projects` arrays (default: only the `projects_scanned` / `projects_skipped` counts). See [Project coverage metadata](#project-coverage-metadata). |
 
 ```bash
 # How often does Edit follow Read, corpus-wide?
@@ -775,12 +811,14 @@ cc-session-tool stats trajectories --limit 20
 Escape hatches for the SQLite index that backs `stats`. Neither is required for normal use -- `stats` builds and refreshes the index automatically.
 
 ```bash
-cc-session-tool index status  [--project <path> | --all-projects] [--db <path>]
-cc-session-tool index rebuild [--project <path> | --all-projects] [--db <path>]
+cc-session-tool index status  [--project <path> | --all-projects] [--include-project-lists] [--db <path>]
+cc-session-tool index rebuild [--project <path> | --all-projects] [--include-project-lists] [--db <path>]
 ```
 
 - `index status` reports the database path, schema version, size, row counts, and scope freshness (`fresh` / `stale` / `not_indexed` / `orphaned` transcript counts).
 - `index rebuild` deletes the database and re-indexes the selected scope from scratch (default: all projects). A schema-version bump does this automatically on first use; there is no migration code by design.
+
+Both always return `_meta.projects_scanned` / `_meta.projects_skipped`; see [Project coverage metadata](#project-coverage-metadata).
 
 ## Composition Examples
 
@@ -899,6 +937,20 @@ Errors:
   "error": { "code": "NOT_FOUND", "message": "..." }
 }
 ```
+
+### Project coverage metadata
+
+`list`, `projects`, `search`, `stats tokens`, `stats trajectories`, `index status` and `index rebuild` always return two counts in `_meta`:
+
+```json
+"_meta": { "total": 1, "returned": 1, "hasMore": false, "projects_scanned": 3, "projects_skipped": 0 }
+```
+
+- `projects_scanned` is the number of Claude project directories selected for the scan, including any that later failed to read.
+- `projects_skipped` is the number of candidate directories excluded by `--project-glob` (or `projects --glob`) only; it is `0` when no glob applied. `--main-only` exclusions and projects outside a scoped selection are not counted, so `projects_scanned + projects_skipped` equals the total number of directories only in all-projects mode.
+- `--include-project-lists` adds the `_meta.included_projects` and `_meta.skipped_projects` arrays (each entry has `project`, `project_path_guess`, `project_role`). They are absent by default because they grow with the number of Claude project directories and can exceed agent tool-output limits; `skipped_projects` is `[]` unless a glob excluded something.
+- Name pitfall: `projects_skipped` (count) and `skipped_projects` (array) differ only in word order.
+- To enumerate project names, use `projects --glob <pattern>` or `projects --project <path>`; unfiltered `projects` returns one row per directory.
 
 ### Exit Codes
 

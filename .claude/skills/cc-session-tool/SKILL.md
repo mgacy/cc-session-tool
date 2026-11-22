@@ -71,7 +71,7 @@ To scope `list` to one project, or to follow up on a row, pick the row of this t
 | What you have | Use | If the value is wrong |
 | --- | --- | --- |
 | The checkout or worktree path, e.g. `<repo>/.claude/worktrees/<name>` (**preferred**) | `list --project <path>` | `NOT_FOUND` |
-| Only a raw Claude basename: the `project` / `session_ref.project` field of a `search`, `list` or `projects` row | `list --all-projects --project-glob <basename>` | `ok:true` with empty `data` and `_meta.projects_scanned: 0`. Confirm `_meta.projects_scanned === 1` before trusting an empty result. `_meta.skipped_projects` lists every other project, so the response grows with the number of projects. |
+| Only a raw Claude basename: the `project` / `session_ref.project` field of a `search`, `list` or `projects` row | `list --all-projects --project-glob <basename>` | `ok:true` with empty `data` and `_meta.projects_scanned: 0`. Confirm `_meta.projects_scanned === 1` before trusting an empty result. |
 | A session to inspect, plus its raw basename | `shape`, `summary`, `tools`, `files`, `tokens`, `messages`, `slice` or `subagents` with `<session> --claude-project <basename>` | `NOT_FOUND` |
 
 - `search` scopes the same way as `list`.

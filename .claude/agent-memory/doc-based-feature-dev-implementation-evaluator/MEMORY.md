@@ -1,0 +1,1 @@
+- [Executor transcript audit](reference_executor_transcript_audit.md) — progress.json timestamps can be estimates; check `subagents`/`shape`, and slice `T-(T+1)` to see a command's result
