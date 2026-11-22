@@ -2597,7 +2597,8 @@ const searchCommand = defineCommand({
           throw cliError('INVALID_ARGS', `--tool ${args.tool} can never name a file tool (Read, Edit, Write, Grep, Glob); --file with --output-match/--output-regex/--failed binds both to one call`);
         }
         if (effectiveOperation && toolQuery && !effectiveOperation.includes(toolQuery)) {
-          throw cliError('INVALID_ARGS', `--tool ${args.tool} contradicts --operation ${effectiveOperation} (or --origin) when selectors bind to one call`);
+          const operationSource = args.operation ? `--operation ${args.operation}` : '--origin (implies --operation write)';
+          throw cliError('INVALID_ARGS', `--tool ${args.tool} contradicts ${operationSource} when selectors bind to one call`);
         }
       }
 

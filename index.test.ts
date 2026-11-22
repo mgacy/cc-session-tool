@@ -4855,6 +4855,7 @@ describe('search tool output integration', () => {
   const OUT_A = 'a0a0a0a0-0000-4000-8000-00000000000a';
   const OUT_B = 'b0b0b0b0-0000-4000-8000-00000000000b';
   const OUT_C = 'c0c0c0c0-0000-4000-8000-00000000000c';
+  const OUT_D = 'd0d0d0d0-0000-4000-8000-00000000000d';
   const run = (args: string[]) => runCli(['search', ...args, '--project', OUTPUT_PROJECT], { HOME: OUTPUT_FIXTURE_HOME });
   const search = async (args: string[]) => parseOutput((await run(args)).stdout);
   const ids = (result: any): string[] => result.data.map((s: any) => s.session_id);
@@ -4913,6 +4914,13 @@ describe('search tool output integration', () => {
       JSON.stringify({ type: 'user', sessionId: OUT_C, timestamp: '2026-04-02T12:00:00.000Z', cwd: OUTPUT_PROJECT, gitBranch: 'main', message: { role: 'user', content: 'Find docs' } }),
       JSON.stringify({ type: 'assistant', timestamp: '2026-04-02T12:01:00.000Z', cwd: OUTPUT_PROJECT, message: { role: 'assistant', content: [use('Glob', 'glob_hit', { pattern: '**/*.md' }), use('Glob', 'glob_empty', { pattern: '**/*.rst' })] } }),
       JSON.stringify({ type: 'user', timestamp: '2026-04-02T12:01:05.000Z', cwd: OUTPUT_PROJECT, message: { role: 'user', content: [result('glob_hit', 'README.md'), result('glob_empty', '')] } }),
+    ].join('\n') + '\n');
+
+    // Null content blocks in both roles: scoped search builds a worktree context over every block.
+    writeFileSync(join(OUTPUT_CLAUDE_DIR, `${OUT_D}.jsonl`), [
+      JSON.stringify({ type: 'user', sessionId: OUT_D, timestamp: '2026-04-02T14:00:00.000Z', cwd: OUTPUT_PROJECT, gitBranch: 'main', message: { role: 'user', content: [null, { type: 'text', text: 'Check nulls' }] } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-04-02T14:01:00.000Z', cwd: OUTPUT_PROJECT, message: { role: 'assistant', content: [null, { type: 'text', text: 'nullblock prose' }, use('Bash', 'null_bash', { command: 'make nulls' })] } }),
+      JSON.stringify({ type: 'user', timestamp: '2026-04-02T14:01:05.000Z', cwd: OUTPUT_PROJECT, message: { role: 'user', content: [result('null_bash', 'NULLBLOCK_ERR exit 2', true)] } }),
     ].join('\n') + '\n');
   });
 
@@ -4981,6 +4989,14 @@ describe('search tool output integration', () => {
       const outputs = evidenceOf(r, OUT_A).filter(e => e.kind === 'tool_output');
       expect(outputs).toHaveLength(1);
       expect(outputs[0]).toMatchObject({ tool_use_id: 'bash_a', block_index: 0, result_turn: 3 });
+    });
+
+    test('null content blocks do not drop a session from scoped search', async () => {
+      const r = await search(['--output-match', 'NULLBLOCK_ERR']);
+      expect(r.ok).toBe(true);
+      expect(ids(r)).toEqual([OUT_D]);
+      expect(evidenceOf(r, OUT_D).find(e => e.kind === 'tool_output')).toMatchObject({ tool_use_id: 'null_bash', block_index: 2, is_error: true });
+      expect(ids(await search(['--text', 'nullblock prose', '--failed']))).toEqual([OUT_D]);
     });
 
     test('--text and --failed stay session-level', async () => {
@@ -5099,7 +5115,7 @@ describe('search tool output integration', () => {
       ['--bash with a non-Bash --tool', ['--bash', 'npm', '--tool', 'Read', '--failed'], '--tool Read can never name a Bash call'],
       ['--file with a non-file --tool', ['--file', 'x', '--tool', 'Bash', '--failed'], '--tool Bash can never name a file tool'],
       ['--operation contradicting --tool', ['--file', 'x', '--operation', 'edit', '--tool', 'Write', '--failed'], '--tool Write contradicts --operation edit'],
-      ['--origin (implies write) contradicting --tool', ['--file', 'x', '--origin', '--tool', 'Read', '--failed'], '--tool Read contradicts --operation write'],
+      ['--origin (implies write) contradicting --tool', ['--file', 'x', '--origin', '--tool', 'Read', '--failed'], '--tool Read contradicts --origin (implies --operation write)'],
       ['--output-regex with --bash-regex and --file', ['--bash-regex', 'npm', '--file', 'x', '--output-regex', 'y'], '--bash and --file can never match the same tool call'],
     ];
     for (const [name, args, message] of rejected) {

@@ -326,7 +326,7 @@ export function collectObservedWorktreeRoots(entries: SessionEntry[], projectRoo
     const content = entry.message?.content;
     if (!Array.isArray(content)) continue;
     for (const block of content) {
-      if (block.type !== 'tool_use' || !block.name) continue;
+      if (block?.type !== 'tool_use' || !block.name) continue;
       const fileInfo = extractFilePath(block.name, block.input ?? {});
       if (!fileInfo || !isAbsolute(fileInfo.path)) continue;
       const worktreeRoot = acceptedWorktreeRoot(projectRoot, fileInfo.path);

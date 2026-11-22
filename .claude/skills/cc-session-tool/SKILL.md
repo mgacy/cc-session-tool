@@ -168,8 +168,9 @@ cc-session-tool search --tool Bash --output-match "permission denied" --sort mat
 # Or: Bash calls matching a command whose result failed
 cc-session-tool search --bash "bun test" --failed
 
-# Follow up on a tool_output evidence item: read the full result at result_turn
-cc-session-tool messages DA2738E3 --claude-project <session_ref.project> \
+# Follow up on a tool_output evidence item: read the full result at result_turn.
+# Append :<agent_id> when the evidence came from a subagent, and pick the result whose tool_use_id matches.
+cc-session-tool messages <session>[:<agent_id>] --claude-project <session_ref.project> \
   --turn <result_turn> --type tool_result --max-tool-result 4000
 ```
 
