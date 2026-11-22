@@ -4982,6 +4982,49 @@ describe('search tool output integration', () => {
       expect(r.error.message).toContain('At least one search filter is required');
     });
   });
+
+  describe('never-matching bound combinations', () => {
+    const rejected: Array<[string, string[], string]> = [
+      ['--bash with --file', ['--bash', 'npm', '--file', 'x', '--failed'], '--bash and --file can never match the same tool call'],
+      ['--bash with a non-Bash --tool', ['--bash', 'npm', '--tool', 'Read', '--failed'], '--tool Read can never name a Bash call'],
+      ['--file with a non-file --tool', ['--file', 'x', '--tool', 'Bash', '--failed'], '--tool Bash can never name a file tool'],
+      ['--operation contradicting --tool', ['--file', 'x', '--operation', 'edit', '--tool', 'Write', '--failed'], '--tool Write contradicts --operation edit'],
+      ['--origin (implies write) contradicting --tool', ['--file', 'x', '--origin', '--tool', 'Read', '--failed'], '--tool Read contradicts --operation write'],
+      ['--output-regex with --bash-regex and --file', ['--bash-regex', 'npm', '--file', 'x', '--output-regex', 'y'], '--bash and --file can never match the same tool call'],
+    ];
+    for (const [name, args, message] of rejected) {
+      test(`rejects ${name}`, async () => {
+        const r = await search(args);
+        expect(r.ok).toBe(false);
+        expect(r.error.code).toBe('INVALID_ARGS');
+        expect(r.error.message).toContain(message);
+      });
+    }
+
+    test('rejects --aggregate counters with result selectors', async () => {
+      const r = await search(['--failed', '--aggregate', 'counters', '--counter', 'a=b']);
+      expect(r.ok).toBe(false);
+      expect(r.error.code).toBe('INVALID_ARGS');
+      expect(r.error.message).toContain('--aggregate counters does not support --output-match, --output-regex, or --failed');
+    });
+
+    test('still accepts compatible bound combinations', async () => {
+      for (const args of [
+        ['--bash', 'npm', '--tool', 'Bash', '--failed'],
+        ['--file', 'x', '--tool', 'Edit', '--failed'],
+        ['--file', 'x', '--tool', 'Write', '--operation', 'write', '--failed'],
+        ['--file', 'x', '--origin', '--tool', 'Write', '--failed'],
+      ]) {
+        const r = await search(args);
+        expect(r.ok).toBe(true);
+      }
+    });
+
+    test('session-level --tool Bash --file without result selectors is still accepted', async () => {
+      const r = await search(['--tool', 'Bash', '--file', 'x']);
+      expect(r.ok).toBe(true);
+    });
+  });
 });
 
 describe('search tool output on shared fixture (read-only)', () => {

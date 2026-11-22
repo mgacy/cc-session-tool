@@ -2567,6 +2567,28 @@ const searchCommand = defineCommand({
         throw cliError('INVALID_ARGS', '--counter and --counter-regex require --aggregate counters');
       }
 
+      if (hasResultSelectors) {
+        if (aggregateMode === 'counters') {
+          throw cliError('INVALID_ARGS', '--aggregate counters does not support --output-match, --output-regex, or --failed; use --aggregate count-per-session');
+        }
+        // Result selectors bind every tool-call selector to one call; reject pairs that can never land on the same call.
+        const hasBashSelector = Boolean(args.bash || args['bash-regex']);
+        const toolQuery = args.tool?.toLowerCase();
+        const effectiveOperation = origin ? 'write' : args.operation;
+        if (hasBashSelector && args.file) {
+          throw cliError('INVALID_ARGS', '--bash and --file can never match the same tool call when --output-match/--output-regex/--failed bind selectors to one call; run two searches');
+        }
+        if (hasBashSelector && toolQuery && !'bash'.includes(toolQuery)) {
+          throw cliError('INVALID_ARGS', `--tool ${args.tool} can never name a Bash call; --bash with --output-match/--output-regex/--failed binds both to one call`);
+        }
+        if (args.file && toolQuery && !SEARCH_OPERATIONS.some(op => op.includes(toolQuery))) {
+          throw cliError('INVALID_ARGS', `--tool ${args.tool} can never name a file tool (Read, Edit, Write, Grep, Glob); --file with --output-match/--output-regex/--failed binds both to one call`);
+        }
+        if (effectiveOperation && toolQuery && !effectiveOperation.includes(toolQuery)) {
+          throw cliError('INVALID_ARGS', `--tool ${args.tool} contradicts --operation ${effectiveOperation} (or --origin) when selectors bind to one call`);
+        }
+      }
+
       // Null exactly when the raw values are falsy, matching hasResultSelectors.
       const outputMatcher = args['output-regex']
         ? parseCliRegexMatcher(args['output-regex'], '--output-regex')
