@@ -1,0 +1,1 @@
+- [progress.json timestamps unreliable](project_progress_json_timestamps.md) — executors may invent round-minute started_at/completed_at; recover starts via `subagents`, durations via `shape` on the orchestrator session
