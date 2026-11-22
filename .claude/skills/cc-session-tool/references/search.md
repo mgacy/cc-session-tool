@@ -39,7 +39,7 @@ At least one **selector** is required: `--tool`, `--input-match` / `--input-rege
 | `--origin` | With `--file`, returns earliest matching transcript **write** evidence | Implies `--operation write`. Defaults to one result. Transcript evidence, **not** VCS creation history. |
 | `--text <text>` / `--text-regex` | User/assistant text and thinking | Case-insensitive substring or regex. |
 | `--intent-match <text>` / `--intent-regex` | Session intent sources (slug, first prompt token, first user message) | |
-| `--bash <text>` / `--bash-regex` | Bash command inputs | Shorthand for finding Bash commands in match rows. For audits with `--aggregate`, use `--tool Bash --input-match` instead (see [Aggregation modes](#aggregation-modes)). |
+| `--bash <text>` / `--bash-regex` | Bash command inputs | Convenience over `--tool Bash --input-match`; use that form with `--aggregate`. |
 
 ## File identity matching (the worktree story)
 
@@ -68,23 +68,19 @@ Use `--all-projects` only for broad audits.
 | `--after <ISO>` / `--before <ISO>` | Date range. |
 | `--since <duration>` | `30m`, `2h`, `1d`, `1w`. Mutually exclusive with `--after`. |
 
-Date filters compare against each session's start time: a session that began before the cutoff is excluded even if its later activity falls inside the range.
+Date filters and `--bucket` use session start time.
 
 ## Aggregation modes
 
-Default: full match rows with evidence. Two summary modes:
-
-Both count matching tool calls, not occurrences of the text: `bun test && bun test` in one Bash call counts once, and a command that only mentions the text (for example, in a commit message) counts too.
+Default: full match rows with evidence. Two summary modes, both counting matching tool calls, including ones that only mention the text:
 
 ### `--aggregate count-per-session`
 
 Per-session rollup with `counts.tool_inputs` and a small `sample_matches` array. Useful for "how often did session X do Y" audits.
 
-Counts the tool calls matched by `--tool`, `--input-match`, or `--input-regex`; `--tool Bash` alone counts every Bash call. For Bash audits use `--tool Bash --input-match '<text>'`, and don't combine `--bash` or `--bash-regex` with `--aggregate` (the count currently ignores their matches).
-
 ### `--aggregate counters`
 
-Named raw-input counters. Combine with `--counter NAME=text` or `--counter-regex NAME=regex` (repeatable). Counters match every tool call's raw input, so pass `--tool` to limit them to one tool. Add `--bucket day|week` to bucket by each session's start date (missing timestamps go to `unknown`). `--per-subagent` emits transcript-level rows instead of parent-session rollups.
+Named raw-input counters; without `--tool`, they match every tool's input. Combine with `--counter NAME=text` or `--counter-regex NAME=regex` (repeatable). Add `--bucket day|week` to bucket by date (missing timestamps go to `unknown`). `--per-subagent` emits transcript-level rows instead of parent-session rollups.
 
 ```bash
 cc-session-tool search --tool Bash --aggregate counters \

@@ -7,7 +7,7 @@ description: Use cc-session-tool to inspect Claude Code session transcripts. Tri
 
 A CLI that queries Claude Code session transcripts and returns compact JSON. Designed for agent consumption — every command returns a `{ ok, data, _meta }` envelope so output is mechanical to parse.
 
-The CLI runs as `cc-session-tool` on PATH; inside the cc-session-tool repository, `bun run index.ts <command>` also works. If neither is available, tell the user rather than reading the JSONL files directly. Run any subcommand with `--help` for full flag reference, or consult `references/commands.md` in this skill for a condensed catalog.
+The binary `cc-session-tool` is on PATH. Run any subcommand with `--help` for full flag reference, or consult `references/commands.md` in this skill for a condensed catalog.
 
 ## When to reach for which command
 
@@ -37,7 +37,7 @@ Two-phase pattern that minimizes token usage:
 1. **Triage** — narrow to one session with `list`, `search`, or a session ID the user provided.
 2. **Drill** — start with `summary` for a one-shot overview. If you need more, use `shape` for the table of contents, then `tools` / `files` / `messages` / `slice` for specifics.
 
-Avoid `slice` without a `--turn` range narrower than ~5 turns — it returns raw content, which is expensive. Use `shape` or `messages` first to locate the turns you care about. `messages` truncates text and thinking to 200 characters across a turn range, but a single `--turn N` returns them in full unless you pass `--max-content`.
+Avoid `slice` without a `--turn` range narrower than ~5 turns — it returns raw content, which is expensive. Use `messages` (truncated by default, except for a single `--turn N`) or `shape` first to locate the turns you care about.
 
 ## Key concepts
 

@@ -178,7 +178,7 @@ cc-session-tool messages <session> [flags]
 | `--role <user\|assistant>` | all | Role filter. |
 | `--type <text\|thinking\|tool_use\|tool_result>` | all | Block type filter. |
 | `--turn <N\|N-M>` | all | Turn or range. |
-| `--max-content <chars>` | 200 | Truncate text/thinking content (suffix `...[truncated, N chars]`). When `--turn` selects a single turn (`N` or `N-N`), text/thinking is unbounded unless this is set. |
+| `--max-content <chars>` | 200; unbounded for a single `--turn` | Truncate text/thinking content (suffix `...[truncated, N chars]`). |
 
 `tool_use` blocks keep `name` and `id` (not truncated). `tool_result` blocks keep `tool_use_id` and `is_error`, with truncated content.
 
