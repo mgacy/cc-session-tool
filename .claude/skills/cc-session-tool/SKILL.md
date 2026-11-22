@@ -102,7 +102,7 @@ Every command emits one of:
 
 Exit codes: `0` success, `1` format error, `2` invalid args, `3` not found. Always check `_meta.hasMore` — long results truncate.
 
-**Project coverage.** `list`, `projects`, `search`, `stats tokens|trajectories` and `index status|rebuild` always add `_meta.projects_scanned` (Claude project directories selected, including any that later failed to read) and `_meta.projects_skipped` (directories excluded by `--project-glob` / `projects --glob` only; `--main-only` exclusions and projects outside a scoped selection are not counted, so `projects_scanned + projects_skipped` equals the total number of Claude project directories only in all-projects mode). `--include-project-lists` adds the `included_projects` / `skipped_projects` arrays; they grow with the number of project directories and can exceed agent tool-output limits. To enumerate names, use `projects --glob <pattern>` or `projects --project <path>`, never unfiltered `projects` (one row per directory).
+**Project coverage.** `list`, `projects`, `search`, `stats` and `index` always return `_meta.projects_scanned` / `_meta.projects_skipped`. Check `projects_scanned` before trusting an empty result: `0` means no project directory matched, so empty `data` proves nothing. Pass `--include-project-lists` only when you need the project names; the lists grow with the number of Claude project directories and can exceed tool-output limits. To enumerate project names, use `projects --glob <pattern>` or `projects --project <path>`, never unfiltered `projects`, which returns one row per directory.
 
 ## Common workflows
 
