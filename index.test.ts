@@ -4190,6 +4190,28 @@ describe('search integration', () => {
     ]);
   });
 
+  test('--aggregate count-per-session counts --bash and --bash-regex matches', async () => {
+    for (const selector of [['--bash', 'npm install'], ['--bash-regex', 'npm\\s+install']]) {
+      const result = parseOutput((await runCli(['search', ...selector, '--aggregate', 'count-per-session', '--project', FAKE_PROJECT])).stdout);
+      expect(result.ok).toBe(true);
+      const aggregate = result.data.find((s: any) => s.session_id === SESSION_ID_4);
+      expect(aggregate.counts.tool_inputs).toBe(1);
+      expect(aggregate.sample_matches).toEqual([
+        { tool: 'Bash', input_summary: expect.stringContaining('npm install express'), turn: 2 },
+      ]);
+    }
+  });
+
+  test('--aggregate count-per-session counts only calls matching both --tool and --bash', async () => {
+    const count = async (...selectors: string[]) => {
+      const result = parseOutput((await runCli(['search', ...selectors, '--aggregate', 'count-per-session', '--project', FAKE_PROJECT])).stdout);
+      expect(result.ok).toBe(true);
+      return result.data.find((s: any) => s.session_id === SESSION_ID_4).counts.tool_inputs;
+    };
+    expect(await count('--tool', 'Bash')).toBe(2);
+    expect(await count('--tool', 'Bash', '--bash', 'npm install')).toBe(1);
+  });
+
   test('--aggregate counters uses counters as selector and returns nonzero rows', async () => {
     const { exitCode, stdout } = await runCli(['search', '--counter', 'tracking=.claude-tracking', '--aggregate', 'counters', '--project', FAKE_PROJECT]);
     expect(exitCode).toBe(0);
@@ -4306,7 +4328,7 @@ describe('search integration', () => {
     const withoutToolInput = parseOutput((await runCli(['search', '--file', 'hello.ts', '--aggregate', 'count-per-session', '--project', FAKE_PROJECT])).stdout);
     expect(withoutToolInput.ok).toBe(false);
     expect(withoutToolInput.error.code).toBe('INVALID_ARGS');
-    expect(withoutToolInput.error.message).toContain('--aggregate requires --tool, --input-match, or --input-regex');
+    expect(withoutToolInput.error.message).toContain('--aggregate requires --tool, --input-match, --input-regex, --bash, or --bash-regex');
 
     const invalidMode = parseOutput((await runCli(['search', '--tool', 'Read', '--aggregate', 'totals', '--project', FAKE_PROJECT])).stdout);
     expect(invalidMode.ok).toBe(false);

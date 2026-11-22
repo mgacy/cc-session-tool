@@ -289,9 +289,31 @@ export function evidenceTimestamps(match: SearchMatch, kind?: SearchEvidenceKind
     .sort();
 }
 
+export type CallSelectors = { toolInput: boolean; bash: boolean };
+
+/** One evidence item per tool call that satisfies every selected call-level selector. */
+export function matchedToolCalls(evidence: SearchEvidence[], selectors: CallSelectors): SearchEvidence[] {
+  const required: SearchEvidenceKind[] = [];
+  if (selectors.toolInput) required.push('tool_input');
+  if (selectors.bash) required.push('bash');
+
+  const byCall = new Map<string, Map<SearchEvidenceKind, SearchEvidence>>();
+  for (const item of evidence) {
+    if (!required.includes(item.kind)) continue;
+    const key = `${item.agent_id ?? ''}:${item.turn}:${item.block_index}`;
+    let kinds = byCall.get(key);
+    if (!kinds) byCall.set(key, kinds = new Map());
+    kinds.set(item.kind, item);
+  }
+
+  return Array.from(byCall.values())
+    .filter(kinds => required.every(kind => kinds.has(kind)))
+    .map(kinds => kinds.get(required[0]!)!);
+}
+
 export function toolInputSamplesFromEvidence(evidence: SearchEvidence[], limit = 5): ToolInputMatch[] {
   return evidence
-    .filter(e => e.kind === 'tool_input' && e.tool)
+    .filter(e => (e.kind === 'tool_input' || e.kind === 'bash') && e.tool)
     .slice(0, limit)
     .map(e => ({
       tool: e.tool!,

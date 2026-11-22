@@ -35,6 +35,7 @@ import {
   attachCounterTranscriptResults,
   bucketCounterRows,
   evidenceTimestamps,
+  matchedToolCalls,
   parseCounterArgs,
   parseRegexMatcher,
   parseSubstringMatcher,
@@ -42,6 +43,7 @@ import {
   snippetForMatch,
   testTextMatcher,
   toolInputSamplesFromEvidence,
+  type CallSelectors,
   type TextMatcher,
   type SearchEvidence,
   type SearchEvidenceKind,
@@ -2155,6 +2157,7 @@ async function scanSearchTranscript(target: SearchTarget, args: PreparedSearchAr
               block_index: blockIndex,
               timestamp: entry.timestamp ?? null,
               tool: 'Bash',
+              input_summary: safeInputSummary('Bash', block.input ?? {}),
               snippet: snippetForMatch(command, args.bashMatcher, SEARCH_EVIDENCE_SNIPPET_CHARS),
             }, target));
             matchedTurns.add(turnNum);
@@ -2357,18 +2360,23 @@ export function sortSearchMatches(matches: SearchMatch[], mode: SearchSortMode):
   });
 }
 
-export function aggregateSearchMatches(matches: SearchMatch[], mode: SearchAggregateMode): SearchAggregateResult[] {
+export function aggregateSearchMatches(
+  matches: SearchMatch[],
+  mode: SearchAggregateMode,
+  selectors: CallSelectors = { toolInput: true, bash: false },
+): SearchAggregateResult[] {
   if (mode === 'none') return [];
   return matches.map(match => {
+    const calls = matchedToolCalls(match.matches.evidence, selectors);
     const result: SearchAggregateResult = {
       session_id: match.session_id,
       branch: match.branch,
       timestamp: match.timestamp,
       slug: match.slug,
       counts: {
-        tool_inputs: match.matches.evidence.filter(evidence => evidence.kind === 'tool_input').length,
+        tool_inputs: calls.length,
       },
-      sample_matches: toolInputSamplesFromEvidence(match.matches.evidence),
+      sample_matches: toolInputSamplesFromEvidence(calls),
     };
     if (match.project !== undefined) result.project = match.project;
     if (match.project_path_guess !== undefined) result.project_path_guess = match.project_path_guess;
@@ -2458,8 +2466,8 @@ const searchCommand = defineCommand({
       if (aggregateMode !== 'none' && aggregateMode !== 'count-per-session' && aggregateMode !== 'counters') {
         throw cliError('INVALID_ARGS', '--aggregate must be one of: count-per-session, counters');
       }
-      if (aggregateMode === 'count-per-session' && !args.tool && !args['input-match'] && !args['input-regex']) {
-        throw cliError('INVALID_ARGS', '--aggregate requires --tool, --input-match, or --input-regex');
+      if (aggregateMode === 'count-per-session' && !args.tool && !args['input-match'] && !args['input-regex'] && !args.bash && !args['bash-regex']) {
+        throw cliError('INVALID_ARGS', '--aggregate requires --tool, --input-match, --input-regex, --bash, or --bash-regex');
       }
       const bucketMode = (args.bucket ?? 'none') as SearchBucketMode;
       if (bucketMode !== 'none' && bucketMode !== 'day' && bucketMode !== 'week') {
@@ -2570,7 +2578,10 @@ const searchCommand = defineCommand({
       let responseData: unknown = returned;
       let responseMeta: SearchMeta = meta(total, returned.length);
       if (aggregateMode === 'count-per-session') {
-        responseData = aggregateSearchMatches(returned, aggregateMode);
+        responseData = aggregateSearchMatches(returned, aggregateMode, {
+          toolInput: Boolean(args.tool || args['input-match'] || args['input-regex']),
+          bash: Boolean(args.bash || args['bash-regex']),
+        });
       } else if (aggregateMode === 'counters') {
         const explicitSelector = Boolean(args.tool || args['input-match'] || args['input-regex'] || args.file || args.text || args['text-regex'] || args.bash || args['bash-regex'] || args['intent-match'] || args['intent-regex']);
         const counterRows = aggregateCounterRows(returned, counters, {
