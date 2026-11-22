@@ -39,7 +39,7 @@ At least one **selector** is required: `--tool`, `--input-match` / `--input-rege
 | `--origin` | With `--file`, returns earliest matching transcript **write** evidence | Implies `--operation write`. Defaults to one result. Transcript evidence, **not** VCS creation history. |
 | `--text <text>` / `--text-regex` | User/assistant text and thinking | Case-insensitive substring or regex. |
 | `--intent-match <text>` / `--intent-regex` | Session intent sources (slug, first prompt token, first user message) | |
-| `--bash <text>` / `--bash-regex` | Bash command inputs | Convenience over `--tool Bash --input-match`; use that form with `--aggregate`. |
+| `--bash <text>` / `--bash-regex` | Bash command inputs | Convenience over `--tool Bash --input-match`. |
 
 ## File identity matching (the worktree story)
 
