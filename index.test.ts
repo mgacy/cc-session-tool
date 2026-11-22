@@ -6337,7 +6337,9 @@ describe('strict argument dispatch integration', () => {
     test('-h reaches citty help even with an unknown flag present', async () => {
       const { exitCode, stdout } = await runCliHelp(['shape', 'x', '--definitely-unknown', '-h']);
       expect(exitCode).toBe(0);
-      expect(stdout).toContain('USAGE cc-session-tool shape');
+      // consola renders the usage line differently under CI (`[log]` prefix, ANSI codes,
+      // literal backticks), so match only the span that is contiguous in every reporter.
+      expect(stdout).toContain('cc-session-tool shape [OPTIONS] <SESSION>');
     });
 
     test('repeated --counter and --counter-regex both produce counters', async () => {
