@@ -1,4 +1,3 @@
 - [Scratchpad fixtures truncate](reference_plan_review_simulation.md) — scratchpad paths exceed 200 sanitized chars; derive fixture project names with the encoder
 - [Claude Code encoder parity](reference_claude_code_encoder_parity.md) — find the ground-truth project-dir encoder in the native binary via grep -F plus dd, not a context regex
-- [Pre-existing pipe truncation](project_preexisting_pipe_truncation.md) — large JSON via pipe truncates at ~64KB (seen at d9c8e0c); redirect to a file, don't blame the diff
-- [bun test filter gotcha](reference_bun_test_filter_gotcha.md) — `--filter` filters files and runs nothing here; use `bun test index.test.ts -t "<pattern>"`
+- [Pre-existing pipe truncation](project_preexisting_pipe_truncation.md) — large JSON via pipe truncates at ~64KB (issue #21); redirect to a file, don't blame the diff
