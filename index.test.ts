@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
-import { appendFileSync, mkdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'fs';
+import { appendFileSync, mkdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'fs';
 import { Database } from 'bun:sqlite';
 import { basename, join } from 'path';
 import { tmpdir } from 'os';
@@ -37,6 +37,7 @@ import {
 import {
   buildScopedSearchScope as buildScopedSearchScopeModule,
   listSearchTargetsForContext as listSearchTargetsForContextModule,
+  claudeProjectPathHash,
   mangleProjectPath as mangleProjectPathModule,
 } from './src/project-selection.ts';
 import {
@@ -603,6 +604,77 @@ describe('Claude project discovery helpers', () => {
     expect(mangleProjectPath('/tmp/example/./')).toBe(mangleProjectPath('/tmp/example'));
   });
 
+  // Encoding-sensitive expectations below are hardcoded literals on purpose: a fixture derived from the
+  // encoder agrees with any encoder, which is how the original dot-handling bug went unnoticed.
+  test('mangleProjectPath maps every non-alphanumeric character to a hyphen like Claude Code', () => {
+    // Issue example: the '.' of '.claude' becomes '-', so the worktree dir has a double dash.
+    expect(mangleProjectPath('/workspace/app/.claude/worktrees/feature-a')).toBe('-workspace-app--claude-worktrees-feature-a');
+    // macOS tmpdir shape contains an underscore.
+    expect(mangleProjectPath('/var/folders/_t/abc/T/x')).toBe('-var-folders--t-abc-T-x');
+    expect(mangleProjectPath('/workspace/My App - v2/pkg')).toBe('-workspace-My-App---v2-pkg');
+    expect(mangleProjectPath('/work/repo/.notes/042_draft_plan')).toBe('-work-repo--notes-042-draft-plan');
+    expect(mangleProjectPath('/work/a@b+c/pkg')).toBe('-work-a-b-c-pkg');
+  });
+
+  test('mangleProjectPath NFC-normalizes and encodes per UTF-16 code unit', () => {
+    const precomposed = '/tmp/caf\u00e9';
+    const decomposed = '/tmp/cafe\u0301';
+    expect(precomposed).not.toBe(decomposed);
+    expect(mangleProjectPath(precomposed)).toBe('-tmp-caf-');
+    expect(mangleProjectPath(decomposed)).toBe('-tmp-caf-');
+    // An astral character is two UTF-16 code units, so it yields two hyphens.
+    expect(mangleProjectPath('/tmp/\u{1F600}')).toBe('-tmp---');
+  });
+
+  test('mangleProjectPath output only ever contains alphanumerics and hyphens', () => {
+    const inputs = [
+      '/tmp/../..',
+      '/a/..b',
+      '/a/b\nc',
+      '/a/b\\c',
+      `/workspace/${'a'.repeat(300)}`,
+      '/tmp/caf\u00e9/\u{1F600}/na\u00efve',
+    ];
+    for (const input of inputs) {
+      expect(mangleProjectPath(input)).toMatch(/^[A-Za-z0-9-]+$/);
+    }
+  });
+
+  // The suffixes f06yf, qm5yvc and 16gmfc were computed with the reference algorithm during planning,
+  // not observed from Claude Code. The Java String.hashCode oracle test below is the independent check.
+  test('claudeProjectPathHash matches Java String.hashCode as base36 of the JS absolute value', () => {
+    // Inputs and Java hashCode values: '' = 0, 'a' = 97, 'hello' = 99162322, 'Hello World' = -862545276,
+    // 'polygenelubricants' = Integer.MIN_VALUE (JS Math.abs gives +2147483648, unlike Java's Math.abs).
+    expect(claudeProjectPathHash('')).toBe('0');
+    expect(claudeProjectPathHash('a')).toBe('2p');
+    expect(claudeProjectPathHash('hello')).toBe('1n1e4y');
+    expect(claudeProjectPathHash('Hello World')).toBe('e9jc70');
+    expect(claudeProjectPathHash('polygenelubricants')).toBe('zik0zk');
+  });
+
+  test('mangleProjectPath truncates names over 200 chars and appends the path hash', () => {
+    const exactly200 = `/workspace/${'a'.repeat(189)}`;
+    expect(mangleProjectPath(exactly200)).toBe(`-workspace-${'a'.repeat(189)}`);
+    expect(mangleProjectPath(exactly200)).toHaveLength(200);
+
+    const over200 = `/workspace/${'a'.repeat(190)}`;
+    expect(mangleProjectPath(over200)).toBe(`-workspace-${'a'.repeat(189)}-f06yf`);
+  });
+
+  test('mangleProjectPath hashes the unsanitized path of a truncated nested worktree', () => {
+    const nested = `/workspace/app/.claude/worktrees/${'x'.repeat(100)}/.claude/worktrees/${'y'.repeat(80)}`;
+    const encoded = mangleProjectPath(nested);
+    expect(encoded).toBe(`-workspace-app--claude-worktrees-${'x'.repeat(100)}--claude-worktrees-${'y'.repeat(48)}-qm5yvc`);
+    expect(encoded).toHaveLength(207);
+  });
+
+  test('mangleProjectPath hashes the NFC-normalized path', () => {
+    // Sanitized NFC length is 201. Hashing the NFD input instead would give suffix ygso7h.
+    const input = `/workspace/${'a'.repeat(185)}/cafe\u0301`;
+    expect(input.normalize('NFC')).not.toBe(input);
+    expect(mangleProjectPath(input)).toBe(`-workspace-${'a'.repeat(185)}-caf-16gmfc`);
+  });
+
   test('claudeProjectsRoot can resolve from an explicit home directory', () => {
     expect(claudeProjectsRoot('/tmp/example-home')).toBe('/tmp/example-home/.claude/projects');
   });
@@ -644,31 +716,21 @@ describe('Claude project discovery helpers', () => {
     }
   });
 
-  test('findRelatedProjectRefs returns both raw worktree project-name shapes under the project path', () => {
-    const projectPath = '/tmp/repo';
-    const worktreesDirProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
-    const doubleDashProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-b`;
+  const projectRefNamed = (project: string) => ({
+    project,
+    claude_dir: join('/tmp/claude/projects', project),
+    project_path_guess: projectPathGuessFromClaudeProject(project),
+  });
+
+  test('findRelatedProjectRefs returns double-dash worktree project names under the project path', () => {
     const refs = [
+      projectRefNamed('-tmp-repo--claude-worktrees-feature-a'),
+      projectRefNamed('-tmp-repo--claude-worktrees-feature-b'),
       {
-        project: worktreesDirProject,
-        claude_dir: `/tmp/claude/projects/${worktreesDirProject}`,
-        project_path_guess: '/tmp/repo/.claude/worktrees/feature/a',
+        ...projectRefNamed('-tmp-repo--claude-worktrees-feature-b'),
+        claude_dir: '/tmp/claude/projects/-tmp-repo--claude-worktrees-feature-b-duplicate',
       },
-      {
-        project: doubleDashProject,
-        claude_dir: `/tmp/claude/projects/${doubleDashProject}`,
-        project_path_guess: projectPathGuessFromClaudeProject(doubleDashProject),
-      },
-      {
-        project: doubleDashProject,
-        claude_dir: `/tmp/claude/projects/${doubleDashProject}-duplicate`,
-        project_path_guess: projectPathGuessFromClaudeProject(doubleDashProject),
-      },
-      {
-        project: '-tmp-repo-other',
-        claude_dir: '/tmp/claude/projects/-tmp-repo-other',
-        project_path_guess: '/tmp/repo/other',
-      },
+      projectRefNamed('-tmp-repo-other'),
       {
         project: 'not-mangled',
         claude_dir: '/tmp/claude/projects/not-mangled',
@@ -679,38 +741,65 @@ describe('Claude project discovery helpers', () => {
     expect(findRelatedProjectRefs('/tmp/repo/', refs)).toEqual([refs[0]!, refs[1]!]);
   });
 
+  test('findRelatedProjectRefs does not return the dot-shaped worktree name Claude Code never writes', () => {
+    const refs = [
+      projectRefNamed('-tmp-repo-.claude-worktrees-feature-c'),
+      projectRefNamed('-tmp-repo--claude-worktrees-feature-a'),
+    ];
+
+    expect(findRelatedProjectRefs('/tmp/repo', refs)).toEqual([refs[1]!]);
+  });
+
   test('findRelatedProjectRefs handles hyphenated project paths without relying on path guesses', () => {
     const projectPath = '/tmp/cc-session-tool/cc-session-tool';
-    const relatedProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
-    const relatedDoubleDashProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-b`;
-    const siblingProject = mangleProjectPath('/tmp/cc-session-tool/other');
-    const similarPrefixProject = `${mangleProjectPath(`${projectPath}-other`)}--claude-worktrees-feature-c`;
     const refs = [
-      {
-        project: relatedProject,
-        claude_dir: join('/tmp/claude/projects', relatedProject),
-        project_path_guess: projectPathGuessFromClaudeProject(relatedProject),
-      },
-      {
-        project: relatedDoubleDashProject,
-        claude_dir: join('/tmp/claude/projects', relatedDoubleDashProject),
-        project_path_guess: projectPathGuessFromClaudeProject(relatedDoubleDashProject),
-      },
-      {
-        project: siblingProject,
-        claude_dir: join('/tmp/claude/projects', siblingProject),
-        project_path_guess: projectPathGuessFromClaudeProject(siblingProject),
-      },
-      {
-        project: similarPrefixProject,
-        claude_dir: join('/tmp/claude/projects', similarPrefixProject),
-        project_path_guess: projectPathGuessFromClaudeProject(similarPrefixProject),
-      },
+      projectRefNamed('-tmp-cc-session-tool-cc-session-tool--claude-worktrees-feature-a'),
+      projectRefNamed('-tmp-cc-session-tool-cc-session-tool--claude-worktrees-feature-b'),
+      projectRefNamed('-tmp-cc-session-tool-other'),
+      projectRefNamed('-tmp-cc-session-tool-cc-session-tool-other--claude-worktrees-feature-c'),
     ];
 
     expect(refs[0]!.project_path_guess).not.toStartWith(`${projectPath}/.claude/worktrees/`);
     expect(refs[1]!.project_path_guess).not.toStartWith(`${projectPath}/.claude/worktrees/`);
     expect(findRelatedProjectRefs(projectPath, refs)).toEqual([refs[0]!, refs[1]!]);
+  });
+
+  test('findRelatedProjectRefs matches repo paths containing dots and underscores', () => {
+    const refs = [
+      projectRefNamed('-tmp-my-app-v2--claude-worktrees-x'),
+      projectRefNamed('-tmp-my-app-v2-other--claude-worktrees-x'),
+    ];
+
+    expect(findRelatedProjectRefs('/tmp/my_app.v2', refs)).toEqual([refs[0]!]);
+  });
+
+  test('findRelatedProjectRefs matches a truncated nested worktree name', () => {
+    // Nested path is 232 sanitized chars, so Claude Code stores its first 200 chars plus the pinned qm5yvc hash.
+    const repo = `/workspace/app/.claude/worktrees/${'x'.repeat(100)}`;
+    const nestedProject = `-workspace-app--claude-worktrees-${'x'.repeat(100)}--claude-worktrees-${'y'.repeat(48)}-qm5yvc`;
+    expect(mangleProjectPath(`${repo}/.claude/worktrees/${'y'.repeat(80)}`)).toBe(nestedProject);
+    const refs = [projectRefNamed(nestedProject)];
+
+    expect(findRelatedProjectRefs(repo, refs)).toEqual(refs);
+  });
+
+  test('findRelatedProjectRefs prefix guard ignores lookalikes at 200 chars and returns nothing past it', () => {
+    const lookalike = (head: string, suffix: string) => projectRefNamed(`${head}a-${suffix}`);
+
+    // Prefix of exactly 200 chars: sanitized repo of 181 chars.
+    const repo181 = `-r-${'a'.repeat(178)}`;
+    const head199 = `${repo181}--claude-worktrees`;
+    const real200 = projectRefNamed(`${head199}--abc123`);
+    expect(findRelatedProjectRefs(`/r/${'a'.repeat(178)}`, [real200, lookalike(head199, 'def456')])).toEqual([real200]);
+
+    // Prefix of exactly 201 chars: sanitized repo of 182 chars. The trailing '-' lines up with the truncation
+    // separator, so real and lookalike names share the 200-char head. The guard returns no refs rather than both.
+    const repo182 = `-r-${'a'.repeat(179)}`;
+    const head200 = `${repo182}--claude-worktrees`;
+    expect(head200).toHaveLength(200);
+    const real201 = projectRefNamed(`${head200}-abc123`);
+    const fake201 = projectRefNamed(`${head200}-def456`);
+    expect(findRelatedProjectRefs(`/r/${'a'.repeat(179)}`, [real201, fake201])).toEqual([]);
   });
 
   test('isPathWithinOrEqual is separator-safe', () => {
@@ -732,7 +821,7 @@ describe('Claude project discovery helpers', () => {
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const projectPath = join(tmpdir(), unique, 'repo');
     const claudeDir = join(root, mangleProjectPath(projectPath));
-    const worktreeProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
+    const worktreeProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-a`;
 
     mkdirSync(claudeDir, { recursive: true });
     mkdirSync(join(root, worktreeProject), { recursive: true });
@@ -756,29 +845,53 @@ describe('Claude project discovery helpers', () => {
     }
   });
 
-  test('buildScopedSearchScope includes both related hyphenated worktree refs without reverse-mangling', () => {
+  test('buildScopedSearchScope includes related hyphenated worktree refs without reverse-mangling', () => {
     const unique = uniqueTempName('cc-session-tool-scope-worktree');
     const root = join(tmpdir(), unique, '.claude', 'projects');
     const projectPath = join(tmpdir(), unique, 'cc-session-tool', 'cc-session-tool');
     const mainProject = mangleProjectPath(projectPath);
-    const worktreeProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
-    const doubleDashWorktreeProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-b`;
+    const worktreeProjectA = `${mainProject}--claude-worktrees-feature-a`;
+    const worktreeProjectB = `${mainProject}--claude-worktrees-feature-b`;
     const siblingProject = mangleProjectPath(join(tmpdir(), unique, 'cc-session-tool-other'));
 
     mkdirSync(join(root, mainProject), { recursive: true });
-    mkdirSync(join(root, worktreeProject), { recursive: true });
-    mkdirSync(join(root, doubleDashWorktreeProject), { recursive: true });
+    mkdirSync(join(root, worktreeProjectA), { recursive: true });
+    mkdirSync(join(root, worktreeProjectB), { recursive: true });
     mkdirSync(join(root, siblingProject), { recursive: true });
 
     try {
       const scope = buildScopedSearchScope({ projectPath, claudeProjectsRoot: root, includeWorktrees: true });
       expect(scope.projects.map(context => context.role)).toEqual(['main', 'worktree', 'worktree']);
-      expect(scope.projects[1]!.projectRef.project).toBe(doubleDashWorktreeProject);
-      expect(scope.projects[1]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(doubleDashWorktreeProject));
+      expect(scope.projects[1]!.projectRef.project).toBe(worktreeProjectA);
+      expect(scope.projects[1]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(worktreeProjectA));
       expect(scope.projects[1]!.worktreeRoot).toBeNull();
-      expect(scope.projects[2]!.projectRef.project).toBe(worktreeProject);
-      expect(scope.projects[2]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(worktreeProject));
+      expect(scope.projects[2]!.projectRef.project).toBe(worktreeProjectB);
+      expect(scope.projects[2]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(worktreeProjectB));
       expect(scope.projects[2]!.worktreeRoot).toBeNull();
+    } finally {
+      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+    }
+  });
+
+  test('buildScopedSearchScope from a worktree path resolves that worktree dir and excludes parent and siblings', () => {
+    const unique = uniqueTempName('cc-session-tool-scope-from-worktree');
+    const root = join(tmpdir(), unique, '.claude', 'projects');
+    const repoPath = join(tmpdir(), unique, 'repo');
+    const projectPath = join(repoPath, '.claude', 'worktrees', 'feature-a');
+    const repoProject = mangleProjectPath(repoPath);
+    const worktreeProject = `${repoProject}--claude-worktrees-feature-a`;
+    const siblingProject = `${repoProject}--claude-worktrees-feature-b`;
+
+    mkdirSync(join(root, repoProject), { recursive: true });
+    mkdirSync(join(root, worktreeProject), { recursive: true });
+    mkdirSync(join(root, siblingProject), { recursive: true });
+
+    try {
+      expect(resolveClaudeProjectDir(projectPath, root)).toBe(join(root, worktreeProject));
+      const scope = buildScopedSearchScope({ projectPath, claudeProjectsRoot: root, includeWorktrees: true });
+      expect(scope.projects.map(context => context.role)).toEqual(['main']);
+      expect(scope.projects[0]!.projectRef.project).toBe(worktreeProject);
+      expect(scope.projects[0]!.projectRef.claude_dir).toBe(join(root, worktreeProject));
     } finally {
       rmSync(join(tmpdir(), unique), { recursive: true, force: true });
     }
@@ -1423,8 +1536,10 @@ const fakeDirName = mangleProjectPath(FAKE_PROJECT);
 const secondFakeDirName = mangleProjectPath(SECOND_FAKE_PROJECT);
 const summaryDirName = mangleProjectPath(SUMMARY_PROJECT);
 const relatedDirName = mangleProjectPath(RELATED_PROJECT);
-const relatedWorktreeDirName = mangleProjectPath(RELATED_WORKTREE_ROOT);
-const relatedDoubleDashWorktreeDirName = `${mangleProjectPath(RELATED_PROJECT)}--claude-worktrees-feature`;
+// Hand-built on purpose: only the '--claude-worktrees-' part is literal. The self-check test below pins
+// mangleProjectPath(RELATED_WORKTREE_ROOT) to it (it stops matching if TMPDIR is long enough to hit the 200-char cap).
+const relatedWorktreeDirName = `${relatedDirName}--claude-worktrees-feature`;
+const relatedSiblingWorktreeDirName = `${relatedDirName}--claude-worktrees-feature-b`;
 const CLAUDE_DIR = join(
   FIXTURE_CLAUDE_PROJECTS_ROOT,
   fakeDirName,
@@ -1445,9 +1560,9 @@ const RELATED_WORKTREE_CLAUDE_DIR = join(
   FIXTURE_CLAUDE_PROJECTS_ROOT,
   relatedWorktreeDirName,
 );
-const RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR = join(
+const RELATED_SIBLING_WORKTREE_CLAUDE_DIR = join(
   FIXTURE_CLAUDE_PROJECTS_ROOT,
-  relatedDoubleDashWorktreeDirName,
+  relatedSiblingWorktreeDirName,
 );
 
 const SESSION_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -1568,7 +1683,7 @@ beforeAll(() => {
   mkdirSync(SUMMARY_CLAUDE_DIR, { recursive: true });
   mkdirSync(RELATED_CLAUDE_DIR, { recursive: true });
   mkdirSync(RELATED_WORKTREE_CLAUDE_DIR, { recursive: true });
-  mkdirSync(RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR, { recursive: true });
+  mkdirSync(RELATED_SIBLING_WORKTREE_CLAUDE_DIR, { recursive: true });
   const lines = makeFixtureLines();
   writeFileSync(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`), lines.join('\n') + '\n');
   const fullTimingSummaryLines = [
@@ -2001,13 +2116,14 @@ afterAll(() => {
   rmSync(SUMMARY_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(RELATED_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(RELATED_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
-  rmSync(RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
+  rmSync(RELATED_SIBLING_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
 });
 
-function runCli(args: string[], extraEnv: Record<string, string> = {}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+function runCli(args: string[], extraEnv: Record<string, string> = {}, cwd?: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   return new Promise(async (resolve) => {
-    const proc = Bun.spawn(['bun', 'run', 'index.ts', ...args], {
-      cwd: import.meta.dir,
+    const entry = cwd === undefined ? 'index.ts' : join(import.meta.dir, 'index.ts');
+    const proc = Bun.spawn(['bun', 'run', entry, ...args], {
+      cwd: cwd ?? import.meta.dir,
       env: { ...process.env, HOME: FIXTURE_HOME, ...extraEnv },
       stdout: 'pipe',
       stderr: 'pipe',
@@ -2088,6 +2204,162 @@ describe('scanSearchTarget', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('worktree project path resolution integration', () => {
+  test('fixture worktree root encodes to the hand-built Claude project name', () => {
+    expect(mangleProjectPath(RELATED_WORKTREE_ROOT)).toBe(relatedWorktreeDirName);
+  });
+
+  test('list --project <worktree> scopes to that worktree dir only', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--project', RELATED_WORKTREE_ROOT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta).not.toHaveProperty('included_projects');
+    const ids = result.data.map((s: any) => s.session_id);
+    expect(ids).toContain(SESSION_ID_8);
+    expect(ids).not.toContain(SESSION_ID_7);
+  });
+
+  test('search --project <worktree> resolves the worktree dir and excludes the parent and sibling', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--bash-regex', 'bun test related', '--project', RELATED_WORKTREE_ROOT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((s: any) => s.session_id)).toContain(SESSION_ID_8);
+    expect(result._meta.included_projects).toEqual([
+      {
+        project: relatedWorktreeDirName,
+        project_path_guess: RELATED_WORKTREE_ROOT,
+        project_role: 'main',
+      },
+    ]);
+  });
+
+  test('projects --project <worktree> returns exactly that worktree dir', async () => {
+    const { exitCode, stdout } = await runCli(['projects', '--project', RELATED_WORKTREE_ROOT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data).toHaveLength(1);
+    expect(result.data[0]).toMatchObject({
+      project: relatedWorktreeDirName,
+      project_role: 'main',
+      session_count: 5,
+    });
+  });
+
+  test('summary <session> --project <worktree> resolves through the session selector path', async () => {
+    const { exitCode, stdout } = await runCli(['summary', SESSION_ID_8, '--project', RELATED_WORKTREE_ROOT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_8);
+  });
+
+  test('stats tokens --project <worktree> scopes to that worktree dir with a per-test db', async () => {
+    const dbDir = join(FIXTURE_DIR, 'dbs-worktree');
+    mkdirSync(dbDir, { recursive: true });
+    const { exitCode, stdout } = await runCli(['stats', 'tokens', '--by', 'session', '--project', RELATED_WORKTREE_ROOT, '--db', join(dbDir, 'worktree.db')]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.included_projects).toEqual([
+      {
+        project: relatedWorktreeDirName,
+        project_path_guess: RELATED_WORKTREE_ROOT,
+        project_role: 'main',
+      },
+    ]);
+    const ids = result.data.map((r: any) => r.session_id);
+    expect(ids).toContain(SESSION_ID_8);
+    expect(ids).not.toContain(SESSION_ID_7);
+  });
+});
+
+describe('worktree CWD default integration', () => {
+  const unique = uniqueTempName('cc-session-tool-cwd-worktree');
+  const realTmp = realpathSync(tmpdir());
+  const base = join(realTmp, unique);
+  const repoRoot = join(base, 'repo');
+  const worktreeDir = join(repoRoot, '.claude', 'worktrees', 'feature-a');
+  const home = join(base, 'home');
+  // Only the '--claude-worktrees-' part is hand-built; the repo part comes from the encoder because it
+  // depends on the machine's tmpdir, and the unit literals pin the encoder.
+  const worktreeProject = `${mangleProjectPath(repoRoot)}--claude-worktrees-feature-a`;
+  const sessionId = '12345678-aaaa-bbbb-cccc-1234567890ab';
+  const dbPath = join(base, 'dbs', 'cwd.db');
+
+  beforeAll(() => {
+    mkdirSync(worktreeDir, { recursive: true });
+    mkdirSync(join(base, 'dbs'), { recursive: true });
+    const projectDir = join(claudeProjectsRoot(home), worktreeProject);
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, `${sessionId}.jsonl`), [
+      JSON.stringify({
+        type: 'user',
+        sessionId,
+        cwd: worktreeDir,
+        timestamp: '2026-03-08T10:00:00.000Z',
+        message: { role: 'user', content: 'Run the cwd default check' },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        cwd: worktreeDir,
+        timestamp: '2026-03-08T10:01:00.000Z',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', name: 'Bash', id: 'tool_cwd_bash_1', input: { command: 'bun test cwd-default-marker' } },
+          ],
+          usage: { input_tokens: 10, output_tokens: 5 },
+        },
+      }),
+    ].join('\n') + '\n');
+  });
+
+  afterAll(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  test('fixture worktree dir encodes to the hand-built Claude project name', () => {
+    expect(mangleProjectPath(worktreeDir)).toBe(worktreeProject);
+  });
+
+  test('list from a worktree CWD finds the worktree session without flags', async () => {
+    const { exitCode, stdout } = await runCli(['list'], { HOME: home }, worktreeDir);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(exitCode).toBe(0);
+    expect(result.data.map((s: any) => s.session_id)).toContain(sessionId);
+  });
+
+  test('search from a worktree CWD finds the worktree session without flags', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--bash-regex', 'cwd-default-marker'], { HOME: home }, worktreeDir);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(exitCode).toBe(0);
+    expect(result.data.map((s: any) => s.session_id)).toContain(sessionId);
+  });
+
+  test('summary from a worktree CWD resolves the session without flags', async () => {
+    const { exitCode, stdout } = await runCli(['summary', sessionId], { HOME: home }, worktreeDir);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(exitCode).toBe(0);
+    expect(result.data.session_id).toBe(sessionId);
+  });
+
+  test('stats tokens from a worktree CWD resolves the CWD scope with a per-test db', async () => {
+    const { exitCode, stdout } = await runCli(['stats', 'tokens', '--by', 'session', '--db', dbPath], { HOME: home }, worktreeDir);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(exitCode).toBe(0);
+    expect(result._meta.included_projects.map((p: any) => p.project)).toEqual([worktreeProject]);
+    const row = result.data.find((r: any) => r.session_id === sessionId && r.agent_id === null);
+    expect(row).toMatchObject({ input_tokens: 10, output_tokens: 5 });
   });
 });
 
@@ -2189,13 +2461,13 @@ describe('list integration', () => {
         project_role: 'main',
       },
       {
-        project: relatedDoubleDashWorktreeDirName,
-        project_path_guess: projectPathGuessFromClaudeProject(relatedDoubleDashWorktreeDirName),
+        project: relatedWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedWorktreeDirName),
         project_role: 'worktree',
       },
       {
-        project: relatedWorktreeDirName,
-        project_path_guess: projectPathGuessFromClaudeProject(relatedWorktreeDirName),
+        project: relatedSiblingWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedSiblingWorktreeDirName),
         project_role: 'worktree',
       },
     ]);
@@ -2311,8 +2583,8 @@ describe('projects integration', () => {
     expect(result.ok).toBe(true);
     expect(result.data.map((p: any) => p.project)).toEqual([
       relatedDirName,
-      relatedDoubleDashWorktreeDirName,
       relatedWorktreeDirName,
+      relatedSiblingWorktreeDirName,
     ]);
     expect(result.data.find((p: any) => p.project === relatedDirName)).toMatchObject({
       project_path_guess: RELATED_PROJECT,
@@ -3721,13 +3993,13 @@ describe('search integration', () => {
         project_role: 'main',
       },
       {
-        project: relatedDoubleDashWorktreeDirName,
-        project_path_guess: projectPathGuessFromClaudeProject(relatedDoubleDashWorktreeDirName),
+        project: relatedWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedWorktreeDirName),
         project_role: 'worktree',
       },
       {
-        project: relatedWorktreeDirName,
-        project_path_guess: projectPathGuessFromClaudeProject(relatedWorktreeDirName),
+        project: relatedSiblingWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedSiblingWorktreeDirName),
         project_role: 'worktree',
       },
     ]);

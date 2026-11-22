@@ -15,7 +15,7 @@ Match the user's intent to a command before reading flags. Most investigations a
 
 | Intent                                                          | Command               |
 | --------------------------------------------------------------- | --------------------- |
-| List recent sessions (current project + its worktrees)          | `list`                |
+| List recent sessions (current project + its worktrees; from a worktree, that worktree + nested worktrees) | `list`                |
 | Cross-project listing                                           | `list --all-projects` |
 | Index project transcript directories themselves                 | `projects`            |
 | Find which sessions touched a file, ran a tool, said a phrase   | `search`              |
@@ -64,6 +64,8 @@ cc-session-tool shape DA2738E3:a8361bc            # inspect one
 
 By default, `list` and `search` are scoped to the **logical project** of the current working directory and _also_ include that project's Claude-managed worktree transcript directories. This is intentional: from the main checkout, a search can find work done in a worktree without `--all-projects`.
 
+When the CWD or `--project` is a Claude-managed worktree checkout (`<repo>/.claude/worktrees/<name>`), scoped `list`/`search`/`stats`/`index status` (and `projects --project <worktree>`) cover that worktree's own transcript dir plus any worktrees nested under it. They do not cover the main checkout or sibling worktrees. From a worktree, absolute `--file` paths match against that worktree's own checkout; a main-tree absolute path falls back to substring matching and will not find writes made in the worktree. For the whole logical project, pass `--project <repo root>` and use main-tree absolute (or relative) `--file` paths there.
+
 For follow-up commands, use the stable `project` field (or `session_ref.project`) returned in search/list rows as `--claude-project`. **Never** use `project_path_guess` — it is display-only and lossy.
 
 ```bash
@@ -106,7 +108,7 @@ cc-session-tool summary DA2738E3
 ### "Find the session that wrote/edited file X"
 
 ```bash
-# Current logical project (includes its worktrees by default)
+# Current logical project (includes its worktrees by default; from a worktree CWD, only that worktree plus nested worktrees, so add --project <repo root>)
 cc-session-tool search --file src/auth.ts --operation write
 
 # Earliest matching transcript write evidence (one row by default)

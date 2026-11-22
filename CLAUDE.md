@@ -33,7 +33,7 @@ CLI entrypoint and command wiring live in `index.ts` using `citty`. Shared trans
 
 | Command | Purpose |
 |---------|---------|
-| `list` | Index sessions with metadata; scoped lists include associated Claude worktrees by default and support `--main-only` |
+| `list` | Index sessions with metadata; scoped lists include associated Claude worktrees by default (from a worktree, that worktree plus nested worktrees; use `--project <repo root>` for all) and support `--main-only` |
 | `projects` | Summarize Claude project transcript directories and expose raw project handles |
 | `shape` | Turn-by-turn skeleton with summary stats (tool counts, duration, first edit) |
 | `summary` | One-call triage summary for a session |
@@ -42,14 +42,16 @@ CLI entrypoint and command wiring live in `index.ts` using `citty`. Shared trans
 | `tokens` | Per-turn token usage timeline (optional cumulative mode) |
 | `messages` | Filtered, truncated message content by role/type/turn |
 | `slice` | Raw entries for a turn range |
-| `search` | Find sessions matching structured queries (tool, input, file, text, bash filters), scoped to the logical project plus associated Claude worktrees by default |
+| `search` | Find sessions matching structured queries (tool, input, file, text, bash filters), scoped to the logical project (or, from inside a worktree, that worktree) plus associated Claude worktrees by default |
 | `subagents` | List subagents for a session with metadata |
 | `stats` | Corpus-wide aggregates from the SQLite transcript index: `stats tokens` (rollups, optional `--bucket day\|week`, `--by model\|session`) and `stats trajectories` (prev-tool/next-tool pair counts) |
 | `index` | SQLite index escape hatches: `index status` (path, counts, freshness) and `index rebuild` (drop and re-index; default scope all projects) |
 
 All session-scoped commands accept a positional session identifier (UUID, UUID prefix, or slug) and an optional `--project` flag (defaults to CWD). They also accept `--claude-project <project>` for stable follow-up from search/list/projects rows that expose raw Claude project basenames through `project` or `session_ref.project`; do not use `project_path_guess` as a follow-up handle. `--project` and `--claude-project` are mutually exclusive. Subagent sessions can be targeted using colon notation: `<session>:<agent-id>` (e.g., `DA2738E3:a8361bc`).
 
-The `list` and `search` commands are agent-first and worktree-aware by default. A scoped query from the logical project checkout includes associated Claude-managed worktree transcript directories. Use `list --main-only` only when you intentionally want to ignore worktree sessions. Search compares absolute main-tree file queries to worktree-local accesses by exact canonical path candidates first, then shared project-relative identity. Use `search --file <absolute-main-tree-path> --operation write` as the primary workflow for finding worktree writes to the same logical file; use `--all-projects` for broad audits, not routine worktree lookup.
+The `list` and `search` commands are agent-first and worktree-aware by default. A scoped query from the logical project checkout includes associated Claude-managed worktree transcript directories. Use `list --main-only` only when you intentionally want to ignore worktree sessions. Search compares absolute main-tree file queries to worktree-local accesses by exact canonical path candidates first, then shared project-relative identity. Use `search --file <absolute-main-tree-path> --operation write` as the primary workflow for finding worktree writes to the same logical file; this works from the main checkout or with `--project <repo root>`. Use `--all-projects` for broad audits, not routine worktree lookup.
+
+Worktree CWD scope: when the CWD or `--project` is a Claude-managed worktree checkout (`<repo>/.claude/worktrees/<name>`), scoped `list`/`search`/`stats`/`index status` (and `projects --project <worktree>`) cover that worktree's own transcript dir plus any worktrees nested under it. They do not cover the main checkout or sibling worktrees. From a worktree, absolute `--file` paths match against that worktree's own checkout; a main-tree absolute path falls back to substring matching and will not find writes made in the worktree. For the whole logical project, pass `--project <repo root>` and use main-tree absolute (or relative) `--file` paths there.
 
 In `search --all-projects`, an explicit `--project <path>` is a query identity anchor for absolute file matching only. It must not be treated as a scan limit, and without it the command must not silently use CWD or `project_path_guess` as the authoritative project root for unrelated projects.
 
@@ -74,6 +76,7 @@ Sessions are resolved in order within the selected Claude project directory: exa
 3. Errors are thrown via `cliError(code, msg)` and caught at the command handler level
 4. Content truncation uses `"...[truncated, N chars]"` suffix
 5. `project_path_guess` is display metadata only; raw `project` / `session_ref.project` is the stable Claude project identity for follow-up commands.
+6. `mangleProjectPath` must mirror Claude Code's project-dir encoder exactly: NFC-normalize the path; every non-`[A-Za-z0-9]` UTF-16 code unit becomes `-`; names over 200 chars become the first 200 chars + `-` + base36 of the Java-style 32-bit hash of the NFC, unsanitized path, made positive with JS `Math.abs`. Output is always `[A-Za-z0-9-]+`. Worktree discovery derives its prefix from the same sanitizer. Encoding-sensitive tests must hand-build the encoding-sensitive part of expected basenames (e.g. `--claude-worktrees-`) as literals, because encoder-derived fixtures agree with any encoder; machine-dependent parts such as a tmpdir repo root may come from the encoder, since unit tests pin it with literals.
 
 ### Testing
 

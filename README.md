@@ -56,7 +56,7 @@ All commands use consistent turn numbering:
 
 ### `list`
 
-Index sessions by reading metadata from the first few lines of each file. A scoped `list --project <repo>` includes the repo's associated Claude-managed worktree transcript directories by default, matching `search`; use `--main-only` to inspect only the main project transcript directory.
+Index sessions by reading metadata from the first few lines of each file. A scoped `list --project <repo>` includes the repo's associated Claude-managed worktree transcript directories by default, matching `search`; use `--main-only` to inspect only the main project transcript directory. When the CWD or `--project` is a Claude-managed worktree checkout (`<repo>/.claude/worktrees/<name>`), scoped commands cover that worktree's own transcript dir plus any worktrees nested under it, not the main checkout or sibling worktrees. For the whole logical project, pass `--project <repo root>`.
 
 ```bash
 cc-session-tool list [--project <path>] [--main-only] [--all-projects] [--project-glob <pattern>] [--intent-match <text>|--intent-regex <regex>] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>] [--min-lines <n>] [--include-subagents]
@@ -107,7 +107,7 @@ Summarize Claude project transcript directories and expose stable raw project ha
 cc-session-tool projects [--glob <pattern>] [--project <path>]
 ```
 
-Without `--project`, `projects` scans all top-level Claude project directories under `~/.claude/projects`. With `--project`, it returns the main project plus associated Claude worktree transcript directories. Rows are sorted by raw `project` basename.
+Without `--project`, `projects` scans all top-level Claude project directories under `~/.claude/projects`. With `--project`, it returns the main project plus associated Claude worktree transcript directories; when `--project` is a worktree checkout, it returns that worktree plus nested worktrees, so use `--project <repo root>` for the whole logical project. Rows are sorted by raw `project` basename.
 
 | Field | Description |
 | ----- | ----------- |
@@ -462,7 +462,7 @@ cc-session-tool slice <session> --turn <N|N-M> [--project <path> | --claude-proj
 
 ### `search`
 
-Find sessions matching structured filters. By default, search is scoped to the logical project derived from `--project <path>` or the current working directory, and it also includes associated Claude-managed worktree transcript directories. This agent-first default means a query from the main checkout can find work performed from a Claude worktree without `--all-projects`.
+Find sessions matching structured filters. By default, search is scoped to the logical project derived from `--project <path>` or the current working directory, and it also includes associated Claude-managed worktree transcript directories. This agent-first default means a query from the main checkout can find work performed from a Claude worktree without `--all-projects`. When the CWD or `--project` is a Claude-managed worktree checkout (`<repo>/.claude/worktrees/<name>`), scoped commands cover that worktree's own transcript dir plus any worktrees nested under it, not the main checkout or sibling worktrees. For the whole logical project, pass `--project <repo root>`. From a worktree, absolute `--file` paths match against that worktree's own checkout; a main-tree absolute path falls back to substring matching and will not find writes made in the worktree. Use main-tree absolute (or relative) `--file` paths with `--project <repo root>`.
 
 ```bash
 cc-session-tool search [--project <path>] [--all-projects] [--project-glob <pattern>] [--tool <name>] [--input-match <text>|--input-regex <regex>] [--file <path>] [--text <text>|--text-regex <regex>] [--intent-match <text>|--intent-regex <regex>] [--bash <text>|--bash-regex <regex>] [--no-subagents] [--operation <op>] [--origin] [--sort <mode>] [--aggregate count-per-session|counters] [--counter NAME=text] [--counter-regex NAME=regex] [--bucket day|week] [--per-subagent] [--branch <name>] [--after <date>] [--before <date>] [--since <duration>] [--last <n>]
@@ -470,7 +470,7 @@ cc-session-tool search [--project <path>] [--all-projects] [--project-glob <patt
 
 | Option           | Default | Description |
 | ---------------- | ------- | ----------- |
-| `--project`      | CWD     | Logical project path for scoped search. Scoped searches include associated Claude worktrees by default. With `--all-projects`, this becomes a file-identity query anchor, not a scan limit. |
+| `--project`      | CWD     | Logical project path for scoped search. Scoped searches include associated Claude worktrees by default; from a worktree CWD or `--project <worktree>`, scope is that worktree's own dir plus nested worktrees (not the main checkout or siblings), so pass `--project <repo root>` for the whole logical project. With `--all-projects`, this becomes a file-identity query anchor, not a scan limit. |
 | `--all-projects` | false   | Search every top-level Claude project directory under `~/.claude/projects` for broad audits. Without an explicit `--project`, absolute file queries do not infer a logical project anchor from CWD or `project_path_guess`. |
 | `--project-glob` | —       | With `--all-projects`, filter by raw Claude project basename or display-only `project_path_guess`. Supports `*` and `?`. |
 | `--tool`         | —       | Match tool names by case-insensitive substring. |
@@ -584,7 +584,7 @@ Scoped responses include `_meta.included_projects`, showing the main project and
 | Field | Description |
 | ----- | ----------- |
 | `project` | Raw Claude project directory basename from `~/.claude/projects`. |
-| `project_path_guess` | Best-effort unmangled path guess, or `null` when the directory name is not in Claude's path-mangled form. This is display-only and lossy when path segments contain literal hyphens. |
+| `project_path_guess` | Best-effort unmangled path guess, or `null` when the directory name is not in Claude's path-mangled form. This is display-only and lossy whenever a path segment contains any non-alphanumeric character (hyphen, dot, underscore, space, and so on), since Claude Code encodes each of them as `-`, and for names over 200 chars, which Claude Code truncates and suffixes with a hash. |
 | `project_role` | `main`, `worktree`, or `global`. |
 | `session_ref` | Stable follow-up identity: `{ "session_id": "...", "project": "<raw Claude project basename>" }`. |
 
@@ -692,7 +692,7 @@ Each row reports `turns` (assistant turns), `turns_with_usage`, the four token s
 # Daily spend per model across the whole corpus
 cc-session-tool stats tokens --all-projects --bucket day --by model
 
-# Cache hit rate by week for the current project (worktrees included)
+# Cache hit rate by week for the current project (worktrees included when run from the main checkout; from a worktree, that worktree plus nested worktrees)
 cc-session-tool stats tokens --bucket week
 ```
 
@@ -795,7 +795,7 @@ cc-session-tool files DA2738E3 --group-by turn
 ### Find which session wrote a file
 
 ```bash
-# Current logical project, including associated Claude worktrees
+# Current logical project, including associated Claude worktrees (run from the main checkout, or add --project <repo root> when in a worktree)
 cc-session-tool search --file /workspace/app/src/auth.ts --operation write
 
 # Earliest matching transcript write with file evidence

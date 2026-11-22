@@ -139,10 +139,33 @@ export function normalizePathForContainment(input: string): string {
   return stripTrailingSlashes(resolve(input));
 }
 
+/** Claude Code truncates sanitized project names longer than this and appends a hash suffix. */
+const CLAUDE_PROJECT_NAME_MAX_LENGTH = 200;
+
+/** The path Claude Code encodes: absolute, no trailing slash, NFC (Claude Code NFC-normalizes originalCwd). */
+function encodableProjectPath(projectPath: string): string {
+  return normalizePathForContainment(projectPath).normalize('NFC');
+}
+
+/** Every non-ASCII-alphanumeric UTF-16 code unit becomes '-', as in Claude Code. */
+function sanitizeProjectPath(path: string): string {
+  return path.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+/** Base36 of |Java String.hashCode(path)|, using JS Math.abs semantics as Claude Code does. */
+export function claudeProjectPathHash(path: string): string {
+  let hash = 0;
+  for (let i = 0; i < path.length; i++) {
+    hash = ((hash << 5) - hash + path.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
 export function mangleProjectPath(projectPath: string): string {
-  const normalized = normalizePathForContainment(projectPath);
-  const stripped = normalized.startsWith('/') ? normalized.slice(1) : normalized;
-  return '-' + stripped.replace(/\//g, '-');
+  const path = encodableProjectPath(projectPath);
+  const sanitized = sanitizeProjectPath(path);
+  if (sanitized.length <= CLAUDE_PROJECT_NAME_MAX_LENGTH) return sanitized;
+  return `${sanitized.slice(0, CLAUDE_PROJECT_NAME_MAX_LENGTH)}-${claudeProjectPathHash(path)}`;
 }
 
 export function projectPathGuessFromClaudeProject(projectName: string): string | null {
@@ -428,16 +451,16 @@ export function matchFileAccess(query: NormalizedFileQuery, access: NormalizedFi
 }
 
 export function findRelatedProjectRefs(projectPath: string, refs: ProjectRef[]): ProjectRef[] {
-  const normalizedProject = normalizePathForContainment(projectPath);
-  const worktreesDirPrefix = `${mangleProjectPath(join(normalizedProject, '.claude', 'worktrees'))}-`;
-  const doubleDashWorktreePrefix = `${mangleProjectPath(normalizedProject)}--claude-worktrees-`;
+  const worktreesPath = join(encodableProjectPath(projectPath), '.claude', 'worktrees');
+  const worktreePrefix = `${sanitizeProjectPath(worktreesPath)}-`;
+  // Truncated names keep 200 sanitized chars plus '-<hash>': a 201-char prefix's trailing '-' lines up with that
+  // separator and would match any truncated name sharing the 200-char head; longer prefixes can never match.
+  if (worktreePrefix.length > CLAUDE_PROJECT_NAME_MAX_LENGTH) return [];
   const related: ProjectRef[] = [];
   const seen = new Set<string>();
 
   for (const ref of refs) {
-    if (!ref.project.startsWith(worktreesDirPrefix) && !ref.project.startsWith(doubleDashWorktreePrefix)) {
-      continue;
-    }
+    if (!ref.project.startsWith(worktreePrefix)) continue;
     if (seen.has(ref.project)) continue;
     seen.add(ref.project);
     related.push(ref);

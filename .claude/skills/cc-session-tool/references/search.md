@@ -19,8 +19,8 @@ At least one **selector** is required: `--tool`, `--input-match` / `--input-rege
 
 | Flag | Effect |
 | --- | --- |
-| (none) | Scoped to the logical project at CWD, **including its Claude worktree transcript dirs**. |
-| `--project <path>` | Same as above but with an explicit logical project. |
+| (none) | Scoped to the logical project at CWD, **including its Claude worktree transcript dirs**. From a worktree CWD, scope is that worktree's own dir plus nested worktrees only (not the main checkout or siblings). |
+| `--project <path>` | Same as above but with an explicit logical project. `--project <repo root>` covers the whole logical project, including every worktree; `--project <worktree>` covers only that worktree plus nested worktrees. |
 | `--all-projects` | Scan every top-level Claude project directory under `~/.claude/projects`. |
 | `--project-glob <pat>` | Only valid with `--all-projects`. Filter by raw Claude project basename **or** by display-only `project_path_guess`. `*` and `?` supported. This matches Claude project identity, not filesystem files. |
 | `--no-subagents` | Disable the default one-level subagent transcript inclusion. |
@@ -50,6 +50,8 @@ For absolute `--file` queries inside the logical project, search does this in or
 3. If both sides normalize to logical paths and they differ, search **does not** fall back to substring matching.
 
 Practical consequence: from the main checkout, `search --file <absolute-main-tree-path> --operation write` is the primary workflow for finding worktree writes to the same logical file. You do not need `--all-projects` for that.
+
+When the CWD or `--project` is a Claude-managed worktree checkout (`<repo>/.claude/worktrees/<name>`), scoped `list`/`search`/`stats`/`index status` (and `projects --project <worktree>`) cover that worktree's own transcript dir plus any worktrees nested under it. They do not cover the main checkout or sibling worktrees. From a worktree, absolute `--file` paths match against that worktree's own checkout; a main-tree absolute path falls back to substring matching and will not find writes made in the worktree. For the whole logical project, pass `--project <repo root>` and use main-tree absolute (or relative) `--file` paths there.
 
 Use `--all-projects` only for broad audits.
 
@@ -101,7 +103,7 @@ Default full-match rows include, where relevant:
 Worktree / all-project responses add:
 
 - `project` — raw Claude project directory basename (use with `--claude-project`)
-- `project_path_guess` — display-only, lossy when paths have hyphens
+- `project_path_guess` — display-only, lossy when a path segment contains any non-alphanumeric character (Claude Code encodes each as `-`), and for names over 200 chars, which Claude Code truncates and suffixes with a hash
 - `project_role` — `main` / `worktree` / `global`
 - `session_ref` — `{ session_id, project }` for stable follow-up
 
@@ -112,7 +114,7 @@ Scoped responses set `_meta.included_projects`; all-projects responses set `_met
 ## Common recipes
 
 ```bash
-# Sessions that touched auth.ts in current project (incl. worktrees)
+# Sessions that touched auth.ts in current project (incl. worktrees; from a worktree, add --project <repo root> for all)
 cc-session-tool search --file auth.ts
 
 # Worktree writes to a specific logical file
