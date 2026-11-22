@@ -85,3 +85,7 @@ Sessions are resolved in order within the selected Claude project directory: exa
 Tests in `index.test.ts` use `bun:test`. Two categories:
 - **Unit tests**: Import exported helpers (`parseTurnRange`, `inputSummary`, `determineOutcome`, etc.) and test pure logic
 - **Integration tests**: Create a temp fixture dir with a fake JSONL session, run the CLI via `Bun.spawn`, and assert on parsed JSON output. Fixture is created in `beforeAll` and cleaned up in `afterAll`.
+
+## Agent-Facing Files
+
+CLAUDE.md and `.claude/skills/cc-session-tool/` are instructions for agents, not documentation. When a change alters CLI behaviour, edit them only to correct statements the change made false or to add a new flag to a skill reference flag table. Add guidance only for a workflow or trap an agent would get wrong without it — never to describe the change; behaviour descriptions belong in README.md.
