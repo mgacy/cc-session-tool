@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { defineCommand, runMain } from 'citty';
+import { defineCommand, runMain, type ParsedArgs } from 'citty';
 import { join, basename, dirname } from 'path';
 import { readdirSync, existsSync } from 'fs';
 import {
@@ -82,6 +82,7 @@ import {
   type ToolPairRow,
 } from './src/transcript-index.ts';
 import type { Database } from 'bun:sqlite';
+import { isCliArgsError, parseCommandArgs, resolveCliCommand } from './src/cli-args.ts';
 
 export const VERSION = '0.2.0';
 
@@ -2415,8 +2416,8 @@ const searchCommand = defineCommand({
     origin: { type: 'boolean', description: 'With --file, return earliest matching write evidence', default: false },
     sort: { type: 'string', description: 'Sort mode: session-newest, match-earliest, match-newest, project' },
     aggregate: { type: 'string', description: 'Aggregate mode: count-per-session, counters' },
-    counter: { type: 'string', description: 'Named raw-input counter as NAME=substring' },
-    'counter-regex': { type: 'string', description: 'Named raw-input counter as NAME=regex' },
+    counter: { type: 'string', description: 'Named raw-input counter as NAME=substring (repeatable)', multiple: true },
+    'counter-regex': { type: 'string', description: 'Named raw-input counter as NAME=regex (repeatable)', multiple: true },
     bucket: { type: 'string', description: 'Bucket counter aggregates by: day, week' },
     'per-subagent': { type: 'boolean', description: 'Emit transcript-level counter rows instead of parent session rollups', default: false },
     last: { type: 'string', description: 'Return only the last N matches' },
@@ -2507,6 +2508,7 @@ const searchCommand = defineCommand({
 
       const counters = (() => {
         try {
+          // Runtime value is string[] (declared `multiple`) or absent; citty still types it as string.
           return parseCounterArgs(
             rawArgs.counter as string | string[] | undefined,
             rawArgs['counter-regex'] as string | string[] | undefined,
@@ -2552,7 +2554,7 @@ const searchCommand = defineCommand({
         before: args.before,
         since: args.since,
         operation: origin ? 'write' : args.operation as SearchOperation | undefined,
-        includeSubagents: args.subagents !== false && !(args as Record<string, unknown>)['no-subagents'],
+        includeSubagents: args.subagents !== false,
       };
 
       const allProjects = Boolean(args['all-projects']);
@@ -2783,7 +2785,7 @@ const statsTokensCommand = defineCommand({
       }
       const afterCutoff = args.since ? parseSince(args.since) : parseDateArg(args.after, '--after', 'start');
       const beforeCutoff = parseDateArg(args.before, '--before', 'end');
-      const includeSubagents = args.subagents !== false && !(args as Record<string, unknown>)['no-subagents'];
+      const includeSubagents = args.subagents !== false;
 
       const selection = selectIndexScope(args);
       const handle = acquireIndexForContexts(args.db, selection.contexts);
@@ -2826,7 +2828,7 @@ const statsTrajectoriesCommand = defineCommand({
       if (limit <= 0) {
         throw cliError('INVALID_ARGS', '--limit must be a positive integer');
       }
-      const includeSubagents = args.subagents !== false && !(args as Record<string, unknown>)['no-subagents'];
+      const includeSubagents = args.subagents !== false;
 
       const selection = selectIndexScope(args);
       const handle = acquireIndexForContexts(args.db, selection.contexts);
@@ -2890,7 +2892,7 @@ const subagentsCommand = defineCommand({
 // Main
 // ============================================================================
 
-const main = defineCommand({
+export const main = defineCommand({
   meta: {
     name: 'cc-session-tool',
     version: VERSION,
@@ -2913,6 +2915,26 @@ const main = defineCommand({
   },
 });
 
+/**
+ * Dispatch argv to a leaf command with strict argument parsing.
+ * The help/version condition must stay identical to citty runMain's own checks
+ * (node_modules/citty/dist/index.mjs:435-438); if they diverge, runMain falls
+ * through to citty's lenient runCommand and unknown flags are ignored again.
+ */
+async function dispatchCli(argv: readonly string[]): Promise<void> {
+  if (argv.includes('--help') || argv.includes('-h') || (argv.length === 1 && argv[0] === '--version')) {
+    await runMain(main, { rawArgs: [...argv] });
+    return;
+  }
+  try {
+    const { command, path, rawArgs, argsDef } = await resolveCliCommand(main, argv);
+    const args = parseCommandArgs(rawArgs, argsDef, path.join(' '));
+    await command.run({ rawArgs: [...rawArgs], args: args as ParsedArgs, cmd: command });
+  } catch (err: unknown) {
+    handleCommandError(isCliArgsError(err) ? cliError('INVALID_ARGS', err.message) : err);
+  }
+}
+
 if (import.meta.main) {
-  runMain(main);
+  void dispatchCli(process.argv.slice(2));
 }

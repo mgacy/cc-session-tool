@@ -45,6 +45,8 @@ cc-session-tool shape DA2738E3 --claude-project -workspace-app
 
 **Input validation:** Session IDs accept `[a-zA-Z0-9-]` characters; agent IDs also allow underscores `[a-zA-Z0-9_-]`. All other inputs are rejected with exit code 2.
 
+**Strict arguments:** Arguments are validated before any file or index I/O. Unknown or misplaced flags, repeated flags (except the repeatable `--counter` / `--counter-regex`), flags with a missing or empty value, and extra or missing positional arguments are rejected with exit code 2 and a JSON `INVALID_ARGS` error; for an unknown flag the message lists the command's supported flags. Flags must follow the subcommand name (`cc-session-tool list --all-projects`, not `cc-session-tool --all-projects list`). A value that starts with a single dash, such as a raw basename (`-workspace-app`), may be space-separated (except `-h`, which opens help); a value that starts with `--` must use `--flag=value`. Boolean flags accept `--x`, `--no-x`, `--x=true` and `--x=false`, but not `--x false`.
+
 ### Turn Numbering
 
 All commands use consistent turn numbering:
@@ -79,7 +81,18 @@ cc-session-tool list [--project <path>] [--main-only] [--all-projects] [--projec
 | `--min-lines` | 0       | Sessions with at least N lines                                 |
 | `--include-subagents` | false | Include `subagent_count` per session                    |
 
-**Output:** Sessions sorted by timestamp (newest first). When `--include-subagents` is set, each session includes a `subagent_count` field; otherwise the field is omitted entirely. Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated. When multiple project contexts are included, rows include `project`, `project_path_guess`, `project_role`, and `session_ref`; `_meta.included_projects` records the selected Claude project contexts. `project_path_guess` is display-only; use raw `project` or `session_ref.project` with `--claude-project` for follow-up commands.
+**Scoping `list` to one project:** `list` does not accept `--claude-project`. Pick the row that matches what you have:
+
+| What you have | Use | If the value is wrong |
+| --- | --- | --- |
+| The checkout or worktree path, e.g. `<repo>/.claude/worktrees/<name>` (**preferred**) | `list --project <path>` | `NOT_FOUND` |
+| Only a raw Claude basename: the `project` / `session_ref.project` field of a `search`, `list` or `projects` row | `list --all-projects --project-glob <basename>` | `ok:true` with empty `data` and `_meta.projects_scanned: 0`. Confirm `_meta.projects_scanned === 1` before trusting an empty result. `_meta.skipped_projects` lists every other project, so the response grows with the number of projects. |
+| A session to inspect, plus its raw basename | `shape`, `summary`, `tools`, `files`, `tokens`, `messages`, `slice` or `subagents` with `<session> --claude-project <basename>` | `NOT_FOUND` |
+
+- `--claude-project` is accepted only by the session commands in the last row; `list` and `search` reject it, and `search` scopes the same way as `list`.
+- Don't turn `project_path_guess` into a `--project` value: it is display-only and lossy. With only a row's fields, use the raw-basename row. A repo-root path also covers that repo's Claude worktrees (`--main-only` skips them). A worktree path covers that worktree.
+
+**Output:** Sessions sorted by timestamp (newest first). When `--include-subagents` is set, each session includes a `subagent_count` field; otherwise the field is omitted entirely. Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated. When multiple project contexts are included, rows include `project`, `project_path_guess`, `project_role`, and `session_ref`; `_meta.included_projects` records the selected Claude project contexts. `project_path_guess` is display-only; use raw `project` or `session_ref.project` with `--claude-project` on session commands (not `list`) for follow-up.
 
 ```json
 {
@@ -483,7 +496,7 @@ cc-session-tool search [--project <path>] [--all-projects] [--project-glob <patt
 | `--origin`       | false   | With `--file`, return earliest matching transcript write evidence. Implies `--operation write` and defaults to one result. |
 | `--sort`         | `session-newest` | Sort matches by `session-newest`, `match-earliest`, `match-newest`, or `project`. |
 | `--aggregate`    | `none`  | `count-per-session` returns per-session tool-input counts; `counters` returns named raw-input counters. |
-| `--counter` / `--counter-regex` | — | Named raw-input counter as `NAME=pattern`; requires `--aggregate counters`. |
+| `--counter` / `--counter-regex` | — | Named raw-input counter as `NAME=pattern`; repeatable; requires `--aggregate counters`. |
 | `--bucket`       | `none`  | With `--aggregate counters`, bucket by `day` or `week`. Missing timestamps use `unknown`. |
 | `--per-subagent` | false   | With counter aggregation, emit transcript-level rows instead of parent session rollups. |
 | `--text`         | —       | Match user/assistant text and thinking by case-insensitive substring. |
@@ -854,12 +867,12 @@ Errors:
 
 ### Exit Codes
 
-| Code | Meaning                        |
-| ---- | ------------------------------ |
-| 0    | Success                        |
-| 1    | Format error / terminated      |
-| 2    | Invalid arguments or ID format |
-| 3    | Not found                      |
+| Code | Meaning                                                                          |
+| ---- | -------------------------------------------------------------------------------- |
+| 0    | Success                                                                          |
+| 1    | Format error / terminated                                                        |
+| 2    | Invalid arguments (unknown/duplicate/missing flags or values) or ID format       |
+| 3    | Not found                                                                        |
 
 ## Testing
 

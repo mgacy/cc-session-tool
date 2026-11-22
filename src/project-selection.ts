@@ -583,22 +583,6 @@ export function validateClaudeProjectBasename(project: string): void {
   }
 }
 
-function readRawStringOption(name: string): string | undefined {
-  const longName = `--${name}`;
-  const withEquals = `${longName}=`;
-  for (let i = 2; i < process.argv.length; i++) {
-    const arg = process.argv[i]!;
-    if (arg.startsWith(withEquals)) {
-      return arg.slice(withEquals.length);
-    }
-    if (arg === longName) {
-      const value = process.argv[i + 1];
-      return value && !value.startsWith('--') ? value : undefined;
-    }
-  }
-  return undefined;
-}
-
 export function resolveClaudeProjectDirFromSelector(
   selector: SessionProjectSelector,
   root = claudeProjectsRoot(),
@@ -619,13 +603,11 @@ export function sessionProjectSelectorFromArgs(args: {
   project?: string;
   'claude-project'?: string;
 }): SessionProjectSelector {
-  const claudeProject = readRawStringOption('claude-project') ?? (
-    typeof args['claude-project'] === 'string' ? args['claude-project'] : undefined
-  );
-  if (args.project && claudeProject) {
+  const claudeProject = typeof args['claude-project'] === 'string' ? args['claude-project'] : undefined;
+  if (args.project && claudeProject !== undefined) {
     throw new ProjectSelectionError('INVALID_ARGS', '--project and --claude-project are mutually exclusive');
   }
-  if (claudeProject) {
+  if (claudeProject !== undefined) {
     return { kind: 'claudeProject', project: claudeProject };
   }
   return { kind: 'projectPath', projectPath: args.project || process.cwd() };

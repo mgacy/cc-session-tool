@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
-import { appendFileSync, mkdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'fs';
 import { Database } from 'bun:sqlite';
 import { basename, join } from 'path';
 import { tmpdir } from 'os';
@@ -18,7 +18,7 @@ import {
   normalizeFileQuery, matchFileAccess, projectMatchesGlob, selectProjectContexts,
   stableJsonStringify, toolInputMatches, deriveWorktreeRootFromPath,
   extractWorktreeStatePaths, collectObservedWorktreeRoots, absolutePathCandidatesFor,
-  scanSearchTarget,
+  scanSearchTarget, main as cliMain, VERSION,
 } from './index.ts';
 import {
   applyTruncationPolicy,
@@ -39,7 +39,18 @@ import {
   listSearchTargetsForContext as listSearchTargetsForContextModule,
   claudeProjectPathHash,
   mangleProjectPath as mangleProjectPathModule,
+  ProjectSelectionError,
+  resolveClaudeProjectDirFromSelector,
+  sessionProjectSelectorFromArgs,
 } from './src/project-selection.ts';
+import {
+  CliArgsError,
+  isCliArgsError,
+  parseCommandArgs,
+  resolveCliCommand,
+} from './src/cli-args.ts';
+import { defineCommand } from 'citty';
+import type { ArgsDef, CommandDef } from 'citty';
 import {
   aggregateCounterRows,
   attachCounterTranscriptResults,
@@ -5580,5 +5591,768 @@ describe('index resilience', () => {
     const oracle = parseOutput((await runCli(['tokens', SESSION_ID, '--project', FAKE_PROJECT])).stdout);
     const row = result.data.find((r: any) => r.session_id === SESSION_ID && r.agent_id === null);
     expect(row.input_tokens ?? 0).toBe(oracle.data.totals.input);
+  });
+});
+
+// ============================================================================
+// Strict argument parser (src/cli-args.ts)
+// ============================================================================
+
+describe('parseCommandArgs', () => {
+  const shapeDef: ArgsDef = {
+    session: { type: 'positional', required: true },
+    project: { type: 'string' },
+    'claude-project': { type: 'string' },
+  };
+  const toolsDef: ArgsDef = {
+    session: { type: 'positional', required: true },
+    turn: { type: 'string' },
+    'claude-project': { type: 'string' },
+  };
+  const searchDef: ArgsDef = {
+    text: { type: 'string' },
+    subagents: { type: 'boolean', default: true },
+    counter: { type: 'string', multiple: true } as ArgsDef[string],
+    glob: { type: 'string' },
+  };
+  const sliceDef: ArgsDef = {
+    session: { type: 'positional', required: true },
+    turn: { type: 'string', required: true },
+  };
+  const noFlagsDef: ArgsDef = {};
+
+  function argsError(fn: () => unknown): CliArgsError {
+    try {
+      fn();
+    } catch (err) {
+      expect(err).toBeInstanceOf(CliArgsError);
+      expect(isCliArgsError(err)).toBe(true);
+      return err as CliArgsError;
+    }
+    throw new Error('expected parseCommandArgs to throw');
+  }
+
+  function plainError(fn: () => unknown): Error {
+    try {
+      fn();
+    } catch (err) {
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(CliArgsError);
+      expect(isCliArgsError(err)).toBe(false);
+      return err as Error;
+    }
+    throw new Error('expected parseCommandArgs to throw');
+  }
+
+  test('isCliArgsError rejects non-CliArgsError values', () => {
+    expect(isCliArgsError(new Error('x'))).toBe(false);
+    expect(isCliArgsError('x')).toBe(false);
+    expect(isCliArgsError(null)).toBe(false);
+  });
+
+  describe('unknown flags', () => {
+    test.each([
+      [['abc', '--turn', '1-2'], '--turn'],
+      [['abc', '--turn=1-2'], '--turn'],
+      [['abc', '--no-turn'], '--no-turn'],
+      [['abc', '--no-project'], '--no-project'],
+      [['abc', '--claudeProject', 'x'], '--claudeProject'],
+      [['abc', '-x'], '-x'],
+      [['abc', '-'], '-'],
+      [['abc', '-x=secret'], '-x'],
+    ])('rejects %j echoing %s', (tokens, echoed) => {
+      const err = argsError(() => parseCommandArgs(tokens, shapeDef, 'shape'));
+      expect(err.message.startsWith(`unknown flag ${echoed} for command shape`)).toBe(true);
+      expect(err.message).toContain('(supported flags: --project, --claude-project)');
+      expect(err.message).not.toContain('secret');
+    });
+
+    test.each([
+      [['--constructor', 'x']],
+      [['--__proto__', 'x']],
+      [['--toString']],
+      [['--valueOf', 'x']],
+      [['--no-constructor']],
+      [['--hasOwnProperty=1']],
+    ])('treats Object.prototype name %j as unknown', (tokens) => {
+      const err = argsError(() => parseCommandArgs(['abc', ...tokens], shapeDef, 'shape'));
+      expect(err.message).toContain('unknown flag --');
+      expect(err.message).toContain('for command shape');
+    });
+
+    test('commands with no flags say so', () => {
+      const err = argsError(() => parseCommandArgs(['--x'], noFlagsDef, 'index status'));
+      expect(err.message).toBe('unknown flag --x for command index status (command index status accepts no flags)');
+    });
+
+    test('full path appears in the message', () => {
+      const err = argsError(() => parseCommandArgs(['--bogus'], searchDef, 'stats tokens'));
+      expect(err.message).toContain('for command stats tokens');
+    });
+  });
+
+  describe('values', () => {
+    test('dash-leading values are accepted when space-separated', () => {
+      const parsed = parseCommandArgs(['abc', '--claude-project', '-Users-me-app'], shapeDef, 'shape');
+      expect(parsed['claude-project']).toBe('-Users-me-app');
+      const glob = parseCommandArgs(['--glob', '-tmp-*'], searchDef, 'search');
+      expect(glob.glob).toBe('-tmp-*');
+    });
+
+    test('--flag=value keeps a --leading value verbatim', () => {
+      const parsed = parseCommandArgs(['abc', '--claude-project=--claude-project'], shapeDef, 'shape');
+      expect(parsed['claude-project']).toBe('--claude-project');
+    });
+
+    test('value after first = is kept verbatim', () => {
+      const parsed = parseCommandArgs(['abc', '--turn=a=b'], toolsDef, 'tools');
+      expect(parsed.turn).toBe('a=b');
+    });
+
+    test('missing value at end of argv', () => {
+      const err = argsError(() => parseCommandArgs(['abc', '--turn'], toolsDef, 'tools'));
+      expect(err.message).toBe(
+        'flag --turn for command tools requires a value; use --turn=<value> if the value starts with --',
+      );
+    });
+
+    test('missing value when followed by a -- token', () => {
+      const err = argsError(() => parseCommandArgs(['abc', '--turn', '--claude-project', 'x'], toolsDef, 'tools'));
+      expect(err.message).toContain('flag --turn for command tools requires a value');
+    });
+
+    test('empty values are rejected', () => {
+      for (const tokens of [['abc', '--turn='], ['abc', '--turn', '']]) {
+        const err = argsError(() => parseCommandArgs(tokens, toolsDef, 'tools'));
+        expect(err.message).toBe('flag --turn for command tools requires a non-empty value');
+      }
+    });
+  });
+
+  describe('boolean forms', () => {
+    test('accepted forms', () => {
+      expect(parseCommandArgs(['--subagents'], searchDef, 'search').subagents).toBe(true);
+      expect(parseCommandArgs(['--no-subagents'], searchDef, 'search').subagents).toBe(false);
+      expect(parseCommandArgs(['--subagents=true'], searchDef, 'search').subagents).toBe(true);
+      expect(parseCommandArgs(['--subagents=false'], searchDef, 'search').subagents).toBe(false);
+    });
+
+    const boolMessage =
+      'flag --subagents for command search is a boolean; use --subagents, --no-subagents, --subagents=true or --subagents=false';
+
+    test.each([
+      [['--subagents=yes']],
+      [['--subagents=']],
+      [['--no-subagents=true']],
+      [['--no-subagents=']],
+      [['--subagents', 'false']],
+      [['--subagents', 'true']],
+      [['--no-subagents', 'false']],
+      [['--no-subagents', 'true']],
+    ])('rejects %j with the boolean-form message', (tokens) => {
+      const err = argsError(() => parseCommandArgs(tokens, searchDef, 'search'));
+      expect(err.message).toBe(boolMessage);
+    });
+
+    test('--no-<string flag> is an unknown flag', () => {
+      const err = argsError(() => parseCommandArgs(['--no-text'], searchDef, 'search'));
+      expect(err.message.startsWith('unknown flag --no-text for command search')).toBe(true);
+    });
+  });
+
+  describe('classification order', () => {
+    test('a def declaring only no-foo reaches no-foo', () => {
+      const def: ArgsDef = { 'no-foo': { type: 'boolean' } };
+      expect(parseCommandArgs(['--no-foo'], def, 'x')['no-foo']).toBe(true);
+    });
+
+    test('declaring both x and no-x throws a plain Error', () => {
+      plainError(() => parseCommandArgs([], { x: { type: 'boolean' }, 'no-x': { type: 'boolean' } }, 'x'));
+    });
+  });
+
+  describe('defaults', () => {
+    test('boolean default applies when absent', () => {
+      expect(parseCommandArgs([], searchDef, 'search').subagents).toBe(true);
+    });
+
+    test('boolean without default is omitted', () => {
+      const def: ArgsDef = { all: { type: 'boolean' } };
+      const parsed = parseCommandArgs([], def, 'x');
+      expect(Object.hasOwn(parsed, 'all')).toBe(false);
+    });
+
+    test('optional positional default applies', () => {
+      const def: ArgsDef = { name: { type: 'positional', default: 'fallback' } };
+      expect(parseCommandArgs([], def, 'x').name).toBe('fallback');
+      expect(parseCommandArgs(['given'], def, 'x').name).toBe('given');
+    });
+
+    test('a required flag with a default is never reported missing', () => {
+      const def: ArgsDef = { mode: { type: 'string', required: true, default: 'a' } };
+      expect(parseCommandArgs([], def, 'x').mode).toBe('a');
+    });
+  });
+
+  describe('duplicates', () => {
+    test('repeated single-valued flag is rejected', () => {
+      const err = argsError(() => parseCommandArgs(['abc', '--turn', '1', '--turn', '3'], toolsDef, 'tools'));
+      expect(err.message).toBe('flag --turn for command tools may only be given once');
+    });
+
+    test('--x=1 --x=2 echoes only the flag', () => {
+      const err = argsError(() => parseCommandArgs(['abc', '--turn=1', '--turn=2'], toolsDef, 'tools'));
+      expect(err.message).toBe('flag --turn for command tools may only be given once');
+    });
+
+    test('--subagents --no-subagents is rejected and echoes the second token', () => {
+      const err = argsError(() => parseCommandArgs(['--subagents', '--no-subagents'], searchDef, 'search'));
+      expect(err.message).toBe('flag --no-subagents for command search may only be given once');
+    });
+
+    test('multiple flags collect arrays and are omitted when absent', () => {
+      expect(parseCommandArgs(['--counter', 'a=1'], searchDef, 'search').counter).toEqual(['a=1']);
+      expect(parseCommandArgs(['--counter', 'a=1', '--counter=b=2'], searchDef, 'search').counter).toEqual(['a=1', 'b=2']);
+      expect(Object.hasOwn(parseCommandArgs([], searchDef, 'search'), 'counter')).toBe(false);
+    });
+  });
+
+  describe('positionals', () => {
+    test('bind in declaration order, interleaved with flags', () => {
+      const def: ArgsDef = {
+        first: { type: 'positional', required: true },
+        second: { type: 'positional', required: true },
+        turn: { type: 'string' },
+      };
+      const parsed = parseCommandArgs(['--turn', '1-2', 'a', 'b'], def, 'x');
+      expect(parsed.first).toBe('a');
+      expect(parsed.second).toBe('b');
+      expect(parsed.turn).toBe('1-2');
+      expect(parsed._).toEqual(['a', 'b']);
+      const interleaved = parseCommandArgs(['a', '--turn', '1-2', 'b'], def, 'x');
+      expect(interleaved.first).toBe('a');
+      expect(interleaved.second).toBe('b');
+    });
+
+    test('positional may follow flags: slice --turn 1-2 <session>', () => {
+      const parsed = parseCommandArgs(['--turn', '1-2', 'abc'], sliceDef, 'slice');
+      expect(parsed.session).toBe('abc');
+      expect(parsed.turn).toBe('1-2');
+    });
+
+    test('extra positional, command takes one', () => {
+      const err = argsError(() => parseCommandArgs(['a', 'extra'], shapeDef, 'shape'));
+      expect(err.message).toBe("unexpected argument 'extra' for command shape (expected: <session>)");
+    });
+
+    test('extra positional, command takes none', () => {
+      const err = argsError(() => parseCommandArgs(['extra'], searchDef, 'search'));
+      expect(err.message).toBe("unexpected argument 'extra' for command search (command search takes no positional arguments)");
+    });
+
+    test('missing required positional', () => {
+      const err = argsError(() => parseCommandArgs([], shapeDef, 'shape'));
+      expect(err.message).toBe('missing required argument <session> for command shape');
+    });
+
+    test('after --, later tokens are positional', () => {
+      const parsed = parseCommandArgs(['--', '--x'], shapeDef, 'shape');
+      expect(parsed.session).toBe('--x');
+      const err = argsError(() => parseCommandArgs(['a', '--', '--x'], shapeDef, 'shape'));
+      expect(err.message).toContain("unexpected argument '--x'");
+    });
+
+    test('first walk problem wins over positional count', () => {
+      const err = argsError(() => parseCommandArgs(['a', 'b', '--bogus'], shapeDef, 'shape'));
+      expect(err.message.startsWith('unknown flag --bogus for command shape')).toBe(true);
+    });
+  });
+
+  describe('required flags', () => {
+    test('slice --turn is required', () => {
+      const err = argsError(() => parseCommandArgs(['abc'], sliceDef, 'slice'));
+      expect(err.message).toBe('missing required flag --turn for command slice');
+    });
+  });
+
+  describe('output keys', () => {
+    test('contains only declared names given or defaulted, plus _', () => {
+      const parsed = parseCommandArgs(['abc', '--project', '/p'], shapeDef, 'shape');
+      expect(Object.keys(parsed).sort()).toEqual(['_', 'project', 'session']);
+      const search = parseCommandArgs(['--text', 'x'], searchDef, 'search');
+      expect(Object.keys(search).sort()).toEqual(['_', 'subagents', 'text']);
+      expect(Object.hasOwn(search, 'claudeProjectsRoot')).toBe(false);
+    });
+
+    test('camelCase never resolves to a kebab-case flag', () => {
+      argsError(() => parseCommandArgs(['abc', '--claudeProject', 'x'], shapeDef, 'shape'));
+    });
+  });
+
+  describe('malformed command definitions (D12)', () => {
+    test('throw a plain Error, not CliArgsError', () => {
+      plainError(() => parseCommandArgs([], { x: { type: 'string', alias: 'y' } }, 'x'));
+      plainError(() => parseCommandArgs([], { x: {} }, 'x'));
+      plainError(() => parseCommandArgs([], { x: { type: 'enum' } as unknown as ArgsDef[string] }, 'x'));
+      plainError(() => parseCommandArgs([], { x: { type: 'boolean', multiple: true } as ArgsDef[string] }, 'x'));
+      plainError(() => parseCommandArgs([], { x: { type: 'string', multiple: true, default: 'a' } as ArgsDef[string] }, 'x'));
+      plainError(() => parseCommandArgs([], { _: { type: 'string' } }, 'x'));
+    });
+  });
+});
+
+// ============================================================================
+// Command resolver (src/cli-args.ts)
+// ============================================================================
+
+/** Args each real leaf needs to parse cleanly; WU3's integration loop reuses this. */
+const LEAF_REQUIRED_ARGS: Record<string, string[]> = {
+  list: [],
+  projects: [],
+  search: [],
+  shape: ['SESSION'],
+  summary: ['SESSION'],
+  tools: ['SESSION'],
+  files: ['SESSION'],
+  tokens: ['SESSION'],
+  messages: ['SESSION'],
+  slice: ['SESSION', '--turn', '1-2'],
+  subagents: ['SESSION'],
+  'index status': [],
+  'index rebuild': [],
+  'stats tokens': [],
+  'stats trajectories': [],
+};
+
+/** Enumerate leaf command paths of a tree the same way the resolver defines a leaf. */
+function enumerateLeafPaths(cmd: CommandDef<ArgsDef>, prefix: string[] = []): string[] {
+  const subs = (cmd.subCommands ?? {}) as Record<string, CommandDef<ArgsDef>>;
+  const names = Object.keys(subs);
+  if (names.length === 0) return [prefix.join(' ')];
+  return names.flatMap((name) => enumerateLeafPaths(subs[name] as CommandDef<ArgsDef>, [...prefix, name]));
+}
+
+describe('resolveCliCommand', () => {
+  const noop = () => {};
+  const leafArgs: ArgsDef = { session: { type: 'positional', required: true }, flag: { type: 'string' } };
+  const tree = defineCommand({
+    meta: { name: 'tool' },
+    subCommands: {
+      one: defineCommand({ meta: { name: 'one' }, args: leafArgs, run: noop }),
+      grp: defineCommand({
+        meta: { name: 'grp' },
+        subCommands: {
+          deep: defineCommand({ meta: { name: 'deep' }, args: () => leafArgs, run: noop }),
+          other: defineCommand({ meta: { name: 'other' }, run: noop }),
+        },
+      }),
+      empty: defineCommand({ meta: { name: 'empty' }, subCommands: {}, run: noop }),
+    },
+  });
+
+  const argsError = async (argv: string[], root: CommandDef<ArgsDef> = tree): Promise<CliArgsError> => {
+    try {
+      await resolveCliCommand(root, argv);
+    } catch (err) {
+      expect(err).toBeInstanceOf(CliArgsError);
+      expect(isCliArgsError(err)).toBe(true);
+      return err as CliArgsError;
+    }
+    throw new Error('expected resolveCliCommand to throw');
+  };
+  const plainError = async (root: CommandDef<ArgsDef>, argv: string[] = []): Promise<Error> => {
+    try {
+      await resolveCliCommand(root, argv);
+    } catch (err) {
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(CliArgsError);
+      return err as Error;
+    }
+    throw new Error('expected resolveCliCommand to throw');
+  };
+
+  test('resolves a depth-1 leaf with rawArgs, path and argsDef', async () => {
+    const r = await resolveCliCommand(tree, ['one', 'abc', '--flag', 'x']);
+    expect(r.path).toEqual(['one']);
+    expect(r.rawArgs).toEqual(['abc', '--flag', 'x']);
+    expect(r.argsDef).toBe(leafArgs);
+    expect(typeof r.command.run).toBe('function');
+  });
+
+  test('resolves a depth-2 leaf and a thunk-resolved argsDef', async () => {
+    const r = await resolveCliCommand(tree, ['grp', 'deep', 'abc']);
+    expect(r.path).toEqual(['grp', 'deep']);
+    expect(r.rawArgs).toEqual(['abc']);
+    expect(r.argsDef).toBe(leafArgs);
+  });
+
+  test('a leaf without args resolves to an empty argsDef', async () => {
+    const r = await resolveCliCommand(tree, ['grp', 'other']);
+    expect(r.argsDef).toEqual({});
+    expect(r.rawArgs).toEqual([]);
+  });
+
+  test('subCommands: {} is a leaf', async () => {
+    const r = await resolveCliCommand(tree, ['empty', 'x']);
+    expect(r.path).toEqual(['empty']);
+    expect(r.rawArgs).toEqual(['x']);
+  });
+
+  test('missing subcommand at the root and at a group', async () => {
+    expect((await argsError([])).message).toBe(
+      'missing subcommand for command tool (available subcommands: one, grp, empty)',
+    );
+    expect((await argsError(['grp'])).message).toBe(
+      'missing subcommand for command grp (available subcommands: deep, other)',
+    );
+  });
+
+  test('a flag before the subcommand is rejected without echoing its value', async () => {
+    const err = await argsError(['--all-projects=secret', 'one']);
+    expect(err.message).toBe(
+      'unknown flag --all-projects for command tool; flags must follow the subcommand name (available subcommands: one, grp, empty)',
+    );
+    expect(err.message).not.toContain('secret');
+    expect((await argsError(['grp', '-x', 'deep'])).message).toContain('unknown flag -x for command grp;');
+  });
+
+  test('unknown subcommand', async () => {
+    expect((await argsError(['shap'])).message).toBe(
+      "unknown subcommand 'shap' for command tool (available subcommands: one, grp, empty)",
+    );
+    expect((await argsError(['grp', 'nope'])).message).toContain("unknown subcommand 'nope' for command grp");
+  });
+
+  test('Object.prototype names are unknown subcommands', async () => {
+    for (const token of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+      const err = await argsError([token]);
+      expect(err.message).toContain(`unknown subcommand '${token}' for command tool`);
+    }
+    expect((await argsError(['grp', 'constructor'])).message).toContain("unknown subcommand 'constructor' for command grp");
+  });
+
+  describe('malformed command definitions (D12)', () => {
+    test('a leaf without run', async () => {
+      const root = defineCommand({ meta: { name: 'r' }, subCommands: { a: defineCommand({ meta: { name: 'a' } }) } });
+      await plainError(root, ['a']);
+    });
+
+    test('a leaf with setup or cleanup', async () => {
+      const withSetup = defineCommand({
+        meta: { name: 'r' },
+        subCommands: { a: defineCommand({ meta: { name: 'a' }, run: noop, setup: noop }) },
+      });
+      const withCleanup = defineCommand({
+        meta: { name: 'r' },
+        subCommands: { a: defineCommand({ meta: { name: 'a' }, run: noop, cleanup: noop }) },
+      });
+      await plainError(withSetup, ['a']);
+      await plainError(withCleanup, ['a']);
+    });
+
+    test('a group with args, run, setup or cleanup', async () => {
+      const child = defineCommand({ meta: { name: 'a' }, run: noop });
+      const extras: Partial<CommandDef<ArgsDef>>[] = [
+        { args: { x: { type: 'string' } } },
+        { run: noop },
+        { setup: noop },
+        { cleanup: noop },
+      ];
+      for (const extra of extras) {
+        const root = defineCommand({ meta: { name: 'r' }, subCommands: { a: child }, ...extra });
+        await plainError(root, ['a']);
+        await plainError(root, []);
+      }
+    });
+
+    test('a root without meta.name', async () => {
+      const root = defineCommand({ subCommands: { a: defineCommand({ meta: { name: 'a' }, run: noop }) } });
+      await plainError(root, ['a']);
+    });
+
+    test('a subcommand that resolves to no definition names the command', async () => {
+      const root = defineCommand({
+        meta: { name: 'r' },
+        subCommands: { a: (() => undefined) as unknown as CommandDef<ArgsDef> },
+      });
+      expect((await plainError(root, ['a'])).message).toContain('command a resolved to no definition');
+    });
+
+    test('subCommands that resolve to null are treated as a leaf', async () => {
+      const root = defineCommand({
+        meta: { name: 'r' },
+        subCommands: (() => null) as unknown as Record<string, CommandDef<ArgsDef>>,
+        run: noop,
+      });
+      const r = await resolveCliCommand(root, ['x']);
+      expect(r.path).toEqual([]);
+      expect(r.rawArgs).toEqual(['x']);
+    });
+  });
+});
+
+describe('real command tree (resolver + parser)', () => {
+  test('enumerated leaf paths equal LEAF_REQUIRED_ARGS keys', () => {
+    expect(enumerateLeafPaths(cliMain).sort()).toEqual(Object.keys(LEAF_REQUIRED_ARGS).sort());
+    expect(Object.keys(LEAF_REQUIRED_ARGS)).toHaveLength(15);
+  });
+
+  for (const [leafPath, required] of Object.entries(LEAF_REQUIRED_ARGS)) {
+    test(`resolves and parses '${leafPath}'`, async () => {
+      const resolved = await resolveCliCommand(cliMain, [...leafPath.split(' '), ...required]);
+      expect(resolved.path.join(' ')).toBe(leafPath);
+      expect(() => parseCommandArgs(resolved.rawArgs, resolved.argsDef, leafPath)).not.toThrow();
+    });
+  }
+});
+
+// ============================================================================
+// Strict argument dispatch (dispatchCli) integration
+// ============================================================================
+
+describe('sessionProjectSelectorFromArgs with an empty --claude-project', () => {
+  test('an explicit empty string is an explicit selector, not a CWD fallback', () => {
+    expect(sessionProjectSelectorFromArgs({ 'claude-project': '' })).toEqual({ kind: 'claudeProject', project: '' });
+  });
+
+  test('resolving the empty selector throws INVALID_ARGS', () => {
+    const selector = sessionProjectSelectorFromArgs({ 'claude-project': '' });
+    let thrown: unknown;
+    try {
+      resolveClaudeProjectDirFromSelector(selector, FIXTURE_CLAUDE_PROJECTS_ROOT);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ProjectSelectionError);
+    expect((thrown as ProjectSelectionError).code).toBe('INVALID_ARGS');
+  });
+
+  test('--project together with an empty --claude-project is mutually exclusive', () => {
+    expect(() => sessionProjectSelectorFromArgs({ project: '/x', 'claude-project': '' })).toThrow(ProjectSelectionError);
+  });
+});
+
+describe('strict argument dispatch integration', () => {
+  const MISSING_SESSION = '99999999-0000-0000-0000-000000000000';
+
+  async function expectInvalidArgs(args: string[], messagePart: string, env: Record<string, string> = {}) {
+    const { exitCode, stdout } = await runCli(args, env);
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+    expect(result.error.message).toContain(messagePart);
+    return result;
+  }
+
+  describe('issue repros', () => {
+    test('shape --turn is rejected as an unknown flag', async () => {
+      await expectInvalidArgs(
+        ['shape', SESSION_ID, '--project', FAKE_PROJECT, '--turn', '1-2'],
+        'unknown flag --turn for command shape',
+      );
+    });
+
+    test('list --claude-project is rejected and does not report a CWD-derived NOT_FOUND', async () => {
+      const result = await expectInvalidArgs(
+        ['list', '--claude-project', '-zzz-bogus--claude-worktrees-xyz'],
+        'unknown flag --claude-project for command list',
+      );
+      expect(result.error.message.toLowerCase()).not.toContain('not found');
+    });
+  });
+
+  describe('per-leaf --definitely-unknown loop', () => {
+    for (const [leafPath, required] of Object.entries(LEAF_REQUIRED_ARGS)) {
+      test(`'${leafPath}' rejects an unknown flag before any I/O`, async () => {
+        const tempDir = join(tmpdir(), uniqueTempName('cc-session-unknown-flag'));
+        mkdirSync(tempDir, { recursive: true });
+        try {
+          const dbPath = join(tempDir, 'index.db');
+          const usesDb = leafPath.startsWith('stats ') || leafPath.startsWith('index ');
+          const args = [
+            ...leafPath.split(' '),
+            ...required.map((token) => (token === 'SESSION' ? MISSING_SESSION : token)),
+            '--definitely-unknown',
+            ...(usesDb ? ['--db', dbPath] : []),
+          ];
+          const { exitCode, stdout } = await runCli(args);
+          expect(exitCode).toBe(2);
+          const result = parseOutput(stdout);
+          expect(result.ok).toBe(false);
+          expect(result.error.code).toBe('INVALID_ARGS');
+          expect(result.error.message).toContain(`unknown flag --definitely-unknown for command ${leafPath}`);
+          expect(result.error.message).toContain(`for command ${leafPath}`);
+          expect(existsSync(dbPath)).toBe(false);
+        } finally {
+          rmSync(tempDir, { recursive: true, force: true });
+        }
+      });
+    }
+  });
+
+  describe('dash-leading values', () => {
+    test('projects --glob accepts a dash-leading raw basename', async () => {
+      expect(fakeDirName.startsWith('-')).toBe(true);
+      const { exitCode, stdout } = await runCli(['projects', '--glob', fakeDirName]);
+      expect(exitCode).toBe(0);
+      const result = parseOutput(stdout);
+      expect(result.ok).toBe(true);
+      expect(result.data.map((p: any) => p.project)).toEqual([fakeDirName]);
+    });
+
+    test('list --all-projects --project-glob accepts a dash-leading raw basename', async () => {
+      const { exitCode, stdout } = await runCli(['list', '--all-projects', '--project-glob', secondFakeDirName]);
+      expect(exitCode).toBe(0);
+      const result = parseOutput(stdout);
+      expect(result.ok).toBe(true);
+      expect(result._meta.projects_scanned).toBe(1);
+      expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_6]);
+    });
+
+    test('--claude-project with a dash-leading basename still resolves a session', async () => {
+      const { exitCode, stdout } = await runCli(['shape', SESSION_ID_8, '--claude-project', relatedWorktreeDirName]);
+      expect(exitCode).toBe(0);
+      expect(parseOutput(stdout).ok).toBe(true);
+    });
+
+    test('--claude-project=--claude-project keeps its value and returns NOT_FOUND', async () => {
+      const { exitCode, stdout } = await runCli(['shape', SESSION_ID, '--claude-project=--claude-project']);
+      expect(exitCode).toBe(3);
+      const result = parseOutput(stdout);
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('NOT_FOUND');
+    });
+  });
+
+  describe('D2 glob typo fallback', () => {
+    test('list --all-projects --project-glob with a nonexistent basename is ok with zero projects scanned', async () => {
+      const { exitCode, stdout } = await runCli(['list', '--all-projects', '--project-glob', '-no-such-project-basename-zzz']);
+      expect(exitCode).toBe(0);
+      const result = parseOutput(stdout);
+      expect(result.ok).toBe(true);
+      expect(result.data).toEqual([]);
+      expect(result._meta.projects_scanned).toBe(0);
+    });
+  });
+
+  describe('rejected forms', () => {
+    test('a repeated single-valued flag is INVALID_ARGS, not FORMAT_ERROR', async () => {
+      await expectInvalidArgs(
+        ['tools', SESSION_ID, '--project', FAKE_PROJECT, '--turn', '1', '--turn', '3'],
+        'flag --turn for command tools may only be given once',
+      );
+    });
+
+    test('the hidden camelCase --claude-projects-root redirect is rejected', async () => {
+      await expectInvalidArgs(
+        ['shape', SESSION_ID, '--claude-projects-root', FIXTURE_CLAUDE_PROJECTS_ROOT],
+        'unknown flag --claude-projects-root for command shape',
+      );
+    });
+
+    test('--subagents false is rejected with the boolean-form message', async () => {
+      await expectInvalidArgs(
+        ['search', '--text', 'x', '--subagents', 'false', '--project', FAKE_PROJECT],
+        'flag --subagents for command search is a boolean; use --subagents, --no-subagents, --subagents=true or --subagents=false',
+      );
+    });
+
+    test('an empty flag value is rejected', async () => {
+      await expectInvalidArgs(
+        ['tools', SESSION_ID, '--project', FAKE_PROJECT, '--turn='],
+        'flag --turn for command tools requires a non-empty value',
+      );
+    });
+
+    test('an extra positional is rejected', async () => {
+      await expectInvalidArgs(
+        ['shape', SESSION_ID, 'extra', '--project', FAKE_PROJECT],
+        "unexpected argument 'extra' for command shape",
+      );
+    });
+
+    test('an empty --claude-project is rejected and not silently replaced by the CWD', async () => {
+      await expectInvalidArgs(
+        ['tools', SESSION_ID, '--claude-project='],
+        'flag --claude-project for command tools requires a non-empty value',
+      );
+    });
+  });
+
+  describe('JSON envelopes for errors citty used to print as text', () => {
+    test('shape with no session', async () => {
+      await expectInvalidArgs(['shape'], 'missing required argument <session> for command shape');
+    });
+
+    test('slice without --turn', async () => {
+      await expectInvalidArgs(['slice', SESSION_ID, '--project', FAKE_PROJECT], 'missing required flag --turn for command slice');
+    });
+
+    test('unknown subcommand', async () => {
+      await expectInvalidArgs(['shap'], "unknown subcommand 'shap' for command cc-session-tool");
+    });
+
+    test('Object.prototype key as a subcommand', async () => {
+      await expectInvalidArgs(['constructor'], "unknown subcommand 'constructor' for command cc-session-tool");
+    });
+
+    test('no arguments at all', async () => {
+      await expectInvalidArgs([], 'missing subcommand for command cc-session-tool');
+    });
+
+    test('group without a subcommand', async () => {
+      await expectInvalidArgs(['stats'], 'missing subcommand for command stats (available subcommands: tokens, trajectories)');
+    });
+
+    test('a flag placed before the subcommand', async () => {
+      await expectInvalidArgs(['--all-projects', 'list'], 'unknown flag --all-projects for command cc-session-tool');
+    });
+  });
+
+  describe('preserved paths', () => {
+    test('--version exits 0 and prints the version', async () => {
+      const { exitCode, stdout } = await runCliHelp(['--version']);
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain(VERSION);
+    });
+
+    test('--help still reaches citty', async () => {
+      const { exitCode, stdout } = await runCliHelp(['shape', '--help']);
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain('shape');
+    });
+
+    test('-h reaches citty help even with an unknown flag present', async () => {
+      const { exitCode, stdout } = await runCliHelp(['shape', 'x', '--definitely-unknown', '-h']);
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain('USAGE cc-session-tool shape');
+    });
+
+    test('repeated --counter and --counter-regex both produce counters', async () => {
+      const { exitCode, stdout } = await runCli([
+        'search',
+        '--counter', 'tracking=.claude-tracking',
+        '--counter', 'other=no-such-counter-marker',
+        '--counter-regex', 'tracking_rx=claude-tracking',
+        '--aggregate', 'counters',
+        '--project', FAKE_PROJECT,
+      ]);
+      expect(exitCode).toBe(0);
+      const result = parseOutput(stdout);
+      expect(result.ok).toBe(true);
+      const aggregate = result.data.find((s: any) => s.session_id === SESSION_ID_4);
+      expect(aggregate).toBeDefined();
+      expect(Object.keys(aggregate.counts).sort()).toEqual(['other', 'tracking', 'tracking_rx']);
+    });
+
+    test('--subagents=false excludes subagent rows like --no-subagents', async () => {
+      const base = ['search', '--text', 'Subagent response', '--project', FAKE_PROJECT];
+      const withEquals = parseOutput((await runCli([...base, '--subagents=false'])).stdout);
+      const withNo = parseOutput((await runCli([...base, '--no-subagents'])).stdout);
+      expect(withEquals.ok).toBe(true);
+      expect(withEquals.data).toEqual(withNo.data);
+      expect(withEquals.data.find((s: any) => s.session_id === SESSION_ID)).toBeUndefined();
+    });
   });
 });
