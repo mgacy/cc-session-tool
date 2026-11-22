@@ -90,7 +90,7 @@ cc-session-tool list [--project <path>] [--main-only] [--all-projects] [--projec
 | A session to inspect, plus its raw basename | `shape`, `summary`, `tools`, `files`, `tokens`, `messages`, `slice` or `subagents` with `<session> --claude-project <basename>` | `NOT_FOUND` |
 
 - `--claude-project` is accepted only by the session commands in the last row; `list` and `search` reject it, and `search` scopes the same way as `list`.
-- Don't turn `project_path_guess` into a `--project` value: it is display-only and lossy. With only a row's fields, use the raw-basename row. A repo-root path also covers that repo's Claude worktrees (`--main-only` skips them). A worktree path covers that worktree.
+- Don't turn `project_path_guess` into a `--project` value: it is display-only and lossy. With only a row's fields, use the raw-basename row. A repo-root path also covers that repo's Claude worktrees (`--main-only` skips them). A worktree path covers only that worktree; see **Worktree checkouts** above.
 
 **Output:** Sessions sorted by timestamp (newest first). When `--include-subagents` is set, each session includes a `subagent_count` field; otherwise the field is omitted entirely. Fields may be `null` for sessions with missing metadata. When `--last` is used, `_meta.total` reflects the pre-limit count and `_meta.hasMore` is `true` if results were truncated. When multiple project contexts are included, rows include `project`, `project_path_guess`, `project_role`, and `session_ref`; `_meta.included_projects` records the selected Claude project contexts. `project_path_guess` is display-only; use raw `project` or `session_ref.project` with `--claude-project` on session commands (not `list`) for follow-up.
 
