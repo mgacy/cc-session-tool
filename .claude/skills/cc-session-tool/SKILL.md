@@ -178,7 +178,7 @@ cc-session-tool search --tool Bash \
 - **`--origin` is transcript evidence, not VCS history.** It tells you the earliest _recorded write in a transcript_, not when the file was first committed.
 - **`--all-projects` plus `--project` does not narrow the scan.** In all-projects mode, `--project` is only a file-identity anchor for absolute paths; the scan still covers every project.
 - **`slice` without `--turn` is required to fail** — always pass a range.
-- **Unknown or misplaced flags fail with `INVALID_ARGS`.** Read the error's supported-flags list rather than guessing. Flags go after the subcommand name, repeated flags and empty values are rejected, and a value that starts with `--` must be written `--flag=value` (a single-dash value like `-workspace-app` may be space-separated; `-h` anywhere opens help instead).
+- **Unknown or misplaced flags fail with `INVALID_ARGS`.** Read the error's supported-flags list rather than guessing. Flags go after the subcommand name, repeated flags (except the repeatable `--counter` / `--counter-regex`) and empty values are rejected, and a value that starts with `--` must be written `--flag=value` (a single-dash value like `-workspace-app` may be space-separated; `-h` anywhere opens help instead).
 - **Validate inputs.** Session IDs accept `[a-zA-Z0-9-]`; agent IDs additionally allow `_`; `--claude-project` is a basename only (no path traversal).
 
 ## Further detail

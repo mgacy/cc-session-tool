@@ -5889,7 +5889,7 @@ describe('parseCommandArgs', () => {
     });
   });
 
-  describe('malformed command definitions (D12)', () => {
+  describe('malformed command definitions', () => {
     test('throw a plain Error, not CliArgsError', () => {
       plainError(() => parseCommandArgs([], { x: { type: 'string', alias: 'y' } }, 'x'));
       plainError(() => parseCommandArgs([], { x: {} }, 'x'));
@@ -5905,7 +5905,7 @@ describe('parseCommandArgs', () => {
 // Command resolver (src/cli-args.ts)
 // ============================================================================
 
-/** Args each real leaf needs to parse cleanly; WU3's integration loop reuses this. */
+/** Args each real leaf needs to parse cleanly; the per-leaf integration loop below reuses this. */
 const LEAF_REQUIRED_ARGS: Record<string, string[]> = {
   list: [],
   projects: [],
@@ -6031,7 +6031,7 @@ describe('resolveCliCommand', () => {
     expect((await argsError(['grp', 'constructor'])).message).toContain("unknown subcommand 'constructor' for command grp");
   });
 
-  describe('malformed command definitions (D12)', () => {
+  describe('malformed command definitions', () => {
     test('a leaf without run', async () => {
       const root = defineCommand({ meta: { name: 'r' }, subCommands: { a: defineCommand({ meta: { name: 'a' } }) } });
       await plainError(root, ['a']);
@@ -6225,7 +6225,7 @@ describe('strict argument dispatch integration', () => {
     });
   });
 
-  describe('D2 glob typo fallback', () => {
+  describe('project-glob typo fallback', () => {
     test('list --all-projects --project-glob with a nonexistent basename is ok with zero projects scanned', async () => {
       const { exitCode, stdout } = await runCli(['list', '--all-projects', '--project-glob', '-no-such-project-basename-zzz']);
       expect(exitCode).toBe(0);
@@ -6307,6 +6307,17 @@ describe('strict argument dispatch integration', () => {
 
     test('a flag placed before the subcommand', async () => {
       await expectInvalidArgs(['--all-projects', 'list'], 'unknown flag --all-projects for command cc-session-tool');
+    });
+
+    test('--version after a subcommand is an unknown flag, not version output', async () => {
+      await expectInvalidArgs(['list', '--version'], 'unknown flag --version for command list');
+    });
+
+    test('--version followed by a subcommand is rejected, not version output', async () => {
+      await expectInvalidArgs(
+        ['--version', 'list'],
+        'unknown flag --version for command cc-session-tool; flags must follow the subcommand name',
+      );
     });
   });
 

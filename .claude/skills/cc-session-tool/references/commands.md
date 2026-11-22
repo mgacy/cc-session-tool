@@ -9,7 +9,7 @@ All session-scoped commands accept:
 
 All commands emit `{ ok, data, _meta }` (or `{ ok: false, error }`).
 
-Arguments are parsed strictly: unknown or misplaced flags, repeated flags, missing or empty values, and extra or missing positionals fail with `INVALID_ARGS` (exit 2) before any I/O, and the message lists the command's supported flags. Flags follow the subcommand name. A value starting with `--` must use `--flag=value`. Booleans accept `--x`, `--no-x`, `--x=true` and `--x=false` (not `--x false`).
+Arguments are parsed strictly: unknown or misplaced flags, repeated flags (except the repeatable `--counter` / `--counter-regex`), missing or empty values, and extra or missing positionals fail with `INVALID_ARGS` (exit 2) before any I/O. An unknown-flag message lists the command's supported flags. Flags follow the subcommand name. A value starting with `--` must use `--flag=value`. Booleans accept `--x`, `--no-x`, `--x=true` and `--x=false` (not `--x false`).
 
 ## Table of contents
 

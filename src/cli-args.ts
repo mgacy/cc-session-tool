@@ -139,7 +139,8 @@ function setOwn(target: Record<string, unknown>, key: string, value: unknown): v
 
 /**
  * Strictly parse a leaf's raw tokens against its declared args. Throws
- * CliArgsError for caller problems and a plain Error for malformed defs (D12).
+ * CliArgsError for caller problems and a plain Error for malformed defs, which
+ * surfaces as FORMAT_ERROR because it is a programmer error, not a caller one.
  */
 export function parseCommandArgs(
   rawArgs: readonly string[],
@@ -280,7 +281,8 @@ function hasOwnKeys(value: object | null | undefined): value is Record<string, C
 
 /**
  * Walk `root.subCommands` along argv. Throws CliArgsError for caller dispatch
- * problems and a plain Error for malformed command definitions (D12).
+ * problems and a plain Error (surfacing as FORMAT_ERROR) for malformed command
+ * definitions.
  */
 export async function resolveCliCommand(
   root: CommandDef<ArgsDef>,
