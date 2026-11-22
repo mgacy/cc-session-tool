@@ -1,0 +1,26 @@
+{
+  "skill_name": "cc-session-tool",
+  "evals": [
+    {
+      "id": 0,
+      "name": "edit-history-triage",
+      "prompt": "I'm in the cc-session-tool repo (the current working directory). I think the last Claude Code session that edited index.ts on the main branch may have introduced a regression. Find that session and report: (a) the session UUID, (b) the tools it ran before the first edit/write, and (c) a one-paragraph summary of the assistant's reasoning around the first edit. Return raw findings, no need to fix anything.",
+      "expected_output": "Identifies a specific session UUID, lists tool calls from turns before first_edit_turn, and shows assistant thinking/text near that turn. Uses cc-session-tool list/shape/tools/messages rather than reading JSONL files directly.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "subagent-investigation",
+      "prompt": "There's a Claude Code session in this project (the current working directory) whose UUID starts with c2ebf50e. It spawned a bunch of subagents and I want to audit them. For each subagent, tell me: its agent_id, what it was asked to do, how many tool calls it made, and whether any of its tool calls errored. Don't fix anything — just report.",
+      "expected_output": "Lists every subagent of session c2ebf50e, with agent_id, description, tool count, and a flag for whether any tool errored. Uses subagents + tools/shape with colon notation (e.g., c2ebf50e:<agent-id>), not direct file reads.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "bash-test-audit",
+      "prompt": "I'm in the cc-session-tool repo (the current working directory). Over the last 30 days, how often have I run `bun test` from Claude Code in this project? I want a total count, a per-session breakdown for the top 3 sessions by count, and a rough day-by-day distribution. Don't include sessions from other projects.",
+      "expected_output": "Returns total bun-test invocations in scope, top 3 sessions by count, and a day-bucketed distribution. Uses cc-session-tool search with --bash 'bun test' (or --tool Bash --input-match 'bun test') plus aggregate modes, scoped to the project (no --all-projects).",
+      "files": []
+    }
+  ]
+}
