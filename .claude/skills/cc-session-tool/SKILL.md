@@ -37,7 +37,7 @@ Two-phase pattern that minimizes token usage:
 1. **Triage** — narrow to one session with `list`, `search`, or a session ID the user provided.
 2. **Drill** — start with `summary` for a one-shot overview. If you need more, use `shape` for the table of contents, then `tools` / `files` / `messages` / `slice` for specifics.
 
-Avoid `slice` without a `--turn` range narrower than ~5 turns — it returns raw content, which is expensive. Use `messages` (truncated by default) or `shape` first to locate the turns you care about.
+Avoid `slice` without a `--turn` range narrower than ~5 turns — it returns raw content, which is expensive. Use `messages` (truncated by default, except for a single `--turn N`) or `shape` first to locate the turns you care about.
 
 ## Key concepts
 

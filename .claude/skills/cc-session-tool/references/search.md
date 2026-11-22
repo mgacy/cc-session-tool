@@ -68,9 +68,11 @@ Use `--all-projects` only for broad audits.
 | `--after <ISO>` / `--before <ISO>` | Date range. |
 | `--since <duration>` | `30m`, `2h`, `1d`, `1w`. Mutually exclusive with `--after`. |
 
+Date filters and `--bucket` use session start time.
+
 ## Aggregation modes
 
-Default: full match rows with evidence. Two summary modes:
+Default: full match rows with evidence. Two summary modes, both counting matching tool calls, including ones that only mention the text:
 
 ### `--aggregate count-per-session`
 
@@ -78,7 +80,7 @@ Per-session rollup with `counts.tool_inputs` and a small `sample_matches` array.
 
 ### `--aggregate counters`
 
-Named raw-input counters. Combine with `--counter NAME=text` or `--counter-regex NAME=regex` (repeatable). Add `--bucket day|week` to bucket by date (missing timestamps go to `unknown`). `--per-subagent` emits transcript-level rows instead of parent-session rollups.
+Named raw-input counters; without `--tool`, they match every tool's input. Combine with `--counter NAME=text` or `--counter-regex NAME=regex` (repeatable). Add `--bucket day|week` to bucket by date (missing timestamps go to `unknown`). `--per-subagent` emits transcript-level rows instead of parent-session rollups.
 
 ```bash
 cc-session-tool search --tool Bash --aggregate counters \

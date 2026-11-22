@@ -19,7 +19,7 @@
       "id": 2,
       "name": "bash-test-audit",
       "prompt": "I'm in the cc-session-tool repo (the current working directory). Over the last 30 days, how often have I run `bun test` from Claude Code in this project? I want a total count, a per-session breakdown for the top 3 sessions by count, and a rough day-by-day distribution. Don't include sessions from other projects.",
-      "expected_output": "Returns total bun-test invocations in scope, top 3 sessions by count, and a day-bucketed distribution. Uses cc-session-tool search with --bash 'bun test' (or --tool Bash --input-match 'bun test') plus aggregate modes, scoped to the project (no --all-projects).",
+      "expected_output": "Reports a total count, the top 3 sessions by count, and a day-by-day distribution, scoped to this project (no --all-projects) and the last 30 days. Counts only Bash calls containing `bun test` (for example, search --tool Bash --input-match 'bun test' --aggregate count-per-session, or a --tool Bash counter); a count that includes every Bash call or other tools' inputs is wrong. States that the counts are Bash calls containing `bun test` rather than individual test runs, and that the 30-day window and day grouping use each session's start date. Any cc-session-tool method that meets these is acceptable; reading the JSONL files directly is not.",
       "files": []
     }
   ]
