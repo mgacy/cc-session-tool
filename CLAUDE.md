@@ -37,7 +37,7 @@ CLI entrypoint and command wiring live in `index.ts` using `citty`. Shared trans
 | `projects` | Summarize Claude project transcript directories and expose raw project handles |
 | `shape` | Turn-by-turn skeleton with summary stats (tool counts, duration, first edit) |
 | `summary` | One-call triage summary for a session |
-| `tools` | Tool call log with condensed input summaries and outcomes; rows carry `outcome_hash` (full-error-text discriminator) plus `tool_use_id`/`result_turn` handles for fetching the full result |
+| `tools` | Tool call log with condensed input summaries and outcomes |
 | `files` | Files touched in a session, grouped by path or turn |
 | `tokens` | Per-turn token usage timeline (optional cumulative mode) |
 | `messages` | Filtered, truncated message content by role/type/turn |
@@ -74,7 +74,7 @@ Sessions are resolved in order within the selected Claude project directory: exa
 1. All output uses a `{ ok, data, _meta }` / `{ ok, error }` JSON envelope
 2. Distinct exit codes: 0=success, 1=format/terminated, 2=invalid args/ID, 3=not found
 3. Errors are thrown via `cliError(code, msg)`; argument errors are caught at the dispatch boundary (`dispatchCli`), handler errors in each handler
-4. Content truncation uses the `"...[truncated, N chars]"` marker: as a suffix by default, and as an infix (`<head>...[truncated, N chars]...<tail>`) for head + tail elision of Bash `input_summary`; in both forms `N` is the full original length
+4. Content truncation uses `"...[truncated, N chars]"` suffix
 5. `project_path_guess` is display metadata only; raw `project` / `session_ref.project` is the stable Claude project identity for follow-up commands.
 6. `mangleProjectPath` must mirror Claude Code's project-dir encoder exactly (NFC; every non-`[A-Za-z0-9]` UTF-16 code unit becomes `-`; names over 200 chars are truncated with a hash suffix), and worktree discovery derives its prefix from the same sanitizer. Encoding-sensitive tests must write the encoding-sensitive part of expected basenames (e.g. `--claude-worktrees-`) as literals, because encoder-derived fixtures agree with any encoder.
 7. Arguments are validated strictly before any I/O: input a command does not declare in its `args` is `INVALID_ARGS`, never silently ignored.
