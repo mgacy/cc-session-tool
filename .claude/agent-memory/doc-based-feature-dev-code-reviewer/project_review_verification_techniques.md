@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-**Piped JSON can come back cut off; redirect to a file before parsing.** In the issue #15 review (2026-11-22), piping `search` output into a Bun reader (`bun -e 'await Bun.stdin.text()'` or a script calling it) sometimes returned exactly 131072 bytes and failed with `JSON Parse error: Unexpected EOF`. Redirecting the same command to a file, or piping it to `wc -c`, always gave the full output (156677 / 158699 bytes). The cutoff did not happen every time: a 637 KB `--tool Bash` result parsed fine through the same pipe. The root cause was never found, so it is unknown whether the reader or the writer side cuts the output short.
+**Piped JSON can come back cut off; redirect to a file before parsing.** In the issue #15 review (2026-11-22), piping `search` output into a Bun reader (`bun -e 'await Bun.stdin.text()'` or a script calling it) sometimes returned exactly 131072 bytes and failed with `JSON Parse error: Unexpected EOF`. Redirecting the same command to a file, or piping it to `wc -c`, always gave the full output (156677 / 158699 bytes). The cutoff did not happen every time: a 637 KB `--tool Bash` result parsed fine through the same pipe. The root cause was never found, so it is unknown whether the reader or the writer side cuts the output short. This is likely the same pipe truncation tracked as issue #21 (see [[preexisting-pipe-truncation]], which saw a ~64 KB cutoff on `list`).
 
 **Why:** the reviewer spent 4 tool calls deciding the CLI itself truncated output, and called it a pre-existing CLI bug, before `wc -c` disproved it.
 

@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
-import { appendFileSync, mkdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'fs';
 import { Database } from 'bun:sqlite';
 import { basename, join } from 'path';
 import { tmpdir } from 'os';
@@ -18,7 +18,7 @@ import {
   normalizeFileQuery, matchFileAccess, projectMatchesGlob, selectProjectContexts,
   stableJsonStringify, toolInputMatches, deriveWorktreeRootFromPath,
   extractWorktreeStatePaths, collectObservedWorktreeRoots, absolutePathCandidatesFor,
-  scanSearchTarget, extractContentText, sortSearchMatches,
+  scanSearchTarget, extractContentText, sortSearchMatches, main as cliMain, VERSION,
 } from './index.ts';
 import {
   buildToolResultLocations,
@@ -42,8 +42,20 @@ import {
 import {
   buildScopedSearchScope as buildScopedSearchScopeModule,
   listSearchTargetsForContext as listSearchTargetsForContextModule,
+  claudeProjectPathHash,
   mangleProjectPath as mangleProjectPathModule,
+  ProjectSelectionError,
+  resolveClaudeProjectDirFromSelector,
+  sessionProjectSelectorFromArgs,
 } from './src/project-selection.ts';
+import {
+  CliArgsError,
+  isCliArgsError,
+  parseCommandArgs,
+  resolveCliCommand,
+} from './src/cli-args.ts';
+import { defineCommand } from 'citty';
+import type { ArgsDef, CommandDef } from 'citty';
 import {
   aggregateCounterRows,
   attachCounterTranscriptResults,
@@ -78,6 +90,11 @@ import {
 function uniqueTempName(prefix: string): string {
   return `${prefix}-${randomUUID()}`;
 }
+
+// Fixture project paths must encode under Claude Code's 200-char project-dir cap: past it the encoder
+// hash-truncates, so worktree discovery and project-name globs stop matching. The longest fixture adds ~130 chars,
+// so a long TMPDIR (e.g. a session scratchpad) falls back to /tmp.
+const SHORT_TMP_ROOT = tmpdir().length <= 64 ? tmpdir() : '/tmp';
 
 // ============================================================================
 // Search Module Primitives
@@ -911,6 +928,77 @@ describe('Claude project discovery helpers', () => {
     expect(mangleProjectPath('/tmp/example/./')).toBe(mangleProjectPath('/tmp/example'));
   });
 
+  // Encoding-sensitive expectations below are hardcoded literals on purpose: a fixture derived from the
+  // encoder agrees with any encoder, which is how the original dot-handling bug went unnoticed.
+  test('mangleProjectPath maps every non-alphanumeric character to a hyphen like Claude Code', () => {
+    // Issue example: the '.' of '.claude' becomes '-', so the worktree dir has a double dash.
+    expect(mangleProjectPath('/workspace/app/.claude/worktrees/feature-a')).toBe('-workspace-app--claude-worktrees-feature-a');
+    // macOS tmpdir shape contains an underscore.
+    expect(mangleProjectPath('/var/folders/_t/abc/T/x')).toBe('-var-folders--t-abc-T-x');
+    expect(mangleProjectPath('/workspace/My App - v2/pkg')).toBe('-workspace-My-App---v2-pkg');
+    expect(mangleProjectPath('/work/repo/.notes/042_draft_plan')).toBe('-work-repo--notes-042-draft-plan');
+    expect(mangleProjectPath('/work/a@b+c/pkg')).toBe('-work-a-b-c-pkg');
+  });
+
+  test('mangleProjectPath NFC-normalizes and encodes per UTF-16 code unit', () => {
+    const precomposed = '/tmp/caf\u00e9';
+    const decomposed = '/tmp/cafe\u0301';
+    expect(precomposed).not.toBe(decomposed);
+    expect(mangleProjectPath(precomposed)).toBe('-tmp-caf-');
+    expect(mangleProjectPath(decomposed)).toBe('-tmp-caf-');
+    // An astral character is two UTF-16 code units, so it yields two hyphens.
+    expect(mangleProjectPath('/tmp/\u{1F600}')).toBe('-tmp---');
+  });
+
+  test('mangleProjectPath output only ever contains alphanumerics and hyphens', () => {
+    const inputs = [
+      '/tmp/../..',
+      '/a/..b',
+      '/a/b\nc',
+      '/a/b\\c',
+      `/workspace/${'a'.repeat(300)}`,
+      '/tmp/caf\u00e9/\u{1F600}/na\u00efve',
+    ];
+    for (const input of inputs) {
+      expect(mangleProjectPath(input)).toMatch(/^[A-Za-z0-9-]+$/);
+    }
+  });
+
+  // The suffixes f06yf, qm5yvc and 16gmfc were computed with the reference algorithm during planning,
+  // not observed from Claude Code. The Java String.hashCode oracle test below is the independent check.
+  test('claudeProjectPathHash matches Java String.hashCode as base36 of the JS absolute value', () => {
+    // Inputs and Java hashCode values: '' = 0, 'a' = 97, 'hello' = 99162322, 'Hello World' = -862545276,
+    // 'polygenelubricants' = Integer.MIN_VALUE (JS Math.abs gives +2147483648, unlike Java's Math.abs).
+    expect(claudeProjectPathHash('')).toBe('0');
+    expect(claudeProjectPathHash('a')).toBe('2p');
+    expect(claudeProjectPathHash('hello')).toBe('1n1e4y');
+    expect(claudeProjectPathHash('Hello World')).toBe('e9jc70');
+    expect(claudeProjectPathHash('polygenelubricants')).toBe('zik0zk');
+  });
+
+  test('mangleProjectPath truncates names over 200 chars and appends the path hash', () => {
+    const exactly200 = `/workspace/${'a'.repeat(189)}`;
+    expect(mangleProjectPath(exactly200)).toBe(`-workspace-${'a'.repeat(189)}`);
+    expect(mangleProjectPath(exactly200)).toHaveLength(200);
+
+    const over200 = `/workspace/${'a'.repeat(190)}`;
+    expect(mangleProjectPath(over200)).toBe(`-workspace-${'a'.repeat(189)}-f06yf`);
+  });
+
+  test('mangleProjectPath hashes the unsanitized path of a truncated nested worktree', () => {
+    const nested = `/workspace/app/.claude/worktrees/${'x'.repeat(100)}/.claude/worktrees/${'y'.repeat(80)}`;
+    const encoded = mangleProjectPath(nested);
+    expect(encoded).toBe(`-workspace-app--claude-worktrees-${'x'.repeat(100)}--claude-worktrees-${'y'.repeat(48)}-qm5yvc`);
+    expect(encoded).toHaveLength(207);
+  });
+
+  test('mangleProjectPath hashes the NFC-normalized path', () => {
+    // Sanitized NFC length is 201. Hashing the NFD input instead would give suffix ygso7h.
+    const input = `/workspace/${'a'.repeat(185)}/cafe\u0301`;
+    expect(input.normalize('NFC')).not.toBe(input);
+    expect(mangleProjectPath(input)).toBe(`-workspace-${'a'.repeat(185)}-caf-16gmfc`);
+  });
+
   test('claudeProjectsRoot can resolve from an explicit home directory', () => {
     expect(claudeProjectsRoot('/tmp/example-home')).toBe('/tmp/example-home/.claude/projects');
   });
@@ -952,31 +1040,21 @@ describe('Claude project discovery helpers', () => {
     }
   });
 
-  test('findRelatedProjectRefs returns both raw worktree project-name shapes under the project path', () => {
-    const projectPath = '/tmp/repo';
-    const worktreesDirProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
-    const doubleDashProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-b`;
+  const projectRefNamed = (project: string) => ({
+    project,
+    claude_dir: join('/tmp/claude/projects', project),
+    project_path_guess: projectPathGuessFromClaudeProject(project),
+  });
+
+  test('findRelatedProjectRefs returns double-dash worktree project names under the project path', () => {
     const refs = [
+      projectRefNamed('-tmp-repo--claude-worktrees-feature-a'),
+      projectRefNamed('-tmp-repo--claude-worktrees-feature-b'),
       {
-        project: worktreesDirProject,
-        claude_dir: `/tmp/claude/projects/${worktreesDirProject}`,
-        project_path_guess: '/tmp/repo/.claude/worktrees/feature/a',
+        ...projectRefNamed('-tmp-repo--claude-worktrees-feature-b'),
+        claude_dir: '/tmp/claude/projects/-tmp-repo--claude-worktrees-feature-b-duplicate',
       },
-      {
-        project: doubleDashProject,
-        claude_dir: `/tmp/claude/projects/${doubleDashProject}`,
-        project_path_guess: projectPathGuessFromClaudeProject(doubleDashProject),
-      },
-      {
-        project: doubleDashProject,
-        claude_dir: `/tmp/claude/projects/${doubleDashProject}-duplicate`,
-        project_path_guess: projectPathGuessFromClaudeProject(doubleDashProject),
-      },
-      {
-        project: '-tmp-repo-other',
-        claude_dir: '/tmp/claude/projects/-tmp-repo-other',
-        project_path_guess: '/tmp/repo/other',
-      },
+      projectRefNamed('-tmp-repo-other'),
       {
         project: 'not-mangled',
         claude_dir: '/tmp/claude/projects/not-mangled',
@@ -987,38 +1065,65 @@ describe('Claude project discovery helpers', () => {
     expect(findRelatedProjectRefs('/tmp/repo/', refs)).toEqual([refs[0]!, refs[1]!]);
   });
 
+  test('findRelatedProjectRefs does not return the dot-shaped worktree name Claude Code never writes', () => {
+    const refs = [
+      projectRefNamed('-tmp-repo-.claude-worktrees-feature-c'),
+      projectRefNamed('-tmp-repo--claude-worktrees-feature-a'),
+    ];
+
+    expect(findRelatedProjectRefs('/tmp/repo', refs)).toEqual([refs[1]!]);
+  });
+
   test('findRelatedProjectRefs handles hyphenated project paths without relying on path guesses', () => {
     const projectPath = '/tmp/cc-session-tool/cc-session-tool';
-    const relatedProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
-    const relatedDoubleDashProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-b`;
-    const siblingProject = mangleProjectPath('/tmp/cc-session-tool/other');
-    const similarPrefixProject = `${mangleProjectPath(`${projectPath}-other`)}--claude-worktrees-feature-c`;
     const refs = [
-      {
-        project: relatedProject,
-        claude_dir: join('/tmp/claude/projects', relatedProject),
-        project_path_guess: projectPathGuessFromClaudeProject(relatedProject),
-      },
-      {
-        project: relatedDoubleDashProject,
-        claude_dir: join('/tmp/claude/projects', relatedDoubleDashProject),
-        project_path_guess: projectPathGuessFromClaudeProject(relatedDoubleDashProject),
-      },
-      {
-        project: siblingProject,
-        claude_dir: join('/tmp/claude/projects', siblingProject),
-        project_path_guess: projectPathGuessFromClaudeProject(siblingProject),
-      },
-      {
-        project: similarPrefixProject,
-        claude_dir: join('/tmp/claude/projects', similarPrefixProject),
-        project_path_guess: projectPathGuessFromClaudeProject(similarPrefixProject),
-      },
+      projectRefNamed('-tmp-cc-session-tool-cc-session-tool--claude-worktrees-feature-a'),
+      projectRefNamed('-tmp-cc-session-tool-cc-session-tool--claude-worktrees-feature-b'),
+      projectRefNamed('-tmp-cc-session-tool-other'),
+      projectRefNamed('-tmp-cc-session-tool-cc-session-tool-other--claude-worktrees-feature-c'),
     ];
 
     expect(refs[0]!.project_path_guess).not.toStartWith(`${projectPath}/.claude/worktrees/`);
     expect(refs[1]!.project_path_guess).not.toStartWith(`${projectPath}/.claude/worktrees/`);
     expect(findRelatedProjectRefs(projectPath, refs)).toEqual([refs[0]!, refs[1]!]);
+  });
+
+  test('findRelatedProjectRefs matches repo paths containing dots and underscores', () => {
+    const refs = [
+      projectRefNamed('-tmp-my-app-v2--claude-worktrees-x'),
+      projectRefNamed('-tmp-my-app-v2-other--claude-worktrees-x'),
+    ];
+
+    expect(findRelatedProjectRefs('/tmp/my_app.v2', refs)).toEqual([refs[0]!]);
+  });
+
+  test('findRelatedProjectRefs matches a truncated nested worktree name', () => {
+    // Nested path is 232 sanitized chars, so Claude Code stores its first 200 chars plus the pinned qm5yvc hash.
+    const repo = `/workspace/app/.claude/worktrees/${'x'.repeat(100)}`;
+    const nestedProject = `-workspace-app--claude-worktrees-${'x'.repeat(100)}--claude-worktrees-${'y'.repeat(48)}-qm5yvc`;
+    expect(mangleProjectPath(`${repo}/.claude/worktrees/${'y'.repeat(80)}`)).toBe(nestedProject);
+    const refs = [projectRefNamed(nestedProject)];
+
+    expect(findRelatedProjectRefs(repo, refs)).toEqual(refs);
+  });
+
+  test('findRelatedProjectRefs prefix guard ignores lookalikes at 200 chars and returns nothing past it', () => {
+    const lookalike = (head: string, suffix: string) => projectRefNamed(`${head}a-${suffix}`);
+
+    // Prefix of exactly 200 chars: sanitized repo of 181 chars.
+    const repo181 = `-r-${'a'.repeat(178)}`;
+    const head199 = `${repo181}--claude-worktrees`;
+    const real200 = projectRefNamed(`${head199}--abc123`);
+    expect(findRelatedProjectRefs(`/r/${'a'.repeat(178)}`, [real200, lookalike(head199, 'def456')])).toEqual([real200]);
+
+    // Prefix of exactly 201 chars: sanitized repo of 182 chars. The trailing '-' lines up with the truncation
+    // separator, so real and lookalike names share the 200-char head. The guard returns no refs rather than both.
+    const repo182 = `-r-${'a'.repeat(179)}`;
+    const head200 = `${repo182}--claude-worktrees`;
+    expect(head200).toHaveLength(200);
+    const real201 = projectRefNamed(`${head200}-abc123`);
+    const fake201 = projectRefNamed(`${head200}-def456`);
+    expect(findRelatedProjectRefs(`/r/${'a'.repeat(179)}`, [real201, fake201])).toEqual([]);
   });
 
   test('isPathWithinOrEqual is separator-safe', () => {
@@ -1037,10 +1142,10 @@ describe('Claude project discovery helpers', () => {
 
   test('buildScopedSearchScope returns main context only when worktrees are excluded', () => {
     const unique = uniqueTempName('cc-session-tool-scope-main');
-    const root = join(tmpdir(), unique, '.claude', 'projects');
-    const projectPath = join(tmpdir(), unique, 'repo');
+    const root = join(SHORT_TMP_ROOT, unique, '.claude', 'projects');
+    const projectPath = join(SHORT_TMP_ROOT, unique, 'repo');
     const claudeDir = join(root, mangleProjectPath(projectPath));
-    const worktreeProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
+    const worktreeProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-a`;
 
     mkdirSync(claudeDir, { recursive: true });
     mkdirSync(join(root, worktreeProject), { recursive: true });
@@ -1060,35 +1165,59 @@ describe('Claude project discovery helpers', () => {
         },
       });
     } finally {
-      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+      rmSync(join(SHORT_TMP_ROOT, unique), { recursive: true, force: true });
     }
   });
 
-  test('buildScopedSearchScope includes both related hyphenated worktree refs without reverse-mangling', () => {
+  test('buildScopedSearchScope includes related hyphenated worktree refs without reverse-mangling', () => {
     const unique = uniqueTempName('cc-session-tool-scope-worktree');
-    const root = join(tmpdir(), unique, '.claude', 'projects');
-    const projectPath = join(tmpdir(), unique, 'cc-session-tool', 'cc-session-tool');
+    const root = join(SHORT_TMP_ROOT, unique, '.claude', 'projects');
+    const projectPath = join(SHORT_TMP_ROOT, unique, 'cc-session-tool', 'cc-session-tool');
     const mainProject = mangleProjectPath(projectPath);
-    const worktreeProject = mangleProjectPath(join(projectPath, '.claude', 'worktrees', 'feature-a'));
-    const doubleDashWorktreeProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-b`;
-    const siblingProject = mangleProjectPath(join(tmpdir(), unique, 'cc-session-tool-other'));
+    const worktreeProjectA = `${mainProject}--claude-worktrees-feature-a`;
+    const worktreeProjectB = `${mainProject}--claude-worktrees-feature-b`;
+    const siblingProject = mangleProjectPath(join(SHORT_TMP_ROOT, unique, 'cc-session-tool-other'));
 
     mkdirSync(join(root, mainProject), { recursive: true });
-    mkdirSync(join(root, worktreeProject), { recursive: true });
-    mkdirSync(join(root, doubleDashWorktreeProject), { recursive: true });
+    mkdirSync(join(root, worktreeProjectA), { recursive: true });
+    mkdirSync(join(root, worktreeProjectB), { recursive: true });
     mkdirSync(join(root, siblingProject), { recursive: true });
 
     try {
       const scope = buildScopedSearchScope({ projectPath, claudeProjectsRoot: root, includeWorktrees: true });
       expect(scope.projects.map(context => context.role)).toEqual(['main', 'worktree', 'worktree']);
-      expect(scope.projects[1]!.projectRef.project).toBe(doubleDashWorktreeProject);
-      expect(scope.projects[1]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(doubleDashWorktreeProject));
+      expect(scope.projects[1]!.projectRef.project).toBe(worktreeProjectA);
+      expect(scope.projects[1]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(worktreeProjectA));
       expect(scope.projects[1]!.worktreeRoot).toBeNull();
-      expect(scope.projects[2]!.projectRef.project).toBe(worktreeProject);
-      expect(scope.projects[2]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(worktreeProject));
+      expect(scope.projects[2]!.projectRef.project).toBe(worktreeProjectB);
+      expect(scope.projects[2]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(worktreeProjectB));
       expect(scope.projects[2]!.worktreeRoot).toBeNull();
     } finally {
-      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+      rmSync(join(SHORT_TMP_ROOT, unique), { recursive: true, force: true });
+    }
+  });
+
+  test('buildScopedSearchScope from a worktree path resolves that worktree dir and excludes parent and siblings', () => {
+    const unique = uniqueTempName('cc-session-tool-scope-from-worktree');
+    const root = join(SHORT_TMP_ROOT, unique, '.claude', 'projects');
+    const repoPath = join(SHORT_TMP_ROOT, unique, 'repo');
+    const projectPath = join(repoPath, '.claude', 'worktrees', 'feature-a');
+    const repoProject = mangleProjectPath(repoPath);
+    const worktreeProject = `${repoProject}--claude-worktrees-feature-a`;
+    const siblingProject = `${repoProject}--claude-worktrees-feature-b`;
+
+    mkdirSync(join(root, repoProject), { recursive: true });
+    mkdirSync(join(root, worktreeProject), { recursive: true });
+    mkdirSync(join(root, siblingProject), { recursive: true });
+
+    try {
+      expect(resolveClaudeProjectDir(projectPath, root)).toBe(join(root, worktreeProject));
+      const scope = buildScopedSearchScope({ projectPath, claudeProjectsRoot: root, includeWorktrees: true });
+      expect(scope.projects.map(context => context.role)).toEqual(['main']);
+      expect(scope.projects[0]!.projectRef.project).toBe(worktreeProject);
+      expect(scope.projects[0]!.projectRef.claude_dir).toBe(join(root, worktreeProject));
+    } finally {
+      rmSync(join(SHORT_TMP_ROOT, unique), { recursive: true, force: true });
     }
   });
 
@@ -1719,20 +1848,22 @@ describe('CLI', () => {
 // Integration Tests with Fixture Data
 // ============================================================================
 
-const FIXTURE_DIR = join(tmpdir(), uniqueTempName('cc-session-test'));
+const FIXTURE_DIR = join(SHORT_TMP_ROOT, uniqueTempName('cc-session-test'));
 const FIXTURE_HOME = join(FIXTURE_DIR, 'home');
 const FIXTURE_CLAUDE_PROJECTS_ROOT = claudeProjectsRoot(FIXTURE_HOME);
 const FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project');
 const SECOND_FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project-worktree');
 const SUMMARY_PROJECT = join(FIXTURE_DIR, 'summary-project');
-const RELATED_PROJECT = join(tmpdir(), `ccsessionrelated${randomUUID().replace(/-/g, '')}`);
+const RELATED_PROJECT = join(SHORT_TMP_ROOT, `ccsessionrelated${randomUUID().replace(/-/g, '')}`);
 const RELATED_WORKTREE_ROOT = join(RELATED_PROJECT, '.claude', 'worktrees', 'feature');
 const fakeDirName = mangleProjectPath(FAKE_PROJECT);
 const secondFakeDirName = mangleProjectPath(SECOND_FAKE_PROJECT);
 const summaryDirName = mangleProjectPath(SUMMARY_PROJECT);
 const relatedDirName = mangleProjectPath(RELATED_PROJECT);
-const relatedWorktreeDirName = mangleProjectPath(RELATED_WORKTREE_ROOT);
-const relatedDoubleDashWorktreeDirName = `${mangleProjectPath(RELATED_PROJECT)}--claude-worktrees-feature`;
+// Hand-built on purpose: only the '--claude-worktrees-' part is literal. The self-check test below pins
+// mangleProjectPath(RELATED_WORKTREE_ROOT) to it.
+const relatedWorktreeDirName = `${relatedDirName}--claude-worktrees-feature`;
+const relatedSiblingWorktreeDirName = `${relatedDirName}--claude-worktrees-feature-b`;
 const CLAUDE_DIR = join(
   FIXTURE_CLAUDE_PROJECTS_ROOT,
   fakeDirName,
@@ -1753,9 +1884,9 @@ const RELATED_WORKTREE_CLAUDE_DIR = join(
   FIXTURE_CLAUDE_PROJECTS_ROOT,
   relatedWorktreeDirName,
 );
-const RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR = join(
+const RELATED_SIBLING_WORKTREE_CLAUDE_DIR = join(
   FIXTURE_CLAUDE_PROJECTS_ROOT,
-  relatedDoubleDashWorktreeDirName,
+  relatedSiblingWorktreeDirName,
 );
 
 const SESSION_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -1876,7 +2007,7 @@ beforeAll(() => {
   mkdirSync(SUMMARY_CLAUDE_DIR, { recursive: true });
   mkdirSync(RELATED_CLAUDE_DIR, { recursive: true });
   mkdirSync(RELATED_WORKTREE_CLAUDE_DIR, { recursive: true });
-  mkdirSync(RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR, { recursive: true });
+  mkdirSync(RELATED_SIBLING_WORKTREE_CLAUDE_DIR, { recursive: true });
   const lines = makeFixtureLines();
   writeFileSync(join(CLAUDE_DIR, `${SESSION_ID}.jsonl`), lines.join('\n') + '\n');
   const fullTimingSummaryLines = [
@@ -2309,13 +2440,14 @@ afterAll(() => {
   rmSync(SUMMARY_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(RELATED_CLAUDE_DIR, { recursive: true, force: true });
   rmSync(RELATED_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
-  rmSync(RELATED_DOUBLE_DASH_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
+  rmSync(RELATED_SIBLING_WORKTREE_CLAUDE_DIR, { recursive: true, force: true });
 });
 
-function runCli(args: string[], extraEnv: Record<string, string> = {}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+function runCli(args: string[], extraEnv: Record<string, string> = {}, cwd?: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   return new Promise(async (resolve) => {
-    const proc = Bun.spawn(['bun', 'run', 'index.ts', ...args], {
-      cwd: import.meta.dir,
+    const entry = cwd === undefined ? 'index.ts' : join(import.meta.dir, 'index.ts');
+    const proc = Bun.spawn(['bun', 'run', entry, ...args], {
+      cwd: cwd ?? import.meta.dir,
       env: { ...process.env, HOME: FIXTURE_HOME, ...extraEnv },
       stdout: 'pipe',
       stderr: 'pipe',
@@ -2509,6 +2641,162 @@ describe('scanSearchTarget result selectors', () => {
   });
 });
 
+describe('worktree project path resolution integration', () => {
+  test('fixture worktree root encodes to the hand-built Claude project name', () => {
+    expect(mangleProjectPath(RELATED_WORKTREE_ROOT)).toBe(relatedWorktreeDirName);
+  });
+
+  test('list --project <worktree> scopes to that worktree dir only', async () => {
+    const { exitCode, stdout } = await runCli(['list', '--project', RELATED_WORKTREE_ROOT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta).not.toHaveProperty('included_projects');
+    const ids = result.data.map((s: any) => s.session_id);
+    expect(ids).toContain(SESSION_ID_8);
+    expect(ids).not.toContain(SESSION_ID_7);
+  });
+
+  test('search --project <worktree> resolves the worktree dir and excludes the parent and sibling', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--bash-regex', 'bun test related', '--project', RELATED_WORKTREE_ROOT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.map((s: any) => s.session_id)).toContain(SESSION_ID_8);
+    expect(result._meta.included_projects).toEqual([
+      {
+        project: relatedWorktreeDirName,
+        project_path_guess: RELATED_WORKTREE_ROOT,
+        project_role: 'main',
+      },
+    ]);
+  });
+
+  test('projects --project <worktree> returns exactly that worktree dir', async () => {
+    const { exitCode, stdout } = await runCli(['projects', '--project', RELATED_WORKTREE_ROOT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data).toHaveLength(1);
+    expect(result.data[0]).toMatchObject({
+      project: relatedWorktreeDirName,
+      project_role: 'main',
+      session_count: 5,
+    });
+  });
+
+  test('summary <session> --project <worktree> resolves through the session selector path', async () => {
+    const { exitCode, stdout } = await runCli(['summary', SESSION_ID_8, '--project', RELATED_WORKTREE_ROOT]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.session_id).toBe(SESSION_ID_8);
+  });
+
+  test('stats tokens --project <worktree> scopes to that worktree dir with a per-test db', async () => {
+    const dbDir = join(FIXTURE_DIR, 'dbs-worktree');
+    mkdirSync(dbDir, { recursive: true });
+    const { exitCode, stdout } = await runCli(['stats', 'tokens', '--by', 'session', '--project', RELATED_WORKTREE_ROOT, '--db', join(dbDir, 'worktree.db')]);
+    expect(exitCode).toBe(0);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(result._meta.included_projects).toEqual([
+      {
+        project: relatedWorktreeDirName,
+        project_path_guess: RELATED_WORKTREE_ROOT,
+        project_role: 'main',
+      },
+    ]);
+    const ids = result.data.map((r: any) => r.session_id);
+    expect(ids).toContain(SESSION_ID_8);
+    expect(ids).not.toContain(SESSION_ID_7);
+  });
+});
+
+describe('worktree CWD default integration', () => {
+  const unique = uniqueTempName('cc-session-tool-cwd-worktree');
+  const realTmp = realpathSync(SHORT_TMP_ROOT);
+  const base = join(realTmp, unique);
+  const repoRoot = join(base, 'repo');
+  const worktreeDir = join(repoRoot, '.claude', 'worktrees', 'feature-a');
+  const home = join(base, 'home');
+  // Only the '--claude-worktrees-' part is hand-built; the repo part comes from the encoder because it
+  // depends on the machine's tmpdir, and the unit literals pin the encoder.
+  const worktreeProject = `${mangleProjectPath(repoRoot)}--claude-worktrees-feature-a`;
+  const sessionId = '12345678-aaaa-bbbb-cccc-1234567890ab';
+  const dbPath = join(base, 'dbs', 'cwd.db');
+
+  beforeAll(() => {
+    mkdirSync(worktreeDir, { recursive: true });
+    mkdirSync(join(base, 'dbs'), { recursive: true });
+    const projectDir = join(claudeProjectsRoot(home), worktreeProject);
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, `${sessionId}.jsonl`), [
+      JSON.stringify({
+        type: 'user',
+        sessionId,
+        cwd: worktreeDir,
+        timestamp: '2026-03-08T10:00:00.000Z',
+        message: { role: 'user', content: 'Run the cwd default check' },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        cwd: worktreeDir,
+        timestamp: '2026-03-08T10:01:00.000Z',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', name: 'Bash', id: 'tool_cwd_bash_1', input: { command: 'bun test cwd-default-marker' } },
+          ],
+          usage: { input_tokens: 10, output_tokens: 5 },
+        },
+      }),
+    ].join('\n') + '\n');
+  });
+
+  afterAll(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  test('fixture worktree dir encodes to the hand-built Claude project name', () => {
+    expect(mangleProjectPath(worktreeDir)).toBe(worktreeProject);
+  });
+
+  test('list from a worktree CWD finds the worktree session without flags', async () => {
+    const { exitCode, stdout } = await runCli(['list'], { HOME: home }, worktreeDir);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(exitCode).toBe(0);
+    expect(result.data.map((s: any) => s.session_id)).toContain(sessionId);
+  });
+
+  test('search from a worktree CWD finds the worktree session without flags', async () => {
+    const { exitCode, stdout } = await runCli(['search', '--bash-regex', 'cwd-default-marker'], { HOME: home }, worktreeDir);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(exitCode).toBe(0);
+    expect(result.data.map((s: any) => s.session_id)).toContain(sessionId);
+  });
+
+  test('summary from a worktree CWD resolves the session without flags', async () => {
+    const { exitCode, stdout } = await runCli(['summary', sessionId], { HOME: home }, worktreeDir);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(exitCode).toBe(0);
+    expect(result.data.session_id).toBe(sessionId);
+  });
+
+  test('stats tokens from a worktree CWD resolves the CWD scope with a per-test db', async () => {
+    const { exitCode, stdout } = await runCli(['stats', 'tokens', '--by', 'session', '--db', dbPath], { HOME: home }, worktreeDir);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(true);
+    expect(exitCode).toBe(0);
+    expect(result._meta.included_projects.map((p: any) => p.project)).toEqual([worktreeProject]);
+    const row = result.data.find((r: any) => r.session_id === sessionId && r.agent_id === null);
+    expect(row).toMatchObject({ input_tokens: 10, output_tokens: 5 });
+  });
+});
+
 describe('list integration', () => {
   test('lists sessions in fixture dir', async () => {
     const { exitCode, stdout } = await runCli(['list', '--project', FAKE_PROJECT]);
@@ -2607,13 +2895,13 @@ describe('list integration', () => {
         project_role: 'main',
       },
       {
-        project: relatedDoubleDashWorktreeDirName,
-        project_path_guess: projectPathGuessFromClaudeProject(relatedDoubleDashWorktreeDirName),
+        project: relatedWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedWorktreeDirName),
         project_role: 'worktree',
       },
       {
-        project: relatedWorktreeDirName,
-        project_path_guess: projectPathGuessFromClaudeProject(relatedWorktreeDirName),
+        project: relatedSiblingWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedSiblingWorktreeDirName),
         project_role: 'worktree',
       },
     ]);
@@ -2729,8 +3017,8 @@ describe('projects integration', () => {
     expect(result.ok).toBe(true);
     expect(result.data.map((p: any) => p.project)).toEqual([
       relatedDirName,
-      relatedDoubleDashWorktreeDirName,
       relatedWorktreeDirName,
+      relatedSiblingWorktreeDirName,
     ]);
     expect(result.data.find((p: any) => p.project === relatedDirName)).toMatchObject({
       project_path_guess: RELATED_PROJECT,
@@ -4142,13 +4430,13 @@ describe('search integration', () => {
         project_role: 'main',
       },
       {
-        project: relatedDoubleDashWorktreeDirName,
-        project_path_guess: projectPathGuessFromClaudeProject(relatedDoubleDashWorktreeDirName),
+        project: relatedWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedWorktreeDirName),
         project_role: 'worktree',
       },
       {
-        project: relatedWorktreeDirName,
-        project_path_guess: projectPathGuessFromClaudeProject(relatedWorktreeDirName),
+        project: relatedSiblingWorktreeDirName,
+        project_path_guess: projectPathGuessFromClaudeProject(relatedSiblingWorktreeDirName),
         project_role: 'worktree',
       },
     ]);
@@ -5091,11 +5379,11 @@ describe('search tool output integration', () => {
       expect(r.error.message).toContain('Invalid --output-regex regex');
     });
 
-    test('empty --output-match counts as absent', async () => {
-      const r = await search(['--output-match', '']);
+    test.each(['--output-match', '--output-regex'])('empty %s is rejected instead of turning bound mode off', async flag => {
+      const r = await search([flag, '']);
       expect(r.ok).toBe(false);
       expect(r.error.code).toBe('INVALID_ARGS');
-      expect(r.error.message).toContain('At least one search filter is required');
+      expect(r.error.message).toBe(`flag ${flag} for command search requires a non-empty value`);
     });
   });
 
@@ -6050,5 +6338,781 @@ describe('index resilience', () => {
     const oracle = parseOutput((await runCli(['tokens', SESSION_ID, '--project', FAKE_PROJECT])).stdout);
     const row = result.data.find((r: any) => r.session_id === SESSION_ID && r.agent_id === null);
     expect(row.input_tokens ?? 0).toBe(oracle.data.totals.input);
+  });
+});
+
+// ============================================================================
+// Strict argument parser (src/cli-args.ts)
+// ============================================================================
+
+describe('parseCommandArgs', () => {
+  const shapeDef: ArgsDef = {
+    session: { type: 'positional', required: true },
+    project: { type: 'string' },
+    'claude-project': { type: 'string' },
+  };
+  const toolsDef: ArgsDef = {
+    session: { type: 'positional', required: true },
+    turn: { type: 'string' },
+    'claude-project': { type: 'string' },
+  };
+  const searchDef: ArgsDef = {
+    text: { type: 'string' },
+    subagents: { type: 'boolean', default: true },
+    counter: { type: 'string', multiple: true } as ArgsDef[string],
+    glob: { type: 'string' },
+  };
+  const sliceDef: ArgsDef = {
+    session: { type: 'positional', required: true },
+    turn: { type: 'string', required: true },
+  };
+  const noFlagsDef: ArgsDef = {};
+
+  function argsError(fn: () => unknown): CliArgsError {
+    try {
+      fn();
+    } catch (err) {
+      expect(err).toBeInstanceOf(CliArgsError);
+      expect(isCliArgsError(err)).toBe(true);
+      return err as CliArgsError;
+    }
+    throw new Error('expected parseCommandArgs to throw');
+  }
+
+  function plainError(fn: () => unknown): Error {
+    try {
+      fn();
+    } catch (err) {
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(CliArgsError);
+      expect(isCliArgsError(err)).toBe(false);
+      return err as Error;
+    }
+    throw new Error('expected parseCommandArgs to throw');
+  }
+
+  test('isCliArgsError rejects non-CliArgsError values', () => {
+    expect(isCliArgsError(new Error('x'))).toBe(false);
+    expect(isCliArgsError('x')).toBe(false);
+    expect(isCliArgsError(null)).toBe(false);
+  });
+
+  describe('unknown flags', () => {
+    test.each([
+      [['abc', '--turn', '1-2'], '--turn'],
+      [['abc', '--turn=1-2'], '--turn'],
+      [['abc', '--no-turn'], '--no-turn'],
+      [['abc', '--no-project'], '--no-project'],
+      [['abc', '--claudeProject', 'x'], '--claudeProject'],
+      [['abc', '-x'], '-x'],
+      [['abc', '-'], '-'],
+      [['abc', '-x=secret'], '-x'],
+    ])('rejects %j echoing %s', (tokens, echoed) => {
+      const err = argsError(() => parseCommandArgs(tokens, shapeDef, 'shape'));
+      expect(err.message.startsWith(`unknown flag ${echoed} for command shape`)).toBe(true);
+      expect(err.message).toContain('(supported flags: --project, --claude-project)');
+      expect(err.message).not.toContain('secret');
+    });
+
+    test.each([
+      [['--constructor', 'x']],
+      [['--__proto__', 'x']],
+      [['--toString']],
+      [['--valueOf', 'x']],
+      [['--no-constructor']],
+      [['--hasOwnProperty=1']],
+    ])('treats Object.prototype name %j as unknown', (tokens) => {
+      const err = argsError(() => parseCommandArgs(['abc', ...tokens], shapeDef, 'shape'));
+      expect(err.message).toContain('unknown flag --');
+      expect(err.message).toContain('for command shape');
+    });
+
+    test('commands with no flags say so', () => {
+      const err = argsError(() => parseCommandArgs(['--x'], noFlagsDef, 'index status'));
+      expect(err.message).toBe('unknown flag --x for command index status (command index status accepts no flags)');
+    });
+
+    test('full path appears in the message', () => {
+      const err = argsError(() => parseCommandArgs(['--bogus'], searchDef, 'stats tokens'));
+      expect(err.message).toContain('for command stats tokens');
+    });
+  });
+
+  describe('values', () => {
+    test('dash-leading values are accepted when space-separated', () => {
+      const parsed = parseCommandArgs(['abc', '--claude-project', '-Users-me-app'], shapeDef, 'shape');
+      expect(parsed['claude-project']).toBe('-Users-me-app');
+      const glob = parseCommandArgs(['--glob', '-tmp-*'], searchDef, 'search');
+      expect(glob.glob).toBe('-tmp-*');
+    });
+
+    test('--flag=value keeps a --leading value verbatim', () => {
+      const parsed = parseCommandArgs(['abc', '--claude-project=--claude-project'], shapeDef, 'shape');
+      expect(parsed['claude-project']).toBe('--claude-project');
+    });
+
+    test('value after first = is kept verbatim', () => {
+      const parsed = parseCommandArgs(['abc', '--turn=a=b'], toolsDef, 'tools');
+      expect(parsed.turn).toBe('a=b');
+    });
+
+    test('missing value at end of argv', () => {
+      const err = argsError(() => parseCommandArgs(['abc', '--turn'], toolsDef, 'tools'));
+      expect(err.message).toBe(
+        'flag --turn for command tools requires a value; use --turn=<value> if the value starts with --',
+      );
+    });
+
+    test('missing value when followed by a -- token', () => {
+      const err = argsError(() => parseCommandArgs(['abc', '--turn', '--claude-project', 'x'], toolsDef, 'tools'));
+      expect(err.message).toContain('flag --turn for command tools requires a value');
+    });
+
+    test('empty values are rejected', () => {
+      for (const tokens of [['abc', '--turn='], ['abc', '--turn', '']]) {
+        const err = argsError(() => parseCommandArgs(tokens, toolsDef, 'tools'));
+        expect(err.message).toBe('flag --turn for command tools requires a non-empty value');
+      }
+    });
+  });
+
+  describe('boolean forms', () => {
+    test('accepted forms', () => {
+      expect(parseCommandArgs(['--subagents'], searchDef, 'search').subagents).toBe(true);
+      expect(parseCommandArgs(['--no-subagents'], searchDef, 'search').subagents).toBe(false);
+      expect(parseCommandArgs(['--subagents=true'], searchDef, 'search').subagents).toBe(true);
+      expect(parseCommandArgs(['--subagents=false'], searchDef, 'search').subagents).toBe(false);
+    });
+
+    const boolMessage =
+      'flag --subagents for command search is a boolean; use --subagents, --no-subagents, --subagents=true or --subagents=false';
+
+    test.each([
+      [['--subagents=yes']],
+      [['--subagents=']],
+      [['--no-subagents=true']],
+      [['--no-subagents=']],
+      [['--subagents', 'false']],
+      [['--subagents', 'true']],
+      [['--no-subagents', 'false']],
+      [['--no-subagents', 'true']],
+    ])('rejects %j with the boolean-form message', (tokens) => {
+      const err = argsError(() => parseCommandArgs(tokens, searchDef, 'search'));
+      expect(err.message).toBe(boolMessage);
+    });
+
+    test('--no-<string flag> is an unknown flag', () => {
+      const err = argsError(() => parseCommandArgs(['--no-text'], searchDef, 'search'));
+      expect(err.message.startsWith('unknown flag --no-text for command search')).toBe(true);
+    });
+  });
+
+  describe('classification order', () => {
+    test('a def declaring only no-foo reaches no-foo', () => {
+      const def: ArgsDef = { 'no-foo': { type: 'boolean' } };
+      expect(parseCommandArgs(['--no-foo'], def, 'x')['no-foo']).toBe(true);
+    });
+
+    test('declaring both x and no-x throws a plain Error', () => {
+      plainError(() => parseCommandArgs([], { x: { type: 'boolean' }, 'no-x': { type: 'boolean' } }, 'x'));
+    });
+  });
+
+  describe('defaults', () => {
+    test('boolean default applies when absent', () => {
+      expect(parseCommandArgs([], searchDef, 'search').subagents).toBe(true);
+    });
+
+    test('boolean without default is omitted', () => {
+      const def: ArgsDef = { all: { type: 'boolean' } };
+      const parsed = parseCommandArgs([], def, 'x');
+      expect(Object.hasOwn(parsed, 'all')).toBe(false);
+    });
+
+    test('optional positional default applies', () => {
+      const def: ArgsDef = { name: { type: 'positional', default: 'fallback' } };
+      expect(parseCommandArgs([], def, 'x').name).toBe('fallback');
+      expect(parseCommandArgs(['given'], def, 'x').name).toBe('given');
+    });
+
+    test('a required flag with a default is never reported missing', () => {
+      const def: ArgsDef = { mode: { type: 'string', required: true, default: 'a' } };
+      expect(parseCommandArgs([], def, 'x').mode).toBe('a');
+    });
+  });
+
+  describe('duplicates', () => {
+    test('repeated single-valued flag is rejected', () => {
+      const err = argsError(() => parseCommandArgs(['abc', '--turn', '1', '--turn', '3'], toolsDef, 'tools'));
+      expect(err.message).toBe('flag --turn for command tools may only be given once');
+    });
+
+    test('--x=1 --x=2 echoes only the flag', () => {
+      const err = argsError(() => parseCommandArgs(['abc', '--turn=1', '--turn=2'], toolsDef, 'tools'));
+      expect(err.message).toBe('flag --turn for command tools may only be given once');
+    });
+
+    test('--subagents --no-subagents is rejected and echoes the second token', () => {
+      const err = argsError(() => parseCommandArgs(['--subagents', '--no-subagents'], searchDef, 'search'));
+      expect(err.message).toBe('flag --no-subagents for command search may only be given once');
+    });
+
+    test('multiple flags collect arrays and are omitted when absent', () => {
+      expect(parseCommandArgs(['--counter', 'a=1'], searchDef, 'search').counter).toEqual(['a=1']);
+      expect(parseCommandArgs(['--counter', 'a=1', '--counter=b=2'], searchDef, 'search').counter).toEqual(['a=1', 'b=2']);
+      expect(Object.hasOwn(parseCommandArgs([], searchDef, 'search'), 'counter')).toBe(false);
+    });
+  });
+
+  describe('positionals', () => {
+    test('bind in declaration order, interleaved with flags', () => {
+      const def: ArgsDef = {
+        first: { type: 'positional', required: true },
+        second: { type: 'positional', required: true },
+        turn: { type: 'string' },
+      };
+      const parsed = parseCommandArgs(['--turn', '1-2', 'a', 'b'], def, 'x');
+      expect(parsed.first).toBe('a');
+      expect(parsed.second).toBe('b');
+      expect(parsed.turn).toBe('1-2');
+      expect(parsed._).toEqual(['a', 'b']);
+      const interleaved = parseCommandArgs(['a', '--turn', '1-2', 'b'], def, 'x');
+      expect(interleaved.first).toBe('a');
+      expect(interleaved.second).toBe('b');
+    });
+
+    test('positional may follow flags: slice --turn 1-2 <session>', () => {
+      const parsed = parseCommandArgs(['--turn', '1-2', 'abc'], sliceDef, 'slice');
+      expect(parsed.session).toBe('abc');
+      expect(parsed.turn).toBe('1-2');
+    });
+
+    test('extra positional, command takes one', () => {
+      const err = argsError(() => parseCommandArgs(['a', 'extra'], shapeDef, 'shape'));
+      expect(err.message).toBe("unexpected argument 'extra' for command shape (expected: <session>)");
+    });
+
+    test('extra positional, command takes none', () => {
+      const err = argsError(() => parseCommandArgs(['extra'], searchDef, 'search'));
+      expect(err.message).toBe("unexpected argument 'extra' for command search (command search takes no positional arguments)");
+    });
+
+    test('missing required positional', () => {
+      const err = argsError(() => parseCommandArgs([], shapeDef, 'shape'));
+      expect(err.message).toBe('missing required argument <session> for command shape');
+    });
+
+    test('after --, later tokens are positional', () => {
+      const parsed = parseCommandArgs(['--', '--x'], shapeDef, 'shape');
+      expect(parsed.session).toBe('--x');
+      const err = argsError(() => parseCommandArgs(['a', '--', '--x'], shapeDef, 'shape'));
+      expect(err.message).toContain("unexpected argument '--x'");
+    });
+
+    test('first walk problem wins over positional count', () => {
+      const err = argsError(() => parseCommandArgs(['a', 'b', '--bogus'], shapeDef, 'shape'));
+      expect(err.message.startsWith('unknown flag --bogus for command shape')).toBe(true);
+    });
+  });
+
+  describe('required flags', () => {
+    test('slice --turn is required', () => {
+      const err = argsError(() => parseCommandArgs(['abc'], sliceDef, 'slice'));
+      expect(err.message).toBe('missing required flag --turn for command slice');
+    });
+  });
+
+  describe('output keys', () => {
+    test('contains only declared names given or defaulted, plus _', () => {
+      const parsed = parseCommandArgs(['abc', '--project', '/p'], shapeDef, 'shape');
+      expect(Object.keys(parsed).sort()).toEqual(['_', 'project', 'session']);
+      const search = parseCommandArgs(['--text', 'x'], searchDef, 'search');
+      expect(Object.keys(search).sort()).toEqual(['_', 'subagents', 'text']);
+      expect(Object.hasOwn(search, 'claudeProjectsRoot')).toBe(false);
+    });
+
+    test('camelCase never resolves to a kebab-case flag', () => {
+      argsError(() => parseCommandArgs(['abc', '--claudeProject', 'x'], shapeDef, 'shape'));
+    });
+  });
+
+  describe('malformed command definitions', () => {
+    test('throw a plain Error, not CliArgsError', () => {
+      plainError(() => parseCommandArgs([], { x: { type: 'string', alias: 'y' } }, 'x'));
+      plainError(() => parseCommandArgs([], { x: {} }, 'x'));
+      plainError(() => parseCommandArgs([], { x: { type: 'enum' } as unknown as ArgsDef[string] }, 'x'));
+      plainError(() => parseCommandArgs([], { x: { type: 'boolean', multiple: true } as ArgsDef[string] }, 'x'));
+      plainError(() => parseCommandArgs([], { x: { type: 'string', multiple: true, default: 'a' } as ArgsDef[string] }, 'x'));
+      plainError(() => parseCommandArgs([], { _: { type: 'string' } }, 'x'));
+    });
+  });
+});
+
+// ============================================================================
+// Command resolver (src/cli-args.ts)
+// ============================================================================
+
+/** Args each real leaf needs to parse cleanly; the per-leaf integration loop below reuses this. */
+const LEAF_REQUIRED_ARGS: Record<string, string[]> = {
+  list: [],
+  projects: [],
+  search: [],
+  shape: ['SESSION'],
+  summary: ['SESSION'],
+  tools: ['SESSION'],
+  files: ['SESSION'],
+  tokens: ['SESSION'],
+  messages: ['SESSION'],
+  slice: ['SESSION', '--turn', '1-2'],
+  subagents: ['SESSION'],
+  'index status': [],
+  'index rebuild': [],
+  'stats tokens': [],
+  'stats trajectories': [],
+};
+
+/** Enumerate leaf command paths of a tree the same way the resolver defines a leaf. */
+function enumerateLeafPaths(cmd: CommandDef<ArgsDef>, prefix: string[] = []): string[] {
+  const subs = (cmd.subCommands ?? {}) as Record<string, CommandDef<ArgsDef>>;
+  const names = Object.keys(subs);
+  if (names.length === 0) return [prefix.join(' ')];
+  return names.flatMap((name) => enumerateLeafPaths(subs[name] as CommandDef<ArgsDef>, [...prefix, name]));
+}
+
+describe('resolveCliCommand', () => {
+  const noop = () => {};
+  const leafArgs: ArgsDef = { session: { type: 'positional', required: true }, flag: { type: 'string' } };
+  const tree = defineCommand({
+    meta: { name: 'tool' },
+    subCommands: {
+      one: defineCommand({ meta: { name: 'one' }, args: leafArgs, run: noop }),
+      grp: defineCommand({
+        meta: { name: 'grp' },
+        subCommands: {
+          deep: defineCommand({ meta: { name: 'deep' }, args: () => leafArgs, run: noop }),
+          other: defineCommand({ meta: { name: 'other' }, run: noop }),
+        },
+      }),
+      empty: defineCommand({ meta: { name: 'empty' }, subCommands: {}, run: noop }),
+    },
+  });
+
+  const argsError = async (argv: string[], root: CommandDef<ArgsDef> = tree): Promise<CliArgsError> => {
+    try {
+      await resolveCliCommand(root, argv);
+    } catch (err) {
+      expect(err).toBeInstanceOf(CliArgsError);
+      expect(isCliArgsError(err)).toBe(true);
+      return err as CliArgsError;
+    }
+    throw new Error('expected resolveCliCommand to throw');
+  };
+  const plainError = async (root: CommandDef<ArgsDef>, argv: string[] = []): Promise<Error> => {
+    try {
+      await resolveCliCommand(root, argv);
+    } catch (err) {
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(CliArgsError);
+      return err as Error;
+    }
+    throw new Error('expected resolveCliCommand to throw');
+  };
+
+  test('resolves a depth-1 leaf with rawArgs, path and argsDef', async () => {
+    const r = await resolveCliCommand(tree, ['one', 'abc', '--flag', 'x']);
+    expect(r.path).toEqual(['one']);
+    expect(r.rawArgs).toEqual(['abc', '--flag', 'x']);
+    expect(r.argsDef).toBe(leafArgs);
+    expect(typeof r.command.run).toBe('function');
+  });
+
+  test('resolves a depth-2 leaf and a thunk-resolved argsDef', async () => {
+    const r = await resolveCliCommand(tree, ['grp', 'deep', 'abc']);
+    expect(r.path).toEqual(['grp', 'deep']);
+    expect(r.rawArgs).toEqual(['abc']);
+    expect(r.argsDef).toBe(leafArgs);
+  });
+
+  test('a leaf without args resolves to an empty argsDef', async () => {
+    const r = await resolveCliCommand(tree, ['grp', 'other']);
+    expect(r.argsDef).toEqual({});
+    expect(r.rawArgs).toEqual([]);
+  });
+
+  test('subCommands: {} is a leaf', async () => {
+    const r = await resolveCliCommand(tree, ['empty', 'x']);
+    expect(r.path).toEqual(['empty']);
+    expect(r.rawArgs).toEqual(['x']);
+  });
+
+  test('missing subcommand at the root and at a group', async () => {
+    expect((await argsError([])).message).toBe(
+      'missing subcommand for command tool (available subcommands: one, grp, empty)',
+    );
+    expect((await argsError(['grp'])).message).toBe(
+      'missing subcommand for command grp (available subcommands: deep, other)',
+    );
+  });
+
+  test('a flag before the subcommand is rejected without echoing its value', async () => {
+    const err = await argsError(['--all-projects=secret', 'one']);
+    expect(err.message).toBe(
+      'unknown flag --all-projects for command tool; flags must follow the subcommand name (available subcommands: one, grp, empty)',
+    );
+    expect(err.message).not.toContain('secret');
+    expect((await argsError(['grp', '-x', 'deep'])).message).toContain('unknown flag -x for command grp;');
+  });
+
+  test('unknown subcommand', async () => {
+    expect((await argsError(['shap'])).message).toBe(
+      "unknown subcommand 'shap' for command tool (available subcommands: one, grp, empty)",
+    );
+    expect((await argsError(['grp', 'nope'])).message).toContain("unknown subcommand 'nope' for command grp");
+  });
+
+  test('Object.prototype names are unknown subcommands', async () => {
+    for (const token of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+      const err = await argsError([token]);
+      expect(err.message).toContain(`unknown subcommand '${token}' for command tool`);
+    }
+    expect((await argsError(['grp', 'constructor'])).message).toContain("unknown subcommand 'constructor' for command grp");
+  });
+
+  describe('malformed command definitions', () => {
+    test('a leaf without run', async () => {
+      const root = defineCommand({ meta: { name: 'r' }, subCommands: { a: defineCommand({ meta: { name: 'a' } }) } });
+      await plainError(root, ['a']);
+    });
+
+    test('a leaf with setup or cleanup', async () => {
+      const withSetup = defineCommand({
+        meta: { name: 'r' },
+        subCommands: { a: defineCommand({ meta: { name: 'a' }, run: noop, setup: noop }) },
+      });
+      const withCleanup = defineCommand({
+        meta: { name: 'r' },
+        subCommands: { a: defineCommand({ meta: { name: 'a' }, run: noop, cleanup: noop }) },
+      });
+      await plainError(withSetup, ['a']);
+      await plainError(withCleanup, ['a']);
+    });
+
+    test('a group with args, run, setup or cleanup', async () => {
+      const child = defineCommand({ meta: { name: 'a' }, run: noop });
+      const extras: Partial<CommandDef<ArgsDef>>[] = [
+        { args: { x: { type: 'string' } } },
+        { run: noop },
+        { setup: noop },
+        { cleanup: noop },
+      ];
+      for (const extra of extras) {
+        const root = defineCommand({ meta: { name: 'r' }, subCommands: { a: child }, ...extra });
+        await plainError(root, ['a']);
+        await plainError(root, []);
+      }
+    });
+
+    test('a root without meta.name', async () => {
+      const root = defineCommand({ subCommands: { a: defineCommand({ meta: { name: 'a' }, run: noop }) } });
+      await plainError(root, ['a']);
+    });
+
+    test('a subcommand that resolves to no definition names the command', async () => {
+      const root = defineCommand({
+        meta: { name: 'r' },
+        subCommands: { a: (() => undefined) as unknown as CommandDef<ArgsDef> },
+      });
+      expect((await plainError(root, ['a'])).message).toContain('command a resolved to no definition');
+    });
+
+    test('subCommands that resolve to null are treated as a leaf', async () => {
+      const root = defineCommand({
+        meta: { name: 'r' },
+        subCommands: (() => null) as unknown as Record<string, CommandDef<ArgsDef>>,
+        run: noop,
+      });
+      const r = await resolveCliCommand(root, ['x']);
+      expect(r.path).toEqual([]);
+      expect(r.rawArgs).toEqual(['x']);
+    });
+  });
+});
+
+describe('real command tree (resolver + parser)', () => {
+  test('enumerated leaf paths equal LEAF_REQUIRED_ARGS keys', () => {
+    expect(enumerateLeafPaths(cliMain).sort()).toEqual(Object.keys(LEAF_REQUIRED_ARGS).sort());
+    expect(Object.keys(LEAF_REQUIRED_ARGS)).toHaveLength(15);
+  });
+
+  for (const [leafPath, required] of Object.entries(LEAF_REQUIRED_ARGS)) {
+    test(`resolves and parses '${leafPath}'`, async () => {
+      const resolved = await resolveCliCommand(cliMain, [...leafPath.split(' '), ...required]);
+      expect(resolved.path.join(' ')).toBe(leafPath);
+      expect(() => parseCommandArgs(resolved.rawArgs, resolved.argsDef, leafPath)).not.toThrow();
+    });
+  }
+});
+
+// ============================================================================
+// Strict argument dispatch (dispatchCli) integration
+// ============================================================================
+
+describe('sessionProjectSelectorFromArgs with an empty --claude-project', () => {
+  test('an explicit empty string is an explicit selector, not a CWD fallback', () => {
+    expect(sessionProjectSelectorFromArgs({ 'claude-project': '' })).toEqual({ kind: 'claudeProject', project: '' });
+  });
+
+  test('resolving the empty selector throws INVALID_ARGS', () => {
+    const selector = sessionProjectSelectorFromArgs({ 'claude-project': '' });
+    let thrown: unknown;
+    try {
+      resolveClaudeProjectDirFromSelector(selector, FIXTURE_CLAUDE_PROJECTS_ROOT);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ProjectSelectionError);
+    expect((thrown as ProjectSelectionError).code).toBe('INVALID_ARGS');
+  });
+
+  test('--project together with an empty --claude-project is mutually exclusive', () => {
+    expect(() => sessionProjectSelectorFromArgs({ project: '/x', 'claude-project': '' })).toThrow(ProjectSelectionError);
+  });
+});
+
+describe('strict argument dispatch integration', () => {
+  const MISSING_SESSION = '99999999-0000-0000-0000-000000000000';
+
+  async function expectInvalidArgs(args: string[], messagePart: string, env: Record<string, string> = {}) {
+    const { exitCode, stdout } = await runCli(args, env);
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+    expect(result.error.message).toContain(messagePart);
+    return result;
+  }
+
+  describe('issue repros', () => {
+    test('shape --turn is rejected as an unknown flag', async () => {
+      await expectInvalidArgs(
+        ['shape', SESSION_ID, '--project', FAKE_PROJECT, '--turn', '1-2'],
+        'unknown flag --turn for command shape',
+      );
+    });
+
+    test('list --claude-project is rejected and does not report a CWD-derived NOT_FOUND', async () => {
+      const result = await expectInvalidArgs(
+        ['list', '--claude-project', '-zzz-bogus--claude-worktrees-xyz'],
+        'unknown flag --claude-project for command list',
+      );
+      expect(result.error.message.toLowerCase()).not.toContain('not found');
+    });
+  });
+
+  describe('per-leaf --definitely-unknown loop', () => {
+    for (const [leafPath, required] of Object.entries(LEAF_REQUIRED_ARGS)) {
+      test(`'${leafPath}' rejects an unknown flag before any I/O`, async () => {
+        const tempDir = join(tmpdir(), uniqueTempName('cc-session-unknown-flag'));
+        mkdirSync(tempDir, { recursive: true });
+        try {
+          const dbPath = join(tempDir, 'index.db');
+          const usesDb = leafPath.startsWith('stats ') || leafPath.startsWith('index ');
+          const args = [
+            ...leafPath.split(' '),
+            ...required.map((token) => (token === 'SESSION' ? MISSING_SESSION : token)),
+            '--definitely-unknown',
+            ...(usesDb ? ['--db', dbPath] : []),
+          ];
+          const { exitCode, stdout } = await runCli(args);
+          expect(exitCode).toBe(2);
+          const result = parseOutput(stdout);
+          expect(result.ok).toBe(false);
+          expect(result.error.code).toBe('INVALID_ARGS');
+          expect(result.error.message).toContain(`unknown flag --definitely-unknown for command ${leafPath}`);
+          expect(result.error.message).toContain(`for command ${leafPath}`);
+          expect(existsSync(dbPath)).toBe(false);
+        } finally {
+          rmSync(tempDir, { recursive: true, force: true });
+        }
+      });
+    }
+  });
+
+  describe('dash-leading values', () => {
+    test('projects --glob accepts a dash-leading raw basename', async () => {
+      expect(fakeDirName.startsWith('-')).toBe(true);
+      const { exitCode, stdout } = await runCli(['projects', '--glob', fakeDirName]);
+      expect(exitCode).toBe(0);
+      const result = parseOutput(stdout);
+      expect(result.ok).toBe(true);
+      expect(result.data.map((p: any) => p.project)).toEqual([fakeDirName]);
+    });
+
+    test('list --all-projects --project-glob accepts a dash-leading raw basename', async () => {
+      const { exitCode, stdout } = await runCli(['list', '--all-projects', '--project-glob', secondFakeDirName]);
+      expect(exitCode).toBe(0);
+      const result = parseOutput(stdout);
+      expect(result.ok).toBe(true);
+      expect(result._meta.projects_scanned).toBe(1);
+      expect(result.data.map((s: any) => s.session_id)).toEqual([SESSION_ID_6]);
+    });
+
+    test('--claude-project with a dash-leading basename still resolves a session', async () => {
+      const { exitCode, stdout } = await runCli(['shape', SESSION_ID_8, '--claude-project', relatedWorktreeDirName]);
+      expect(exitCode).toBe(0);
+      expect(parseOutput(stdout).ok).toBe(true);
+    });
+
+    test('--claude-project=--claude-project keeps its value and returns NOT_FOUND', async () => {
+      const { exitCode, stdout } = await runCli(['shape', SESSION_ID, '--claude-project=--claude-project']);
+      expect(exitCode).toBe(3);
+      const result = parseOutput(stdout);
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('NOT_FOUND');
+    });
+  });
+
+  describe('project-glob typo fallback', () => {
+    test('list --all-projects --project-glob with a nonexistent basename is ok with zero projects scanned', async () => {
+      const { exitCode, stdout } = await runCli(['list', '--all-projects', '--project-glob', '-no-such-project-basename-zzz']);
+      expect(exitCode).toBe(0);
+      const result = parseOutput(stdout);
+      expect(result.ok).toBe(true);
+      expect(result.data).toEqual([]);
+      expect(result._meta.projects_scanned).toBe(0);
+    });
+  });
+
+  describe('rejected forms', () => {
+    test('a repeated single-valued flag is INVALID_ARGS, not FORMAT_ERROR', async () => {
+      await expectInvalidArgs(
+        ['tools', SESSION_ID, '--project', FAKE_PROJECT, '--turn', '1', '--turn', '3'],
+        'flag --turn for command tools may only be given once',
+      );
+    });
+
+    test('the hidden camelCase --claude-projects-root redirect is rejected', async () => {
+      await expectInvalidArgs(
+        ['shape', SESSION_ID, '--claude-projects-root', FIXTURE_CLAUDE_PROJECTS_ROOT],
+        'unknown flag --claude-projects-root for command shape',
+      );
+    });
+
+    test('--subagents false is rejected with the boolean-form message', async () => {
+      await expectInvalidArgs(
+        ['search', '--text', 'x', '--subagents', 'false', '--project', FAKE_PROJECT],
+        'flag --subagents for command search is a boolean; use --subagents, --no-subagents, --subagents=true or --subagents=false',
+      );
+    });
+
+    test('an empty flag value is rejected', async () => {
+      await expectInvalidArgs(
+        ['tools', SESSION_ID, '--project', FAKE_PROJECT, '--turn='],
+        'flag --turn for command tools requires a non-empty value',
+      );
+    });
+
+    test('an extra positional is rejected', async () => {
+      await expectInvalidArgs(
+        ['shape', SESSION_ID, 'extra', '--project', FAKE_PROJECT],
+        "unexpected argument 'extra' for command shape",
+      );
+    });
+
+    test('an empty --claude-project is rejected and not silently replaced by the CWD', async () => {
+      await expectInvalidArgs(
+        ['tools', SESSION_ID, '--claude-project='],
+        'flag --claude-project for command tools requires a non-empty value',
+      );
+    });
+  });
+
+  describe('JSON envelopes for errors citty used to print as text', () => {
+    test('shape with no session', async () => {
+      await expectInvalidArgs(['shape'], 'missing required argument <session> for command shape');
+    });
+
+    test('slice without --turn', async () => {
+      await expectInvalidArgs(['slice', SESSION_ID, '--project', FAKE_PROJECT], 'missing required flag --turn for command slice');
+    });
+
+    test('unknown subcommand', async () => {
+      await expectInvalidArgs(['shap'], "unknown subcommand 'shap' for command cc-session-tool");
+    });
+
+    test('Object.prototype key as a subcommand', async () => {
+      await expectInvalidArgs(['constructor'], "unknown subcommand 'constructor' for command cc-session-tool");
+    });
+
+    test('no arguments at all', async () => {
+      await expectInvalidArgs([], 'missing subcommand for command cc-session-tool');
+    });
+
+    test('group without a subcommand', async () => {
+      await expectInvalidArgs(['stats'], 'missing subcommand for command stats (available subcommands: tokens, trajectories)');
+    });
+
+    test('a flag placed before the subcommand', async () => {
+      await expectInvalidArgs(['--all-projects', 'list'], 'unknown flag --all-projects for command cc-session-tool');
+    });
+
+    test('--version after a subcommand is an unknown flag, not version output', async () => {
+      await expectInvalidArgs(['list', '--version'], 'unknown flag --version for command list');
+    });
+
+    test('--version followed by a subcommand is rejected, not version output', async () => {
+      await expectInvalidArgs(
+        ['--version', 'list'],
+        'unknown flag --version for command cc-session-tool; flags must follow the subcommand name',
+      );
+    });
+  });
+
+  describe('preserved paths', () => {
+    test('--version exits 0 and prints the version', async () => {
+      const { exitCode, stdout } = await runCliHelp(['--version']);
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain(VERSION);
+    });
+
+    test('--help still reaches citty', async () => {
+      const { exitCode, stdout } = await runCliHelp(['shape', '--help']);
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain('shape');
+    });
+
+    test('-h reaches citty help even with an unknown flag present', async () => {
+      const { exitCode, stdout } = await runCliHelp(['shape', 'x', '--definitely-unknown', '-h']);
+      expect(exitCode).toBe(0);
+      // consola renders the usage line differently under CI (`[log]` prefix, ANSI codes,
+      // literal backticks), so match only the span that is contiguous in every reporter.
+      expect(stdout).toContain('cc-session-tool shape [OPTIONS] <SESSION>');
+    });
+
+    test('repeated --counter and --counter-regex both produce counters', async () => {
+      const { exitCode, stdout } = await runCli([
+        'search',
+        '--counter', 'tracking=.claude-tracking',
+        '--counter', 'other=no-such-counter-marker',
+        '--counter-regex', 'tracking_rx=claude-tracking',
+        '--aggregate', 'counters',
+        '--project', FAKE_PROJECT,
+      ]);
+      expect(exitCode).toBe(0);
+      const result = parseOutput(stdout);
+      expect(result.ok).toBe(true);
+      const aggregate = result.data.find((s: any) => s.session_id === SESSION_ID_4);
+      expect(aggregate).toBeDefined();
+      expect(Object.keys(aggregate.counts).sort()).toEqual(['other', 'tracking', 'tracking_rx']);
+    });
+
+    test('--subagents=false excludes subagent rows like --no-subagents', async () => {
+      const base = ['search', '--text', 'Subagent response', '--project', FAKE_PROJECT];
+      const withEquals = parseOutput((await runCli([...base, '--subagents=false'])).stdout);
+      const withNo = parseOutput((await runCli([...base, '--no-subagents'])).stdout);
+      expect(withEquals.ok).toBe(true);
+      expect(withEquals.data).toEqual(withNo.data);
+      expect(withEquals.data.find((s: any) => s.session_id === SESSION_ID)).toBeUndefined();
+    });
   });
 });

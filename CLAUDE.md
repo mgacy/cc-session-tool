@@ -12,7 +12,7 @@ A CLI tool that queries Claude Code session transcripts stored as JSONL files in
 bun install          # Install dependencies
 bun run index.ts     # Run the CLI (or: bun run dev)
 bun test             # Run all tests
-bun test --filter "shape"  # Run tests matching a pattern
+bun test index.test.ts -t "shape"  # Run tests whose name matches a pattern
 bun build --compile index.ts --outfile cc-session-tool  # Compile to binary
 bun run release <major|minor|patch>  # Bump VERSION, tag, push (triggers CI release)
 ```
@@ -73,9 +73,11 @@ Sessions are resolved in order within the selected Claude project directory: exa
 
 1. All output uses a `{ ok, data, _meta }` / `{ ok, error }` JSON envelope
 2. Distinct exit codes: 0=success, 1=format/terminated, 2=invalid args/ID, 3=not found
-3. Errors are thrown via `cliError(code, msg)` and caught at the command handler level
+3. Errors are thrown via `cliError(code, msg)`; argument errors are caught at the dispatch boundary (`dispatchCli`), handler errors in each handler
 4. Content truncation uses `"...[truncated, N chars]"` suffix
 5. `project_path_guess` is display metadata only; raw `project` / `session_ref.project` is the stable Claude project identity for follow-up commands.
+6. `mangleProjectPath` must mirror Claude Code's project-dir encoder exactly (NFC; every non-`[A-Za-z0-9]` UTF-16 code unit becomes `-`; names over 200 chars are truncated with a hash suffix), and worktree discovery derives its prefix from the same sanitizer. Encoding-sensitive tests must write the encoding-sensitive part of expected basenames (e.g. `--claude-worktrees-`) as literals, because encoder-derived fixtures agree with any encoder.
+7. Arguments are validated strictly before any I/O: input a command does not declare in its `args` is `INVALID_ARGS`, never silently ignored.
 
 ### Testing
 

@@ -112,7 +112,7 @@ Default full-match rows include, where relevant:
 Worktree / all-project responses add:
 
 - `project` — raw Claude project directory basename (use with `--claude-project`)
-- `project_path_guess` — display-only, lossy when paths have hyphens
+- `project_path_guess` — display-only, lossy (every non-alphanumeric path character is encoded as `-`)
 - `project_role` — `main` / `worktree` / `global`
 - `session_ref` — `{ session_id, project }` for stable follow-up
 

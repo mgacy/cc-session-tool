@@ -64,7 +64,18 @@ cc-session-tool shape DA2738E3:a8361bc            # inspect one
 
 By default, `list` and `search` are scoped to the **logical project** of the current working directory and _also_ include that project's Claude-managed worktree transcript directories. This is intentional: from the main checkout, a search can find work done in a worktree without `--all-projects`.
 
-For follow-up commands, use the stable `project` field (or `session_ref.project`) returned in search/list rows as `--claude-project`. **Never** use `project_path_guess` — it is display-only and lossy.
+From a Claude-managed worktree checkout (`<repo>/.claude/worktrees/<name>`, as CWD or `--project`), scoped `list`/`search`/`stats`/`index status` (and `projects --project <worktree>`) cover only that worktree and any worktrees nested under it, not the main checkout or siblings. Absolute `--file` paths are then anchored to the worktree, so a main-tree path will not find writes made there. For the whole logical project, pass `--project <repo root>` with a main-tree absolute or relative `--file` path.
+
+To scope `list` to one project, or to follow up on a row, pick the row of this table that matches what you have:
+
+| What you have | Use | If the value is wrong |
+| --- | --- | --- |
+| The checkout or worktree path, e.g. `<repo>/.claude/worktrees/<name>` (**preferred**) | `list --project <path>` | `NOT_FOUND` |
+| Only a raw Claude basename: the `project` / `session_ref.project` field of a `search`, `list` or `projects` row | `list --all-projects --project-glob <basename>` | `ok:true` with empty `data` and `_meta.projects_scanned: 0`. Confirm `_meta.projects_scanned === 1` before trusting an empty result. `_meta.skipped_projects` lists every other project, so the response grows with the number of projects. |
+| A session to inspect, plus its raw basename | `shape`, `summary`, `tools`, `files`, `tokens`, `messages`, `slice` or `subagents` with `<session> --claude-project <basename>` | `NOT_FOUND` |
+
+- `search` scopes the same way as `list`.
+- Don't turn `project_path_guess` into a `--project` value: it is display-only and lossy. With only a row's fields, use the raw-basename row. A repo-root path also covers that repo's Claude worktrees (`--main-only` skips them). A worktree path covers only that worktree, as described above.
 
 ```bash
 # Good — stable follow-up using the raw Claude project basename
@@ -74,7 +85,7 @@ cc-session-tool shape DA2738E3 --claude-project -workspace-app--claude-worktrees
 cc-session-tool shape DA2738E3 --project /workspace/app  # may target the wrong directory
 ```
 
-`--project` and `--claude-project` are mutually exclusive. Use `--main-only` on `list` to skip worktrees when you really want only the main directory.
+`--project` and `--claude-project` are mutually exclusive.
 
 ### Turn numbering
 
