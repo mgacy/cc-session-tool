@@ -48,17 +48,6 @@ cc-session-tool list [flags]
 | `--min-lines <n>` | 0 | Sessions with at least N lines. |
 | `--include-subagents` | false | Adds `subagent_count` per session. |
 
-Pick the scoping row that matches what you have:
-
-| What you have | Use | If the value is wrong |
-| --- | --- | --- |
-| The checkout or worktree path, e.g. `<repo>/.claude/worktrees/<name>` (**preferred**) | `list --project <path>` | `NOT_FOUND` |
-| Only a raw Claude basename: the `project` / `session_ref.project` field of a `search`, `list` or `projects` row | `list --all-projects --project-glob <basename>` | `ok:true` with empty `data` and `_meta.projects_scanned: 0`. Confirm `_meta.projects_scanned === 1` before trusting an empty result. `_meta.skipped_projects` lists every other project, so the response grows with the number of projects. |
-| A session to inspect, plus its raw basename | `shape`, `summary`, `tools`, `files`, `tokens`, `messages`, `slice` or `subagents` with `<session> --claude-project <basename>` | `NOT_FOUND` |
-
-- `search` scopes the same way as `list`.
-- Don't turn `project_path_guess` into a `--project` value: it is display-only and lossy. With only a row's fields, use the raw-basename row. A repo-root path also covers that repo's Claude worktrees (`--main-only` skips them). A worktree path covers only that worktree and any worktrees nested under it, not the main checkout or its siblings.
-
 Output rows are sorted newest first. When multiple project contexts are scanned, rows include `project`, `project_path_guess` (display only), `project_role` (`main` / `worktree` / `global`), and `session_ref` for stable follow-up. `_meta.included_projects` records what was scanned.
 
 ---
