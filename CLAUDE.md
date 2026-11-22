@@ -27,7 +27,7 @@ Default to Bun instead of Node.js:
 
 ## Architecture
 
-CLI entrypoint and command wiring live in `index.ts` using `citty` for command definitions and help/version output; `dispatchCli` in `index.ts` resolves the command and strictly parses its arguments via `src/cli-args.ts` before calling the handler. Shared transcript, project-selection, and search primitives live under `src/` and are exported for unit testing.
+CLI entrypoint and command wiring live in `index.ts` using `citty`. Shared transcript, project-selection, and search primitives live under `src/` and are exported for unit testing.
 
 ### Subcommands
 
@@ -75,7 +75,7 @@ Sessions are resolved in order within the selected Claude project directory: exa
 4. Content truncation uses `"...[truncated, N chars]"` suffix
 5. `project_path_guess` is display metadata only; raw `project` / `session_ref.project` is the stable Claude project identity for follow-up commands.
 6. `mangleProjectPath` must mirror Claude Code's project-dir encoder exactly (NFC; every non-`[A-Za-z0-9]` UTF-16 code unit becomes `-`; names over 200 chars are truncated with a hash suffix), and worktree discovery derives its prefix from the same sanitizer. Encoding-sensitive tests must write the encoding-sensitive part of expected basenames (e.g. `--claude-worktrees-`) as literals, because encoder-derived fixtures agree with any encoder.
-7. Arguments are parsed strictly by `src/cli-args.ts` before any I/O. Unknown or misplaced flags, duplicates (unless the def is `multiple`), empty or missing values, and extra or missing positionals are `INVALID_ARGS` (exit 2). Values starting with `--` must use `--flag=value`. A new flag only needs to be declared in the command's `args`. Guards in `src/cli-args.ts` reject malformed definitions (`alias`, `setup` / `cleanup`, untyped args), and a unit test resolves every real leaf so these guards fail in CI.
+7. Arguments are validated strictly before any I/O: input a command does not declare in its `args` is `INVALID_ARGS`, never silently ignored.
 
 ### Testing
 
