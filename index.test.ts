@@ -1311,7 +1311,7 @@ describe('Claude project discovery helpers', () => {
         projectGlob: '*alpha',
       });
       expect(selection.contexts.map(context => context.projectRef.project)).toEqual([projectADir]);
-      expect(selection.includedProjects).toEqual([{
+      expect(buildProjectScanMeta(selection, { includeLists: true }).included_projects).toEqual([{
         project: projectADir,
         project_path_guess: projectPathGuessFromClaudeProject(projectADir),
         project_role: 'global',
@@ -3127,8 +3127,9 @@ describe('projects integration', () => {
 });
 
 describe('--include-project-lists across project-selecting leaves (integration)', () => {
-  // Each row is one project-selecting leaf run against the RELATED_PROJECT fixture (main + 2 worktrees).
-  const PROJECT_LIST_LEAVES: { name: string; args: string[]; usesDb?: boolean }[] = [
+  // Scoped rows run against RELATED_PROJECT (main + 2 worktrees). All-projects rows must scan every fixture
+  // directory, counted by an unfiltered `list --all-projects` because later describes add directories to the root.
+  const PROJECT_LIST_LEAVES: { name: string; args: string[]; usesDb?: boolean; allProjects?: boolean }[] = [
     { name: 'list', args: ['list', '--project', RELATED_PROJECT] },
     { name: 'projects', args: ['projects', '--project', RELATED_PROJECT] },
     { name: 'search', args: ['search', '--tool', 'Bash', '--project', RELATED_PROJECT] },
@@ -3136,6 +3137,10 @@ describe('--include-project-lists across project-selecting leaves (integration)'
     { name: 'index rebuild', args: ['index', 'rebuild', '--project', RELATED_PROJECT], usesDb: true },
     { name: 'stats tokens', args: ['stats', 'tokens', '--project', RELATED_PROJECT], usesDb: true },
     { name: 'stats trajectories', args: ['stats', 'trajectories', '--project', RELATED_PROJECT], usesDb: true },
+    { name: 'index status --all-projects', args: ['index', 'status', '--all-projects'], usesDb: true, allProjects: true },
+    { name: 'index rebuild (all projects by default)', args: ['index', 'rebuild'], usesDb: true, allProjects: true },
+    { name: 'stats tokens --all-projects', args: ['stats', 'tokens', '--all-projects'], usesDb: true, allProjects: true },
+    { name: 'stats trajectories --all-projects', args: ['stats', 'trajectories', '--all-projects'], usesDb: true, allProjects: true },
   ];
 
   for (const leaf of PROJECT_LIST_LEAVES) {
@@ -3144,15 +3149,23 @@ describe('--include-project-lists across project-selecting leaves (integration)'
       mkdirSync(tempDir, { recursive: true });
       try {
         const dbArgs = leaf.usesDb ? ['--db', join(tempDir, 'index.db')] : [];
+        let expectedScanned = 3;
+        if (leaf.allProjects) {
+          const all = await runCli(['list', '--all-projects']);
+          expect(all.exitCode).toBe(0);
+          expectedScanned = parseOutput(all.stdout)._meta.projects_scanned;
+          expect(expectedScanned).toBeGreaterThan(3);
+        }
 
         const def = await runCli([...leaf.args, ...dbArgs]);
         expect(def.exitCode).toBe(0);
         const defResult = parseOutput(def.stdout);
         expect(defResult.ok).toBe(true);
-        expect(defResult._meta.projects_scanned).toBe(3);
+        expect(defResult._meta.projects_scanned).toBe(expectedScanned);
         expect(defResult._meta.projects_skipped).toBe(0);
         expect(defResult._meta).not.toHaveProperty('included_projects');
         expect(defResult._meta).not.toHaveProperty('skipped_projects');
+        expect(Object.keys(defResult._meta).slice(-2)).toEqual(['projects_scanned', 'projects_skipped']);
 
         const opt = await runCli([...leaf.args, '--include-project-lists', ...dbArgs]);
         expect(opt.exitCode).toBe(0);
@@ -3160,8 +3173,9 @@ describe('--include-project-lists across project-selecting leaves (integration)'
         expect(optResult.ok).toBe(true);
         expect(optResult._meta.included_projects).toHaveLength(optResult._meta.projects_scanned);
         expect(optResult._meta.skipped_projects).toHaveLength(optResult._meta.projects_skipped);
-        expect(optResult._meta.projects_scanned).toBe(3);
+        expect(optResult._meta.projects_scanned).toBe(expectedScanned);
         expect(optResult._meta.skipped_projects).toEqual([]);
+        expect(Object.keys(optResult._meta).slice(-4)).toEqual(['projects_scanned', 'projects_skipped', 'included_projects', 'skipped_projects']);
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
       }
@@ -3778,12 +3792,12 @@ describe('project-selection module foundation', () => {
     expect(scanMeta).not.toHaveProperty('skipped_projects');
   });
 
-  test('buildProjectScanMeta with includeLists passes the selection arrays through', () => {
+  test('buildProjectScanMeta with includeLists derives included_projects from the scanned contexts', () => {
     const selection = globSelection();
     const scanMeta = buildProjectScanMeta(selection, { includeLists: true });
     expect(scanMeta.projects_scanned).toBe(selection.contexts.length);
     expect(scanMeta.projects_skipped).toBe(selection.skippedProjects.length);
-    expect(scanMeta.included_projects).toEqual(selection.includedProjects);
+    expect(scanMeta.included_projects?.map(ref => ref.project)).toEqual(selection.contexts.map(context => context.projectRef.project));
     expect(scanMeta.skipped_projects).toEqual(selection.skippedProjects);
   });
 
@@ -3795,7 +3809,7 @@ describe('project-selection module foundation', () => {
       claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT,
     });
     expect(selection.contexts.map(context => context.projectRef.project)).toEqual([relatedWorktreeDirName]);
-    expect(selection.includedProjects.map(ref => [ref.project, ref.project_role])).toEqual([
+    expect(selection.contexts.map(context => [context.projectRef.project, context.role])).toEqual([
       [relatedWorktreeDirName, 'worktree'],
     ]);
     expect(selection.skippedProjects.map(ref => [ref.project, ref.project_role])).toEqual([

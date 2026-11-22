@@ -103,14 +103,13 @@ export type ProjectSelectionOptions = {
 
 export type ProjectSelection = {
   contexts: SearchProjectContext[];
-  includedProjects: PublicProjectRef[];
   skippedProjects: PublicProjectRef[];
 };
 
 /**
  * Project coverage fields that every project-selecting command adds to `_meta`.
  * The arrays grow with the number of Claude project directories, so they are
- * present only when the caller passes --include-project-lists.
+ * present only when `includeLists` is set (CLI: `--include-project-lists`).
  */
 export type ProjectScanMeta = {
   /** Claude project directories selected for the scan; directories that later fail to read are still counted. */
@@ -131,7 +130,7 @@ export function buildProjectScanMeta(selection: ProjectSelection, options: Proje
     projects_skipped: selection.skippedProjects.length,
   };
   if (options.includeLists) {
-    scanMeta.included_projects = selection.includedProjects;
+    scanMeta.included_projects = selection.contexts.map(publicProjectRef);
     scanMeta.skipped_projects = selection.skippedProjects;
   }
   return scanMeta;
@@ -563,7 +562,6 @@ function partitionByProjectGlob(candidates: SearchProjectContext[], glob: string
   }
   return {
     contexts: included,
-    includedProjects: included.map(publicProjectRef),
     skippedProjects: skipped.map(publicProjectRef),
   };
 }

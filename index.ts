@@ -430,7 +430,6 @@ export type ProjectSelectionOptions = {
 
 export type ProjectSelection = {
   contexts: SearchProjectContext[];
-  includedProjects: PublicProjectRef[];
   skippedProjects: PublicProjectRef[];
 };
 
@@ -468,7 +467,13 @@ type ErrorCode = keyof typeof ERROR_CODES;
 const SEARCH_OPERATIONS: SearchOperation[] = ['read', 'edit', 'write', 'grep', 'glob'];
 const SEARCH_SORT_MODES: SearchSortMode[] = ['session-newest', 'match-earliest', 'match-newest', 'project'];
 const SEARCH_SCAN_CONCURRENCY = 50;
-// Must stay above listCommand: defineCommand() spreads it at module load.
+
+// ============================================================================
+// Project Coverage Metadata
+// ============================================================================
+
+// Declared before the first command whose `args` literal spreads it: those literals
+// are evaluated at module load, so a later `const` would throw (TDZ).
 const INCLUDE_PROJECT_LISTS_ARG = {
   'include-project-lists': {
     type: 'boolean',
@@ -476,6 +481,11 @@ const INCLUDE_PROJECT_LISTS_ARG = {
     default: false,
   },
 } as const;
+
+/** `args` must come from a command that declares INCLUDE_PROJECT_LISTS_ARG; otherwise this does not type-check. */
+function projectScanMetaFor(selection: ProjectSelection, args: { 'include-project-lists': boolean }): ProjectScanMeta {
+  return buildProjectScanMeta(selection, { includeLists: args['include-project-lists'] });
+}
 
 // ============================================================================
 // Response Helpers
@@ -1250,8 +1260,7 @@ const listCommand = defineCommand({
       // Apply --last limit after sorting
       const total = sessions.length;
       const returned = lastN != null ? sessions.slice(0, lastN) : sessions;
-      const includeLists = Boolean(args['include-project-lists']);
-      const responseMeta: ListMeta = { ...meta(total, returned.length), ...buildProjectScanMeta(selection, { includeLists }) };
+      const responseMeta: ListMeta = { ...meta(total, returned.length), ...projectScanMetaFor(selection, args) };
       output(success(returned, responseMeta));
     } catch (err: unknown) {
       handleCommandError(err);
@@ -1322,8 +1331,7 @@ const projectsCommand = defineCommand({
       }
       summaries.sort((a, b) => a.project.localeCompare(b.project));
 
-      const includeLists = Boolean(args['include-project-lists']);
-      const responseMeta: ListMeta = { ...meta(summaries.length, summaries.length), ...buildProjectScanMeta(selection, { includeLists }) };
+      const responseMeta: ListMeta = { ...meta(summaries.length, summaries.length), ...projectScanMetaFor(selection, args) };
       output(success(summaries, responseMeta));
     } catch (err: unknown) {
       handleCommandError(err);
@@ -2680,7 +2688,7 @@ const searchCommand = defineCommand({
       }
       const responseMeta: SearchMeta = {
         ...baseMeta,
-        ...buildProjectScanMeta(selection, { includeLists: Boolean(args['include-project-lists']) }),
+        ...projectScanMetaFor(selection, args),
       };
       output(success(responseData, responseMeta));
     } catch (err: unknown) {
@@ -2790,7 +2798,7 @@ const indexStatusCommand = defineCommand({
       const handle = acquireIndexForContexts(args.db, selection.contexts);
       try {
         const status: IndexStatus = queryIndexStatus(handle.db, publicDbPath(handle), selection.contexts);
-        output(success(status, indexMeta(meta(1, 1), handle, buildProjectScanMeta(selection, { includeLists: Boolean(args['include-project-lists']) }))));
+        output(success(status, indexMeta(meta(1, 1), handle, projectScanMetaFor(selection, args))));
       } finally {
         handle.db.close();
       }
@@ -2815,7 +2823,7 @@ const indexRebuildCommand = defineCommand({
       const handle = acquireIndexForContexts(args.db, selection.contexts);
       try {
         const status: IndexStatus = queryIndexStatus(handle.db, publicDbPath(handle), selection.contexts);
-        output(success(status, indexMeta(meta(1, 1), handle, buildProjectScanMeta(selection, { includeLists: Boolean(args['include-project-lists']) }))));
+        output(success(status, indexMeta(meta(1, 1), handle, projectScanMetaFor(selection, args))));
       } finally {
         handle.db.close();
       }
@@ -2872,7 +2880,7 @@ const statsTokensCommand = defineCommand({
           before: beforeCutoff,
           includeSubagents,
         });
-        output(success(rows, indexMeta(meta(rows.length, rows.length), handle, buildProjectScanMeta(selection, { includeLists: Boolean(args['include-project-lists']) }))));
+        output(success(rows, indexMeta(meta(rows.length, rows.length), handle, projectScanMetaFor(selection, args))));
       } finally {
         handle.db.close();
       }
@@ -2916,7 +2924,7 @@ const statsTrajectoriesCommand = defineCommand({
           limit,
           includeSubagents,
         });
-        output(success(rows, indexMeta(meta(rows.length, rows.length), handle, buildProjectScanMeta(selection, { includeLists: Boolean(args['include-project-lists']) }))));
+        output(success(rows, indexMeta(meta(rows.length, rows.length), handle, projectScanMetaFor(selection, args))));
       } finally {
         handle.db.close();
       }
