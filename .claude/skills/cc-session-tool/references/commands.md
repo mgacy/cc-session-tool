@@ -26,7 +26,7 @@ All commands emit `{ ok, data, _meta }` (or `{ ok: false, error }`).
 
 ## list
 
-Index sessions by reading metadata from the first few lines of each JSONL file. Scoped to the logical project of `--project` (CWD by default), including associated Claude-managed worktree transcript directories. From a worktree CWD, scope is that worktree's own dir plus nested worktrees only; pass `--project <repo root>` for the whole logical project.
+Index sessions by reading metadata from the first few lines of each JSONL file. Scoped to the logical project of `--project` (CWD by default), including associated Claude-managed worktree transcript directories.
 
 ```bash
 cc-session-tool list [flags]
@@ -34,7 +34,7 @@ cc-session-tool list [flags]
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--project <path>` | CWD | Logical project. Scoped runs include associated Claude worktree transcript dirs. For a worktree path (`<repo>/.claude/worktrees/<name>`), scope is that worktree plus nested worktrees, not the main checkout or siblings; use `--project <repo root>` for all of them. |
+| `--project <path>` | CWD | Logical project. Scoped runs include associated Claude worktree transcript dirs. |
 | `--main-only` | false | With scoped `--project`, skip worktrees. Incompatible with `--all-projects`. |
 | `--all-projects` | false | List sessions from every top-level Claude project directory under `~/.claude/projects`. |
 | `--project-glob <pat>` | — | With `--all-projects`, filter by raw Claude project basename or display-only `project_path_guess`. Supports `*` and `?`. |
@@ -60,7 +60,7 @@ Summarize Claude project transcript directories and expose stable raw project ha
 cc-session-tool projects [--glob <pattern>] [--project <path>]
 ```
 
-Without `--project`, scans every top-level Claude project directory under `~/.claude/projects`. With `--project`, returns the main project plus associated worktrees. When `--project` is a worktree checkout, it returns that worktree's dir plus nested worktrees only, not the main checkout or siblings; use `--project <repo root>` for the whole logical project. Sorted by raw `project` basename.
+Without `--project`, scans every top-level Claude project directory under `~/.claude/projects`. With `--project`, returns the main project plus associated worktrees. Sorted by raw `project` basename.
 
 Each row: `project` (raw Claude basename — pass to `--claude-project`), `project_path_guess` (display only), `project_role`, `session_count`, `total_lines`, `first_session_at`, `last_session_at`.
 

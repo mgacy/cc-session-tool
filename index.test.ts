@@ -71,6 +71,11 @@ function uniqueTempName(prefix: string): string {
   return `${prefix}-${randomUUID()}`;
 }
 
+// Fixture project paths must encode under Claude Code's 200-char project-dir cap: past it the encoder
+// hash-truncates, so worktree discovery and project-name globs stop matching. The longest fixture adds ~130 chars,
+// so a long TMPDIR (e.g. a session scratchpad) falls back to /tmp.
+const SHORT_TMP_ROOT = tmpdir().length <= 64 ? tmpdir() : '/tmp';
+
 // ============================================================================
 // Search Module Primitives
 // ============================================================================
@@ -818,8 +823,8 @@ describe('Claude project discovery helpers', () => {
 
   test('buildScopedSearchScope returns main context only when worktrees are excluded', () => {
     const unique = uniqueTempName('cc-session-tool-scope-main');
-    const root = join(tmpdir(), unique, '.claude', 'projects');
-    const projectPath = join(tmpdir(), unique, 'repo');
+    const root = join(SHORT_TMP_ROOT, unique, '.claude', 'projects');
+    const projectPath = join(SHORT_TMP_ROOT, unique, 'repo');
     const claudeDir = join(root, mangleProjectPath(projectPath));
     const worktreeProject = `${mangleProjectPath(projectPath)}--claude-worktrees-feature-a`;
 
@@ -841,18 +846,18 @@ describe('Claude project discovery helpers', () => {
         },
       });
     } finally {
-      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+      rmSync(join(SHORT_TMP_ROOT, unique), { recursive: true, force: true });
     }
   });
 
   test('buildScopedSearchScope includes related hyphenated worktree refs without reverse-mangling', () => {
     const unique = uniqueTempName('cc-session-tool-scope-worktree');
-    const root = join(tmpdir(), unique, '.claude', 'projects');
-    const projectPath = join(tmpdir(), unique, 'cc-session-tool', 'cc-session-tool');
+    const root = join(SHORT_TMP_ROOT, unique, '.claude', 'projects');
+    const projectPath = join(SHORT_TMP_ROOT, unique, 'cc-session-tool', 'cc-session-tool');
     const mainProject = mangleProjectPath(projectPath);
     const worktreeProjectA = `${mainProject}--claude-worktrees-feature-a`;
     const worktreeProjectB = `${mainProject}--claude-worktrees-feature-b`;
-    const siblingProject = mangleProjectPath(join(tmpdir(), unique, 'cc-session-tool-other'));
+    const siblingProject = mangleProjectPath(join(SHORT_TMP_ROOT, unique, 'cc-session-tool-other'));
 
     mkdirSync(join(root, mainProject), { recursive: true });
     mkdirSync(join(root, worktreeProjectA), { recursive: true });
@@ -869,14 +874,14 @@ describe('Claude project discovery helpers', () => {
       expect(scope.projects[2]!.projectRef.project_path_guess).toBe(projectPathGuessFromClaudeProject(worktreeProjectB));
       expect(scope.projects[2]!.worktreeRoot).toBeNull();
     } finally {
-      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+      rmSync(join(SHORT_TMP_ROOT, unique), { recursive: true, force: true });
     }
   });
 
   test('buildScopedSearchScope from a worktree path resolves that worktree dir and excludes parent and siblings', () => {
     const unique = uniqueTempName('cc-session-tool-scope-from-worktree');
-    const root = join(tmpdir(), unique, '.claude', 'projects');
-    const repoPath = join(tmpdir(), unique, 'repo');
+    const root = join(SHORT_TMP_ROOT, unique, '.claude', 'projects');
+    const repoPath = join(SHORT_TMP_ROOT, unique, 'repo');
     const projectPath = join(repoPath, '.claude', 'worktrees', 'feature-a');
     const repoProject = mangleProjectPath(repoPath);
     const worktreeProject = `${repoProject}--claude-worktrees-feature-a`;
@@ -893,7 +898,7 @@ describe('Claude project discovery helpers', () => {
       expect(scope.projects[0]!.projectRef.project).toBe(worktreeProject);
       expect(scope.projects[0]!.projectRef.claude_dir).toBe(join(root, worktreeProject));
     } finally {
-      rmSync(join(tmpdir(), unique), { recursive: true, force: true });
+      rmSync(join(SHORT_TMP_ROOT, unique), { recursive: true, force: true });
     }
   });
 
@@ -1524,20 +1529,20 @@ describe('CLI', () => {
 // Integration Tests with Fixture Data
 // ============================================================================
 
-const FIXTURE_DIR = join(tmpdir(), uniqueTempName('cc-session-test'));
+const FIXTURE_DIR = join(SHORT_TMP_ROOT, uniqueTempName('cc-session-test'));
 const FIXTURE_HOME = join(FIXTURE_DIR, 'home');
 const FIXTURE_CLAUDE_PROJECTS_ROOT = claudeProjectsRoot(FIXTURE_HOME);
 const FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project');
 const SECOND_FAKE_PROJECT = join(FIXTURE_DIR, 'fake-project-worktree');
 const SUMMARY_PROJECT = join(FIXTURE_DIR, 'summary-project');
-const RELATED_PROJECT = join(tmpdir(), `ccsessionrelated${randomUUID().replace(/-/g, '')}`);
+const RELATED_PROJECT = join(SHORT_TMP_ROOT, `ccsessionrelated${randomUUID().replace(/-/g, '')}`);
 const RELATED_WORKTREE_ROOT = join(RELATED_PROJECT, '.claude', 'worktrees', 'feature');
 const fakeDirName = mangleProjectPath(FAKE_PROJECT);
 const secondFakeDirName = mangleProjectPath(SECOND_FAKE_PROJECT);
 const summaryDirName = mangleProjectPath(SUMMARY_PROJECT);
 const relatedDirName = mangleProjectPath(RELATED_PROJECT);
 // Hand-built on purpose: only the '--claude-worktrees-' part is literal. The self-check test below pins
-// mangleProjectPath(RELATED_WORKTREE_ROOT) to it (it stops matching if TMPDIR is long enough to hit the 200-char cap).
+// mangleProjectPath(RELATED_WORKTREE_ROOT) to it.
 const relatedWorktreeDirName = `${relatedDirName}--claude-worktrees-feature`;
 const relatedSiblingWorktreeDirName = `${relatedDirName}--claude-worktrees-feature-b`;
 const CLAUDE_DIR = join(
@@ -2281,7 +2286,7 @@ describe('worktree project path resolution integration', () => {
 
 describe('worktree CWD default integration', () => {
   const unique = uniqueTempName('cc-session-tool-cwd-worktree');
-  const realTmp = realpathSync(tmpdir());
+  const realTmp = realpathSync(SHORT_TMP_ROOT);
   const base = join(realTmp, unique);
   const repoRoot = join(base, 'repo');
   const worktreeDir = join(repoRoot, '.claude', 'worktrees', 'feature-a');
