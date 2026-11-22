@@ -60,15 +60,18 @@ import {
   extractSessionIntent,
   normalizedBlocks,
   parseSessionText as parseTranscriptSessionText,
+  truncateContent,
   type SessionSummaryResult,
 } from './src/transcript.ts';
 import {
   buildResultLookup as toolLogBuildResultLookup,
   buildToolResultLocations,
+  DEFAULT_OUTCOME_ERROR_CHARS,
   determineOutcome as toolLogDetermineOutcome,
   extractContentText as toolLogExtractContentText,
   inputSummary as toolLogInputSummary,
   isFailedOutcome,
+  outcomeHash,
   safeInputSummary,
   stableJsonStringify as toolLogStableJsonStringify,
   type ToolResultInfo,
@@ -199,7 +202,13 @@ export type ToolCall = {
   tool: string;
   input_summary: string;
   outcome: string;
+  /** SHA-256 prefix of the full error text: identical texts share it, different hashes mean different texts. Null unless `outcome` starts with `error:`. */
+  outcome_hash: string | null;
   duration_ms: number | null;
+  /** The call's tool_use id, also present on the matching tool_result in `messages`. Null if the block has no id. */
+  tool_use_id: string | null;
+  /** Turn holding the matching tool_result (same numbering as `turn`, not always later); null when there is no result. */
+  result_turn: number | null;
 };
 
 export type ToolsResult = {
@@ -856,11 +865,7 @@ export function parseTurnRange(input: string): { start: number; end: number } {
   throw cliError('INVALID_ARGS', `Invalid turn range '${input}' -- expected N or N-M`);
 }
 
-/** Truncate text with "...[truncated, N chars]" suffix. */
-export function truncateContent(text: string, maxLen: number): string {
-  if (text.length <= maxLen) return text;
-  return text.slice(0, maxLen) + `...[truncated, ${text.length} chars]`;
-}
+export { truncateContent };
 
 export const inputSummary = toolLogInputSummary;
 export const stableJsonStringify = toolLogStableJsonStringify;
@@ -1537,7 +1542,7 @@ const summaryCommand = defineCommand({
 // ============================================================================
 
 const toolsCommand = defineCommand({
-  meta: { name: 'tools', description: 'Tool call log with outcomes; --input-match searches raw structured inputs beyond input_summary' },
+  meta: { name: 'tools', description: 'Tool call log with outcomes (outcome_hash fingerprints full error text; --max-outcome widens error text); --input-match searches raw structured inputs beyond input_summary' },
   args: {
     session: { type: 'positional', description: 'Session ID (UUID, prefix, or slug)', required: true },
     project: { type: 'string', description: 'Absolute project path (defaults to CWD)' },
@@ -1548,6 +1553,7 @@ const toolsCommand = defineCommand({
     'input-regex': { type: 'string', description: 'Filter by raw structured tool input regex' },
     failed: { type: 'boolean', description: 'Show only failed/empty outcomes', default: false },
     turn: { type: 'string', description: 'Filter by turn N or N-M' },
+    'max-outcome': { type: 'string', description: 'Truncate error outcome text to N chars (default: 60); outcome_hash always covers the full text' },
   },
   async run({ args }) {
     try {
@@ -1569,11 +1575,12 @@ const toolsCommand = defineCommand({
         inputMatcher = parseSubstringMatcher(args['input-match']);
       }
       const nameMatcher = parseSubstringMatcher(args['name-match']);
+      const maxOutcome = parseIntArg(args['max-outcome'], '--max-outcome') ?? DEFAULT_OUTCOME_ERROR_CHARS;
       const { sessionId, agentId, entries } = await resolveSession(args);
 
       const turnRange = args.turn ? parseTurnRange(args.turn) : null;
 
-      const resultLookup = buildResultLookup(entries);
+      const locations = buildToolResultLocations(entries);
 
       // Pass 2: Extract tool calls
       let calls: ToolCallWithRawInput[] = [];
@@ -1582,20 +1589,23 @@ const toolsCommand = defineCommand({
         turnNum++;
         if (entry.type === 'assistant' && Array.isArray(entry.message?.content)) {
           for (const block of entry.message!.content as ContentBlock[]) {
-            const rawInput = block.input ?? {};
-            if (block.type === 'tool_use' && block.name) {
-              const resultInfo = resultLookup.get(block.id ?? '') ?? null;
+            if (block?.type === 'tool_use' && block.name) {
+              const rawInput = block.input ?? {};
+              const location = locations.get(block.id ?? '') ?? null;
               let durationMs: number | null = null;
-              if (entry.timestamp && resultInfo?.result_ts) {
-                const diff = new Date(resultInfo.result_ts).getTime() - new Date(entry.timestamp).getTime();
+              if (entry.timestamp && location?.result_ts) {
+                const diff = new Date(location.result_ts).getTime() - new Date(entry.timestamp).getTime();
                 if (diff >= 0) durationMs = diff;
               }
               calls.push({
                 turn: turnNum,
                 tool: block.name,
-                input_summary: inputSummary(block.name, rawInput),
-                outcome: determineOutcome(resultInfo),
+                input_summary: safeInputSummary(block.name, rawInput),
+                outcome: determineOutcome(location, { maxErrorChars: maxOutcome }),
+                outcome_hash: outcomeHash(location),
                 duration_ms: durationMs,
+                tool_use_id: block.id ?? null,
+                result_turn: location?.turn ?? null,
                 raw_input: rawInput,
               });
             }

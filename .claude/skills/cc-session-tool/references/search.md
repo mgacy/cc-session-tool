@@ -32,7 +32,7 @@ At least one **selector** is required: `--tool`, `--input-match` / `--input-rege
 | Flag | Matches | Notes |
 | --- | --- | --- |
 | `--tool <name>` | Tool names | Case-insensitive substring. |
-| `--input-match <text>` | Raw structured tool input | Sees values omitted/truncated in `input_summary`. |
+| `--input-match <text>` | Raw structured tool input | Sees values omitted/truncated in `input_summary`. Evidence and sample `input_summary` values use the `tools` formats (see `references/commands.md`, `tools`). |
 | `--input-regex <regex>` | Raw structured tool input | Mutually exclusive with `--input-match`. |
 | `--output-match <text>` | Tool result text | Case-insensitive substring. Binds to one call (see "Tool output and failures"). |
 | `--output-regex <regex>` | Tool result text | Case-sensitive. Mutually exclusive with `--output-match`. |
@@ -106,7 +106,7 @@ Default full-match rows include, where relevant:
 - `session_id`, `branch`, `timestamp`, `slug`
 - `matches.tools`, `matches.files`, `matches.normalized_files`
 - `matches.evidence` — array of evidence items `{ kind, rawPath, logicalPath, operation, turn, block_index, timestamp }`
-- `tool_output` evidence adds `tool_use_id`, `result_turn`, `result_timestamp`, `is_error` and `snippet`. Its `turn` is the call's turn (as in `tools`); read the result at `result_turn` with `messages`.
+- `tool_output` evidence adds `tool_use_id`, `result_turn`, `result_timestamp`, `is_error` and `snippet`. Its `turn` is the call's turn (as in `tools`); read the result at `result_turn` using the follow-up recipe in `references/commands.md` (`tools`). `tool_output` evidence has no truncation marker, so use the recipe's `slice` branch.
 - `matches.operations`, `matches.turns`
 
 Worktree / all-project responses add:

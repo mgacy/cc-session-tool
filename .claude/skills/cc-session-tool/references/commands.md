@@ -108,8 +108,9 @@ cc-session-tool tools <session> [flags]
 | `--input-regex <regex>` | Regex equivalent. Mutually exclusive with `--input-match`. |
 | `--failed` | Only failed calls. |
 | `--turn <N\|N-M>` | Single turn or range. |
+| `--max-outcome <n>` | Chars of error text shown in `outcome` (default 60; `0` shows only the marker). Never changes `outcome_hash`. |
 
-Each entry: `turn`, `tool`, `input_summary`, `outcome`, `duration_ms`.
+Each entry: `turn`, `tool`, `input_summary`, `outcome`, `outcome_hash`, `duration_ms`, `tool_use_id`, `result_turn`.
 
 **Input summary format by tool:**
 
@@ -119,14 +120,32 @@ Each entry: `turn`, `tool`, `input_summary`, `outcome`, `duration_ms`.
 | `Read` | `file='<basename>' offset=N limit=N` |
 | `Edit` | `file='<basename>' old=(N chars) new=(N chars)` |
 | `Write` | `file='<basename>' (N chars)` |
-| `Bash` | First 80 chars of command |
+| `Bash` | First 40 + last 40 chars of the command, joined by `...[truncated, N chars]...` when longer than 80 |
 | `Glob` | `pattern='...' path='...'` |
-| `Agent`/`Task` | `prompt='...'` (first 80 chars) |
+| `Agent`/`Task` | `prompt='<first 80>...[truncated, N chars]'` (marker inside the quotes when longer than 80) |
 | `WebFetch` | `url='...'` |
 | `WebSearch` | `query='...'` |
-| Other | First 80 chars of JSON-encoded input |
+| Other | First 80 chars of JSON-encoded input, then `...[truncated, N chars]` when longer |
 
-**Outcome:** `success`, `success (N lines)`, `empty`, `error: <message>`, or `no_result` (interrupted session).
+**Outcome:** `success`, `success (N lines)`, `empty`, `error: <message>`, or `no_result` (interrupted session). Error text shows the first 60 chars (`--max-outcome`), then `...[truncated, N chars]` when longer. In every marker, `N` is the full original length.
+
+**`outcome_hash`:** first 12 hex chars of SHA-256 over the UTF-8 bytes of the full error text; `null` unless `outcome` starts with `error:`. Independent of `--max-outcome`.
+
+- Identical text gives the same hash. A different hash means different text, not necessarily a different cause: embedded timings, paths or line numbers split one cause into many hashes. Read the text before naming failure categories.
+- "No text" errors (e.g. image-only) share the empty-string hash `e3b0c44298fc`.
+- Group rows with `jq '.data.tool_calls | group_by(.outcome_hash)'`.
+
+**`tool_use_id` / `result_turn`:** the call's id (also on the matching `tool_result` in `messages`; `null` if the block has no id) and the turn holding its result (same numbering as `turn`; `null` when there is no result). `result_turn` can be smaller than `turn`.
+
+**Reading a full result.** Reuse the exact selector given to `tools`, including `:<agent-id>` for a subagent (`result_turn` is numbered within the subagent transcript; dropping the suffix silently reads the parent's turn), and the same `--project` / `--claude-project`:
+
+```bash
+cc-session-tool messages <session>[:<agent-id>] --turn <result_turn> --type tool_result --max-tool-result <N>
+```
+
+Pick the block with the matching `tool_use_id`; take `N` from the outcome's `...[truncated, N chars]` marker. Rows without a marker (e.g. `success (N lines)`) give no `N` and `messages` truncates at 200 chars by default, so use `slice <session>[:<agent-id>] --turn <result_turn>` instead (untruncated, but the whole turn including parallel results) and pick the block by `tool_use_id`. An untruncated error needs no follow-up. A call's full input: `slice <session>[:<agent-id>] --turn <turn>`.
+
+For long sessions, narrow with `--failed`, `--name` or `--turn`, and prefer this recipe over a large `--max-outcome`. See "Output envelope" in `SKILL.md` for output-size limits.
 
 `duration_ms` is the gap between the assistant entry and its matching tool_result; `null` if timestamps are missing.
 
