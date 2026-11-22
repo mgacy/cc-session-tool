@@ -49,7 +49,7 @@ cc-session-tool list [flags]
 | `--min-lines <n>` | 0 | Sessions with at least N lines. |
 | `--include-subagents` | false | Adds `subagent_count` per session. |
 
-Output rows are sorted newest first. With `--all-projects`, or when `_meta.projects_scanned` is greater than 1, rows include `project`, `project_path_guess` (display only), `project_role` (`main` / `worktree` / `global`), and `session_ref` for stable follow-up. `_meta.projects_scanned` / `_meta.projects_skipped` are always present; `--include-project-lists` adds the `included_projects` / `skipped_projects` arrays. See SKILL.md "Output envelope".
+Output rows are sorted newest first. With `--all-projects`, or when `_meta.projects_scanned` is greater than 1, rows include `project`, `project_path_guess` (display only), `project_role` (`main` / `worktree` / `global`), and `session_ref` for stable follow-up.
 
 ---
 
@@ -61,7 +61,7 @@ Summarize Claude project transcript directories and expose stable raw project ha
 cc-session-tool projects [--glob <pattern>] [--project <path>] [--include-project-lists]
 ```
 
-Without `--project`, scans every top-level Claude project directory under `~/.claude/projects`. With `--project`, returns the main project plus associated worktrees. Sorted by raw `project` basename. `_meta` carries the project coverage counts (`--include-project-lists` adds the arrays); see SKILL.md "Output envelope". Unfiltered `projects` returns one row per directory, so enumerate names with `--glob` or `--project`.
+Without `--project`, scans every top-level Claude project directory under `~/.claude/projects`. With `--project`, returns the main project plus associated worktrees. Sorted by raw `project` basename.
 
 Each row: `project` (raw Claude basename — pass to `--claude-project`), `project_path_guess` (display only), `project_role`, `session_count`, `total_lines`, `first_session_at`, `last_session_at`.
 

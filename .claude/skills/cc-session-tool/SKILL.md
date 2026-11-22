@@ -71,7 +71,7 @@ To scope `list` to one project, or to follow up on a row, pick the row of this t
 | What you have | Use | If the value is wrong |
 | --- | --- | --- |
 | The checkout or worktree path, e.g. `<repo>/.claude/worktrees/<name>` (**preferred**) | `list --project <path>` | `NOT_FOUND` |
-| Only a raw Claude basename: the `project` / `session_ref.project` field of a `search`, `list` or `projects` row | `list --all-projects --project-glob <basename>` | `ok:true` with empty `data` and `_meta.projects_scanned: 0`. Confirm `_meta.projects_scanned === 1` before trusting an empty result. `_meta.projects_skipped` counts the other projects. |
+| Only a raw Claude basename: the `project` / `session_ref.project` field of a `search`, `list` or `projects` row | `list --all-projects --project-glob <basename>` | `ok:true` with empty `data` and `_meta.projects_scanned: 0`. Confirm `_meta.projects_scanned === 1` before trusting an empty result. |
 | A session to inspect, plus its raw basename | `shape`, `summary`, `tools`, `files`, `tokens`, `messages`, `slice` or `subagents` with `<session> --claude-project <basename>` | `NOT_FOUND` |
 
 - `search` scopes the same way as `list`.
@@ -101,8 +101,6 @@ Every command emits one of:
 ```
 
 Exit codes: `0` success, `1` format error, `2` invalid args, `3` not found. Always check `_meta.hasMore` — long results truncate.
-
-**Project coverage.** `list`, `projects`, `search`, `stats` and `index` always return `_meta.projects_scanned` / `_meta.projects_skipped`. Check `projects_scanned` before trusting an empty result: `0` means no project directory matched, so empty `data` proves nothing. Pass `--include-project-lists` only when you need the project names; the lists grow with the number of Claude project directories and can exceed tool-output limits. To enumerate project names, use `projects --glob <pattern>` or `projects --project <path>`, never unfiltered `projects`, which returns one row per directory.
 
 ## Common workflows
 
@@ -180,7 +178,6 @@ cc-session-tool search --tool Bash \
 - **Don't pass `--operation` without `--file`** — the filter only binds when there's a matching file access to bind to.
 - **`--origin` is transcript evidence, not VCS history.** It tells you the earliest _recorded write in a transcript_, not when the file was first committed.
 - **`--all-projects` plus `--project` does not narrow the scan.** In all-projects mode, `--project` is only a file-identity anchor for absolute paths; the scan still covers every project.
-- **`_meta.included_projects` / `skipped_projects` are absent unless you pass `--include-project-lists`;** use the `projects_scanned` / `projects_skipped` counts (note the word order).
 - **`slice` without `--turn` is required to fail** — always pass a range.
 - **Validate inputs.** Session IDs accept `[a-zA-Z0-9-]`; agent IDs additionally allow `_`; `--claude-project` is a basename only (no path traversal).
 
