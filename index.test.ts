@@ -558,6 +558,18 @@ describe('safeInputSummary', () => {
   test('short malformed input falls back to unmarked stable JSON', () => {
     expect(safeInputSummary('Bash', { command: 123 })).toBe('{"command":123}');
   });
+
+  test('array-valued Bash command falls back to stable JSON instead of leaking a non-string', () => {
+    const input = { command: ['ls', '-la'] };
+    expect(() => inputSummary('Bash', input)).toThrow();
+    const summary = safeInputSummary('Bash', input);
+    expect(typeof summary).toBe('string');
+    expect(summary).toBe('{"command":["ls","-la"]}');
+  });
+
+  test('missing Bash command still summarizes as an empty string', () => {
+    expect(safeInputSummary('Bash', {})).toBe('');
+  });
 });
 
 describe('toolInputMatches', () => {
@@ -649,7 +661,7 @@ describe('determineOutcome', () => {
     expect(isFailedOutcome(determineOutcome({ is_error: true, content: 'z'.repeat(500) }, { maxErrorChars: 0 }))).toBe(true);
   });
 
-  test('is safe to pass directly to Array.map', () => {
+  test('works inside Array.map with one argument', () => {
     const results = [{ is_error: true, content: 'q'.repeat(100) }, { content: 'ok' }];
     expect(results.map(r => determineOutcome(r))).toEqual([
       `error: ${'q'.repeat(60)}...[truncated, 100 chars]`,
@@ -2075,7 +2087,6 @@ const SESSION_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const SESSION_ID_2 = 'bbbbbbbb-1111-2222-3333-444444444444';
 const SESSION_ID_3 = 'cccccccc-1111-2222-3333-444444444444';
 const SESSION_ID_4 = 'dddddddd-1111-2222-3333-444444444444';
-const BASH_MARKER_COMMAND = `npm install express ${'x'.repeat(30)} raw-bash-marker-in-elided-middle ${'y'.repeat(50)} tail-end-of-command`;
 const SESSION_ID_5 = 'eeeeeeee-1111-2222-3333-444444444444';
 const SESSION_ID_6 = 'ffffffaa-1111-2222-3333-444444444444';
 const SESSION_ID_7 = 'ffffffee-1111-2222-3333-444444444444';
@@ -2085,6 +2096,7 @@ const SESSION_ID_10 = 'ffffffdd-1111-2222-3333-444444444444';
 const SESSION_ID_11 = 'ffffff11-1111-2222-3333-444444444444';
 const SESSION_ID_12 = 'ffffff22-1111-2222-3333-444444444444';
 const SESSION_ID_13 = 'ffffff33-1111-2222-3333-444444444444';
+const BASH_MARKER_COMMAND = `npm install express ${'x'.repeat(30)} raw-bash-marker-in-elided-middle ${'y'.repeat(50)} tail-end-of-command`;
 const CROSS_PROJECT_FILE = 'cross-project-fixture-target.ts';
 const RELATED_PROJECT_FILE = 'related-origin-warning.ts';
 const RELATED_MISSING_CWD_FILE = 'related-missing-cwd.ts';
@@ -7319,6 +7331,7 @@ describe('tools outcome integration', () => {
   const TOOLS_PROJECT = join(TOOLS_ROOT, 'outcome-project');
   const TOOLS_CLAUDE_DIR = join(claudeProjectsRoot(TOOLS_HOME), mangleProjectPath(TOOLS_PROJECT));
   const TOOLS_SESSION = 'e0e0e0e0-0000-4000-8000-0000000000e0';
+  const NULL_SESSION = 'e0e0e0e0-0000-4000-8000-0000000000e1';
   const SUB_ID = 'outcome_sub';
   const KEY_ORDER = ['turn', 'tool', 'input_summary', 'outcome', 'outcome_hash', 'duration_ms', 'tool_use_id', 'result_turn'];
 
@@ -7330,6 +7343,7 @@ describe('tools outcome integration', () => {
   const ERR_D = `${SHARED_PREFIX}reads /charlie/other/longer/path.ts (blocked, retry inside the isolated worktree)`;
   const SUB_ERR = 'Subagent build failed because the toolchain was not found on this machine PATH';
   const LONG_OK = `${'success line one '.repeat(20)}\nsecond line`;
+  const NULL_ERR = `${SHARED_PREFIX}is refused in a turn that also holds a null content block`;
 
   const sha12 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 12);
   const MARKER_RE = /\.\.\.\[truncated, (\d+) chars\]$/;
@@ -7390,6 +7404,13 @@ describe('tools outcome integration', () => {
       user(3, [toolResult('sub_bash', SUB_ERR, true)]),
     ].join('\n') + '\n');
     writeFileSync(join(subDir, `agent-${SUB_ID}.meta.json`), JSON.stringify({ agentType: 'builder', description: 'Build subagent' }));
+
+    // A null block beside the tool_result in the result turn: the documented follow-ups must still work.
+    writeFileSync(join(TOOLS_CLAUDE_DIR, `${NULL_SESSION}.jsonl`), [
+      user(1, 'Run it'),
+      assistant(2, [use('Bash', 'null_err', { command: 'echo null' })]),
+      user(3, [null, toolResult('null_err', NULL_ERR, true)]),
+    ].join('\n') + '\n');
   });
 
   afterAll(() => {
@@ -7516,6 +7537,37 @@ describe('tools outcome integration', () => {
     const block = messages.data.messages[0].content.find((b: any) => b.tool_use_id === row.tool_use_id);
     expect(block.content).toBe(SUB_ERR);
     expect(sha12(block.content)).toBe(row.outcome_hash);
+  });
+
+  test('messages and slice --max-content follow-ups tolerate a null block in the result turn', async () => {
+    const { exitCode, result } = await tools([], NULL_SESSION);
+    expect(exitCode).toBe(0);
+    const row = rowById(rowsOf(result), 'null_err');
+    expect(row.result_turn).toBe(3);
+    const budget = Number(row.outcome.match(MARKER_RE)![1]);
+
+    const typed = await runCli([
+      'messages', NULL_SESSION, '--project', TOOLS_PROJECT,
+      '--turn', String(row.result_turn), '--type', 'tool_result', '--max-tool-result', String(budget),
+    ], { HOME: TOOLS_HOME });
+    expect(typed.exitCode).toBe(0);
+    const block = parseOutput(typed.stdout).data.messages[0].content.find((b: any) => b.tool_use_id === 'null_err');
+    expect(block.content).toBe(NULL_ERR);
+    expect(sha12(block.content)).toBe(row.outcome_hash);
+
+    const untyped = await runCli([
+      'messages', NULL_SESSION, '--project', TOOLS_PROJECT, '--turn', String(row.result_turn),
+    ], { HOME: TOOLS_HOME });
+    expect(untyped.exitCode).toBe(0);
+    expect(parseOutput(untyped.stdout).data.messages[0].content.map((b: any) => b.type)).toEqual(['unknown', 'tool_result']);
+
+    const sliced = await runCli([
+      'slice', NULL_SESSION, '--project', TOOLS_PROJECT, '--turn', String(row.result_turn), '--max-content', '10',
+    ], { HOME: TOOLS_HOME });
+    expect(sliced.exitCode).toBe(0);
+    const content = parseOutput(sliced.stdout).data.entries[0].message.content;
+    expect(content[0]).toBeNull();
+    expect(content[1].content).toBe(`${NULL_ERR.slice(0, 10)}...[truncated, ${NULL_ERR.length} chars]`);
   });
 
   test('slice fallback returns the untruncated result for a row without a marker', async () => {

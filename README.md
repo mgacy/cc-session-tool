@@ -249,7 +249,7 @@ cc-session-tool tools <session> [--project <path> | --claude-project <project>] 
       {
         "turn": 9,
         "tool": "Bash",
-        "input_summary": "git worktree add ../feature-a -b feature-a ...[truncated, 212 chars]... && cd ../feature-a && ls",
+        "input_summary": "git worktree add ../wt-a -b feature-a &&...[truncated, 207 chars]...&& bun test --bail tests/auth/session.ts",
         "outcome": "error: This session is isolated in the worktree /work/app/.claude/w...[truncated, 241 chars]",
         "outcome_hash": "9f2c41ab07de",
         "duration_ms": 80,

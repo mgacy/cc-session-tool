@@ -140,7 +140,7 @@ Each entry: `turn`, `tool`, `input_summary`, `outcome`, `outcome_hash`, `duratio
 **Reading a full result.** Reuse the exact selector given to `tools`, including `:<agent-id>` for a subagent (`result_turn` is numbered within the subagent transcript; dropping the suffix silently reads the parent's turn), and the same `--project` / `--claude-project`:
 
 ```bash
-cc-session-tool messages <session>[:<agent-id>] --turn <result_turn> --type tool_result --max-tool-result <N>
+cc-session-tool messages <session>[:<agent-id>] [--project <path> | --claude-project <project>] --turn <result_turn> --type tool_result --max-tool-result <N>
 ```
 
 Pick the block with the matching `tool_use_id`; take `N` from the outcome's `...[truncated, N chars]` marker. Rows without a marker (e.g. `success (N lines)`) give no `N` and `messages` truncates at 200 chars by default, so use `slice <session>[:<agent-id>] --turn <result_turn>` instead (untruncated, but the whole turn including parallel results) and pick the block by `tool_use_id`. An untruncated error needs no follow-up. A call's full input: `slice <session>[:<agent-id>] --turn <turn>`.

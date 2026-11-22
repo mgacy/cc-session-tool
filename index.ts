@@ -1772,14 +1772,14 @@ const messagesCommand = defineCommand({
 
         // Apply type filter
         if (args.type) {
-          blocks = blocks.filter(b => b.type === args.type);
+          blocks = blocks.filter(b => b?.type === args.type);
         }
 
         if (blocks.length === 0) continue;
 
         // Process blocks
         const processed = blocks.map(block => {
-          switch (block.type) {
+          switch (block?.type) {
             case 'text':
               return { type: 'text', text: textMax == null ? block.text ?? '' : truncateContent(block.text ?? '', textMax) };
             case 'thinking':
@@ -1800,7 +1800,7 @@ const messagesCommand = defineCommand({
             case 'document':
               return { type: 'document' };
             default:
-              return { type: block.type ?? 'unknown' };
+              return { type: block?.type ?? 'unknown' };
           }
         });
 
@@ -1867,16 +1867,16 @@ function truncateEntryContent(entry: SessionEntry, maxLen: number): void {
     entry.message!.content = truncateContent(content, maxLen);
   } else if (Array.isArray(content)) {
     for (const block of content as ContentBlock[]) {
-      if (block.type === 'text' && block.text) {
+      if (block?.type === 'text' && block.text) {
         block.text = truncateContent(block.text, maxLen);
-      } else if (block.type === 'thinking' && block.thinking) {
+      } else if (block?.type === 'thinking' && block.thinking) {
         block.thinking = truncateContent(block.thinking, maxLen);
-      } else if (block.type === 'tool_result') {
+      } else if (block?.type === 'tool_result') {
         if (typeof block.content === 'string') {
           block.content = truncateContent(block.content, maxLen);
         } else if (Array.isArray(block.content)) {
           for (const sub of block.content as ContentBlock[]) {
-            if (sub.type === 'text' && sub.text) {
+            if (sub?.type === 'text' && sub.text) {
               sub.text = truncateContent(sub.text, maxLen);
             }
           }

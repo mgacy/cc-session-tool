@@ -26,8 +26,12 @@ export function inputSummary(name: string, input: Record<string, unknown>): stri
       return `file='${basename(inp.file_path ?? '')}' old=(${(inp.old_string ?? '').length} chars) new=(${(inp.new_string ?? '').length} chars)`;
     case 'Write':
       return `file='${basename(inp.file_path ?? '')}' (${(inp.content ?? '').length} chars)`;
-    case 'Bash':
-      return truncateMiddle(inp.command ?? '', BASH_SUMMARY_HEAD_CHARS, BASH_SUMMARY_TAIL_CHARS);
+    case 'Bash': {
+      const command = inp.command ?? '';
+      // Non-string commands are malformed; throwing sends safeInputSummary to its stable-JSON fallback.
+      if (typeof command !== 'string') throw new TypeError('Bash command is not a string');
+      return truncateMiddle(command, BASH_SUMMARY_HEAD_CHARS, BASH_SUMMARY_TAIL_CHARS);
+    }
     case 'Glob':
       return `pattern='${inp.pattern ?? ''}' ${inp.path ? `path='${inp.path}'` : ''}`.trim();
     case 'Agent':
@@ -173,9 +177,7 @@ export function isFailedOutcome(outcome: string): boolean {
  * Result predicate used by `search --failed`; must agree with isFailedOutcome(determineOutcome(r)).
  * Skips the line counting determineOutcome does for successful outputs.
  */
-export function isFailedResult(
-  result: { is_error?: boolean; content?: string | ContentBlock[] } | null | undefined,
-): boolean {
+export function isFailedResult(result: ToolResultLike): boolean {
   if (!result) return false;
   if (result.is_error) return true;
   const content = result.content;

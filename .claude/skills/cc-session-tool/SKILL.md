@@ -134,7 +134,7 @@ Search compares absolute main-tree paths against worktree-local paths via shared
 ```bash
 cc-session-tool tools DA2738E3                           # full tool log
 cc-session-tool tools DA2738E3 --name Grep --failed      # only failed greps
-cc-session-tool tools DA2738E3 --failed   # group by outcome_hash; full text: see references/commands.md
+cc-session-tool tools DA2738E3 --failed                  # group by outcome_hash; full text: see references/commands.md
 cc-session-tool tools DA2738E3 --turn 1-14               # before first edit
 cc-session-tool files DA2738E3                           # files by path
 cc-session-tool files DA2738E3 --operation edit          # only edits
