@@ -132,7 +132,7 @@ Each entry: `turn`, `tool`, `input_summary`, `outcome`, `outcome_hash`, `duratio
 
 `duration_ms` is the gap between the assistant entry and its matching tool_result; `null` if timestamps are missing.
 
-`outcome_hash` is a hash of the full error text, so errors whose truncated `outcome` strings match still differ here; `null` for non-errors.
+`outcome_hash` is a hash of the full error text; `null` for non-errors.
 
 **Reading a full result.** Use the same selector and project flag you gave `tools`. For a subagent that includes `:<agent-id>`; without it, `result_turn` silently points into the parent transcript.
 
