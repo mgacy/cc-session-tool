@@ -1,11 +1,11 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
-import { appendFileSync, existsSync, mkdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'fs';
 import { Database } from 'bun:sqlite';
 import { basename, join } from 'path';
 import { tmpdir } from 'os';
 import { createHash, randomUUID } from 'crypto';
 import {
-  ERROR_CODES, success, failure, CliError, isCliError,
+  ERROR_CODES, success, failure, CliError, isCliError, outputFailureEnvelope,
   parseTurnRange, truncateContent, inputSummary, determineOutcome, parseIntArg,
   parseDateArg,
   extractFilePath, parseSince, buildResultLookup, extractSessionMetadata,
@@ -58,6 +58,7 @@ import {
   parseCommandArgs,
   resolveCliCommand,
 } from './src/cli-args.ts';
+import { errnoCode, writeAll, writeAllToFd, type WriteAllIo } from './src/write-all.ts';
 import { defineCommand } from 'citty';
 import type { ArgsDef, CommandDef } from 'citty';
 import {
@@ -362,7 +363,32 @@ describe('ERROR_CODES', () => {
   test('has distinct exit codes', () => {
     expect(ERROR_CODES.INVALID_ARGS.exitCode).toBe(2);
     expect(ERROR_CODES.NOT_FOUND.exitCode).toBe(3);
+    expect(ERROR_CODES.OUTPUT_ERROR.exitCode).toBe(1);
+  });
 });
+
+describe('outputFailureEnvelope', () => {
+  test('a closed reader (EPIPE) needs no report', () => {
+    expect(outputFailureEnvelope(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))).toBeNull();
+  });
+
+  test('an errno error is reported by its code', () => {
+    const report = outputFailureEnvelope(Object.assign(new Error('bad file descriptor'), { code: 'EBADF' }));
+    expect(report?.ok).toBe(false);
+    if (report && !report.ok) {
+      expect(report.error.code).toBe('OUTPUT_ERROR');
+      expect(report.error.message).toContain('EBADF');
+    }
+  });
+
+  test('a non-errno error is reported by its message', () => {
+    const report = outputFailureEnvelope(new Error('boom'));
+    expect(report?.ok).toBe(false);
+    if (report && !report.ok) {
+      expect(report.error.code).toBe('OUTPUT_ERROR');
+      expect(report.error.message).toContain('boom');
+    }
+  });
 });
 
 // ============================================================================
@@ -1967,6 +1993,119 @@ describe('Claude project discovery helpers', () => {
 // ============================================================================
 // Concurrent mapping helper
 // ============================================================================
+
+describe('writeAll', () => {
+  type Step = 'ok' | 'EAGAIN' | 'EWOULDBLOCK' | 'EINTR' | 'zero' | 'EPIPE' | 'boom';
+
+  /** Scripted io: each call consumes one step; 'ok' writes up to `chunk` bytes. Steps run out into 'ok'. */
+  function scriptedIo(steps: Step[], chunk = Infinity) {
+    const received: number[] = [];
+    const log = { writes: 0, waits: 0 };
+    const io: WriteAllIo = {
+      write: (buffer, offset) => {
+        log.writes++;
+        const step = steps.shift() ?? 'ok';
+        if (step === 'zero') return 0;
+        if (step === 'boom') throw new Error('boom');
+        if (step !== 'ok') throw Object.assign(new Error(step), { code: step });
+        const n = Math.min(chunk, buffer.length - offset);
+        for (let i = 0; i < n; i++) received.push(buffer[offset + i]!);
+        return n;
+      },
+      wait: () => { log.waits++; },
+    };
+    return { io, log, bytes: () => Buffer.from(received) };
+  }
+
+  const text = 'héllo ☃ wörld \u{1F600} done';
+
+  test('short writes concatenate to the exact UTF-8 bytes, splitting multi-byte characters', () => {
+    for (const chunk of [1, 2, 3, 5]) {
+      const s = scriptedIo([], chunk);
+      writeAll(s.io, text);
+      expect(s.bytes().equals(Buffer.from(text))).toBe(true);
+      expect(s.bytes().toString('utf8')).toBe(text);
+    }
+  });
+
+  test('EAGAIN and EWOULDBLOCK call wait once per occurrence and finish the output', () => {
+    const s = scriptedIo(['EAGAIN', 'ok', 'EWOULDBLOCK', 'EAGAIN', 'ok'], 4);
+    writeAll(s.io, text);
+    expect(s.log.waits).toBe(3);
+    expect(s.bytes().equals(Buffer.from(text))).toBe(true);
+  });
+
+  test('EINTR retries without wait', () => {
+    const s = scriptedIo(['EINTR', 'EINTR', 'ok'], 4);
+    writeAll(s.io, text);
+    expect(s.log.waits).toBe(0);
+    expect(s.bytes().equals(Buffer.from(text))).toBe(true);
+  });
+
+  test('a zero-byte return waits and retries', () => {
+    const s = scriptedIo(['zero', 'zero', 'ok'], 4);
+    writeAll(s.io, text);
+    expect(s.log.waits).toBe(2);
+    expect(s.bytes().equals(Buffer.from(text))).toBe(true);
+  });
+
+  test('EPIPE propagates unchanged and no write follows it', () => {
+    const s = scriptedIo(['ok', 'EPIPE', 'ok', 'ok'], 4);
+    let caught: unknown;
+    try { writeAll(s.io, text); } catch (err) { caught = err; }
+    expect(errnoCode(caught)).toBe('EPIPE');
+    expect(s.log.writes).toBe(2);
+    expect(s.log.waits).toBe(0);
+  });
+
+  test('a non-errno throw propagates unchanged', () => {
+    const s = scriptedIo(['boom']);
+    expect(() => writeAll(s.io, text)).toThrow('boom');
+    expect(s.log.writes).toBe(1);
+  });
+
+  test('an empty string makes no write calls', () => {
+    const s = scriptedIo([]);
+    writeAll(s.io, '');
+    expect(s.log.writes).toBe(0);
+    expect(s.log.waits).toBe(0);
+  });
+});
+
+describe('writeAllToFd', () => {
+  test('writes multi-byte text to a real fd; the bytes read back match', () => {
+    const dir = join(SHORT_TMP_ROOT, uniqueTempName('write-all-fd'));
+    mkdirSync(dir, { recursive: true });
+    try {
+      const file = join(dir, 'out.txt');
+      const text = ('héllo ☃ \u{1F600}\n').repeat(50_000);
+      const fd = openSync(file, 'w');
+      try {
+        writeAllToFd(fd, text);
+      } finally {
+        closeSync(fd);
+      }
+      expect(readFileSync(file).equals(Buffer.from(text))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('errnoCode', () => {
+  test('returns the code of errno-style errors', () => {
+    expect(errnoCode(Object.assign(new Error('x'), { code: 'EPIPE' }))).toBe('EPIPE');
+    expect(errnoCode({ code: 'EAGAIN' })).toBe('EAGAIN');
+  });
+
+  test('returns undefined for a plain Error, a string, null and a non-string code', () => {
+    expect(errnoCode(new Error('x'))).toBeUndefined();
+    expect(errnoCode('EPIPE')).toBeUndefined();
+    expect(errnoCode(null)).toBeUndefined();
+    expect(errnoCode(undefined)).toBeUndefined();
+    expect(errnoCode({ code: 32 })).toBeUndefined();
+  });
+});
 
 describe('mapConcurrent', () => {
   test('runs work with a global concurrency ceiling', async () => {
@@ -3723,6 +3862,182 @@ describe('slice integration', () => {
     expect(result.ok).toBe(true);
     expect(result.data.entries[0].message.content).toBe('...[truncated, 8300 chars]');
   });
+});
+
+describe('stdout envelope bytes', () => {
+  test('a success run prints the envelope as pretty JSON with one trailing newline', async () => {
+    const { exitCode, stdout } = await runCli(['slice', SESSION_ID, '--project', FAKE_PROJECT, '--turn', '1']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toBe(JSON.stringify(JSON.parse(stdout), null, 2) + '\n');
+  });
+
+  test('an error run prints the envelope the same way and keeps its exit code', async () => {
+    const { exitCode, stdout } = await runCli(['shape', 'nonexistent-session-id', '--project', FAKE_PROJECT]);
+    expect(exitCode).toBe(3);
+    expect(parseOutput(stdout).error.code).toBe('NOT_FOUND');
+    expect(stdout).toBe(JSON.stringify(JSON.parse(stdout), null, 2) + '\n');
+  });
+});
+
+// `runCli` cannot see the pipe-truncation bug: its Bun.spawn pipe buffers far more than 64 KiB. These tests run the
+// CLI inside `sh -c` so stdout is a real pipe(2) whose reader the script controls.
+describe('stdout through a real pipe', () => {
+  const PIPE_DIR = join(SHORT_TMP_ROOT, uniqueTempName('cc-session-pipe'));
+  const PIPE_HOME = join(PIPE_DIR, 'home');
+  const PIPE_PROJECT = `pipe-fixture-${randomUUID().replace(/-/g, '')}`;
+  const PIPE_SESSION = randomUUID();
+  const PIPE_ENTRY = join(import.meta.dir, 'index.ts');
+  const PIPE_MESSAGE_CHARS = 200_000;
+  const TEST_TIMEOUT_MS = 30_000;
+  // Plain strings, not template literals: JS interpolation must not touch the shell variables.
+  const SLICE = '"$BUN" "$ENTRY" slice "$SESSION" --claude-project "$PROJECT" --turn 1';
+
+  beforeAll(() => {
+    const projectDir = join(claudeProjectsRoot(PIPE_HOME), PIPE_PROJECT);
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, `${PIPE_SESSION}.jsonl`), JSON.stringify({
+      type: 'user',
+      sessionId: PIPE_SESSION,
+      timestamp: '2026-03-01T10:00:00.000Z',
+      gitBranch: 'main',
+      version: '2.1.0',
+      message: { role: 'user', content: 'a'.repeat(PIPE_MESSAGE_CHARS) },
+    }) + '\n');
+  });
+
+  afterAll(() => {
+    rmSync(PIPE_DIR, { recursive: true, force: true });
+  });
+
+  /** Runs `script` under `sh -c` with the Bun binary, entry point and fixture identity in the environment. */
+  async function runPipeScript(script: string, extraEnv: Record<string, string> = {}): Promise<{ stdout: Buffer; exitCode: number }> {
+    const proc = Bun.spawn(['sh', '-c', script], {
+      env: {
+        ...process.env,
+        HOME: PIPE_HOME,
+        BUN: process.execPath,
+        ENTRY: PIPE_ENTRY,
+        SESSION: PIPE_SESSION,
+        PROJECT: PIPE_PROJECT,
+        ...extraEnv,
+      },
+      stdout: 'pipe',
+      stderr: 'ignore',
+    });
+    const killer = setTimeout(() => proc.kill(), TEST_TIMEOUT_MS - 5_000);
+    try {
+      const stdout = Buffer.from(await new Response(proc.stdout).arrayBuffer());
+      const exitCode = await proc.exited;
+      return { stdout, exitCode };
+    } finally {
+      clearTimeout(killer);
+      proc.kill();
+    }
+  }
+
+  /** `sh` can exit before every pipeline member's status file is written, so poll briefly for a non-empty one. */
+  async function readStatusFile(path: string): Promise<string> {
+    for (let i = 0; i < 100; i++) {
+      if (existsSync(path)) {
+        const text = readFileSync(path, 'utf8').trim();
+        if (text !== '') return text;
+      }
+      await Bun.sleep(50);
+    }
+    return '';
+  }
+
+  function pipePath(name: string): string {
+    return join(PIPE_DIR, `${name}-${randomUUID()}`);
+  }
+
+  test('a late reader gets the complete output, byte-identical to redirect-to-file, and exit 0', async () => {
+    const status = pipePath('status');
+    const file = pipePath('file');
+
+    // dd blocks until the CLI's first write, then the reader stalls while the CLI fills the pipe.
+    const piped = await runPipeScript(
+      '( ' + SLICE + ' ; echo $? > "$STATUS" ) | { dd bs=1 count=1 2>/dev/null; sleep 0.5; cat; }',
+      { STATUS: status },
+    );
+    await runPipeScript(SLICE + ' > "$FILE"', { FILE: file });
+
+    const expected = readFileSync(file);
+    expect(expected.length).toBeGreaterThan(PIPE_MESSAGE_CHARS);
+    const envelope = JSON.parse(piped.stdout.toString('utf8'));
+    expect(envelope.ok).toBe(true);
+    expect(envelope.data.entries[0].message.content.length).toBe(PIPE_MESSAGE_CHARS);
+    expect(piped.stdout.equals(expected)).toBe(true);
+    expect(await readStatusFile(status)).toBe('0');
+  }, TEST_TIMEOUT_MS);
+
+  test('a reader that closes early gets exit 1 and nothing on stderr', async () => {
+    const status = pipePath('status');
+    const err = pipePath('err');
+
+    await runPipeScript(
+      '( ' + SLICE + ' 2> "$ERR"; echo $? > "$STATUS" ) | head -c 10 > /dev/null',
+      { STATUS: status, ERR: err },
+    );
+
+    expect(await readStatusFile(status)).toBe('1');
+    expect(readFileSync(err, 'utf8')).toBe('');
+  }, TEST_TIMEOUT_MS);
+
+  test.skipIf(!existsSync('/dev/full'))('a write error other than a closed reader reports OUTPUT_ERROR on stderr and exits 1', async () => {
+    const status = pipePath('status');
+    const err = pipePath('err');
+
+    await runPipeScript(SLICE + ' > /dev/full 2> "$ERR"; echo $? > "$STATUS"', { STATUS: status, ERR: err });
+
+    expect(await readStatusFile(status)).toBe('1');
+    const report = JSON.parse(readFileSync(err, 'utf8'));
+    expect(report.ok).toBe(false);
+    expect(report.error.code).toBe('OUTPUT_ERROR');
+    expect(report.error.message).toContain('ENOSPC');
+  }, TEST_TIMEOUT_MS);
+
+  test('SIGTERM during a stalled write takes the default action and appends no second envelope', async () => {
+    const status = pipePath('status');
+    const pidFile = pipePath('pid');
+    const ready = pipePath('ready');
+
+    // The CLI runs in the background so `$!` is its own PID. The reader signals READY after the first byte, then
+    // stalls, so the CLI is inside its synchronous write (200 KB cannot fit in the pipe) when the signal lands.
+    const run = runPipeScript(
+      '( ' + SLICE + ' & echo $! > "$PIDFILE.tmp" && mv "$PIDFILE.tmp" "$PIDFILE"; wait $!; echo $? > "$STATUS" )'
+        + ' | { dd bs=1 count=1 2>/dev/null; : > "$READY"; sleep 1.5; cat; }',
+      { STATUS: status, PIDFILE: pidFile, READY: ready },
+    );
+
+    let cliPid = 0;
+    try {
+      for (let i = 0; i < 200 && !(existsSync(ready) && cliPid > 0); i++) {
+        if (existsSync(pidFile)) cliPid = Number.parseInt(readFileSync(pidFile, 'utf8').trim(), 10) || 0;
+        if (!(existsSync(ready) && cliPid > 0)) await Bun.sleep(25);
+      }
+      // process.kill(0, ...) would signal the test runner's own process group.
+      expect(cliPid).toBeGreaterThan(1);
+      expect(existsSync(ready)).toBe(true);
+      try {
+        process.kill(cliPid, 'SIGTERM');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err;
+      }
+
+      const piped = await run;
+      expect(await readStatusFile(status)).toBe('143');
+      expect(piped.stdout.toString('utf8')).not.toContain('TERMINATED');
+    } finally {
+      if (cliPid > 1) {
+        try {
+          process.kill(cliPid, 'SIGKILL');
+        } catch {
+          // Already exited.
+        }
+      }
+    }
+  }, TEST_TIMEOUT_MS);
 });
 
 // ============================================================================

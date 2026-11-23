@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { defineCommand, runMain, type ParsedArgs } from 'citty';
 import { join, basename, dirname } from 'path';
-import { readdirSync, existsSync } from 'fs';
+import { readdirSync, existsSync, writeSync } from 'fs';
 import {
   buildProjectScanMeta,
   type ProjectScanMeta,
@@ -94,6 +94,7 @@ import {
 } from './src/transcript-index.ts';
 import type { Database } from 'bun:sqlite';
 import { isCliArgsError, parseCommandArgs, resolveCliCommand } from './src/cli-args.ts';
+import { errnoCode, writeAllToFd } from './src/write-all.ts';
 
 export const VERSION = '0.3.0';
 
@@ -469,7 +470,8 @@ export const ERROR_CODES = {
   INVALID_ID: { code: 'INVALID_ID', exitCode: 2 },
   NOT_FOUND: { code: 'NOT_FOUND', exitCode: 3 },
   FORMAT_ERROR: { code: 'FORMAT_ERROR', exitCode: 1 },
-  TERMINATED: { code: 'TERMINATED', exitCode: 1 }
+  TERMINATED: { code: 'TERMINATED', exitCode: 1 },
+  OUTPUT_ERROR: { code: 'OUTPUT_ERROR', exitCode: 1 }
 } as const;
 
 type ErrorCode = keyof typeof ERROR_CODES;
@@ -508,12 +510,53 @@ export function failure(errorCode: ErrorCode, message: string): CliResult<never>
   return { ok: false, error: { code: ERROR_CODES[errorCode].code, message } };
 }
 
-function output<T>(result: CliResult<T>): void {
-  console.log(JSON.stringify(result, null, 2));
-  if (!result.ok) {
-    const code = Object.values(ERROR_CODES).find(e => e.code === result.error.code);
-    process.exit(code?.exitCode ?? 1);
+/** The envelope as `console.log` printed it: pretty JSON plus one trailing newline. */
+function formatEnvelope(result: CliResult<unknown>): string {
+  return JSON.stringify(result, null, 2) + '\n';
+}
+
+function exitCodeFor(result: CliResult<unknown>): number {
+  if (result.ok) return 0;
+  const code = Object.values(ERROR_CODES).find(e => e.code === result.error.code);
+  return code?.exitCode ?? 1;
+}
+
+/** The stderr report for a failed stdout write, or null when the reader closed the pipe (`EPIPE`) and no report is wanted. */
+export function outputFailureEnvelope(err: unknown): CliResult<never> | null {
+  const code = errnoCode(err);
+  if (code === 'EPIPE') return null;
+  const reason = code ?? (err instanceof Error ? err.message : String(err));
+  return failure('OUTPUT_ERROR', `Failed to write output to stdout: ${reason}`);
+}
+
+function exitOnOutputFailure(err: unknown): never {
+  const report = outputFailureEnvelope(err);
+  if (report !== null) {
+    // One attempt, no retry loop: stderr may be broken or stalled too.
+    try {
+      writeSync(2, formatEnvelope(report));
+    } catch {
+      // The exit status alone reports the failure.
+    }
   }
+  process.exit(ERROR_CODES.OUTPUT_ERROR.exitCode);
+}
+
+// Writes to fd 1 through writeAllToFd rather than console.log or process.stdout: Bun can make a stdout pipe
+// non-blocking and then drop or queue what does not fit, so large output was cut off with exit 0.
+// The signal listeners are detached first because JS listeners cannot run during the synchronous write: a kept
+// listener would defer SIGTERM until a stalled reader let the write finish, then append a second envelope.
+function output<T>(result: CliResult<T>): void {
+  releaseSignalListeners();
+  // Formatting stays outside the try so a stringify failure still reaches handleCommandError as FORMAT_ERROR.
+  const text = formatEnvelope(result);
+  try {
+    writeAllToFd(1, text);
+  } catch (err) {
+    // Must end the process here: throwing would reach the handler's catch, which writes a second envelope.
+    exitOnOutputFailure(err);
+  }
+  if (!result.ok) process.exit(exitCodeFor(result));
 }
 
 function meta(total: number, returned: number): ResponseMeta {
@@ -558,10 +601,16 @@ function handleCommandError(err: unknown): void {
 // Signal Handling
 // ============================================================================
 
-for (const signal of ['SIGTERM', 'SIGINT'] as const) {
-  process.on(signal, () => {
-    output(failure('TERMINATED', `Received ${signal}`));
-  });
+const SIGNAL_LISTENERS = {
+  SIGTERM: () => output(failure('TERMINATED', 'Received SIGTERM')),
+  SIGINT: () => output(failure('TERMINATED', 'Received SIGINT')),
+} as const;
+
+for (const [signal, listener] of Object.entries(SIGNAL_LISTENERS)) process.on(signal, listener);
+
+/** Detaches the signal listeners so a signal during or after the stdout write takes its default action. Idempotent. */
+function releaseSignalListeners(): void {
+  for (const [signal, listener] of Object.entries(SIGNAL_LISTENERS)) process.off(signal, listener);
 }
 
 // ============================================================================

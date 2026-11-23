@@ -964,6 +964,9 @@ Errors:
 }
 ```
 
+- If stdout can't be written in full, the CLI exits 1 and stdout may hold a partial document. A reader that closes early (for example `| head`) gets nothing else; any other write error also writes an `OUTPUT_ERROR` envelope to stderr.
+- SIGTERM/SIGINT while the command is still reading transcripts yields a `TERMINATED` envelope and exit 1. Once output has started, the signal takes its default action (exit 143/130).
+
 ### Project coverage metadata
 
 `list`, `projects`, `search`, `stats tokens`, `stats trajectories`, `index status` and `index rebuild` always return two counts in `_meta`:
@@ -983,7 +986,7 @@ Errors:
 | Code | Meaning                                                                          |
 | ---- | -------------------------------------------------------------------------------- |
 | 0    | Success                                                                          |
-| 1    | Format error / terminated                                                        |
+| 1    | Format error / terminated / stdout could not be written in full                  |
 | 2    | Invalid arguments (unknown/duplicate/missing flags or values) or ID format       |
 | 3    | Not found                                                                        |
 
