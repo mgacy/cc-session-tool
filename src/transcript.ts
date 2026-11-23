@@ -28,12 +28,16 @@ export type ContentBlock = {
 export type SessionEntry = {
   type: 'user' | 'assistant' | 'system' | 'summary' | (string & {});
   sessionId?: string;
+  /** API request id; shared by every entry Claude Code writes for one model response. */
+  requestId?: string;
   timestamp?: string;
   gitBranch?: string;
   version?: string;
   cwd?: string;
   model?: string;
   message?: {
+    /** API message id; shared by every entry Claude Code writes for one model response. */
+    id?: string;
     role?: string;
     content?: string | ContentBlock[];
     usage?: TokenUsage;
@@ -137,6 +141,108 @@ export type SessionSummaryResult = {
 
 export function userAssistantEntries(entries: SessionEntry[]): UserAssistantEntry[] {
   return entries.filter((e): e is UserAssistantEntry => e.type === 'user' || e.type === 'assistant');
+}
+
+/** One model request's token usage, merged across the transcript entries Claude Code wrote for it. */
+export type RequestUsage = {
+  /** `msg:<message.id>`, else `req:<requestId>`, else `turn:<n>` (an entry without either id is its own request). */
+  key: string;
+  /** Turns (1-based among user/assistant entries) of the request's first and last entries, in file order. */
+  firstTurn: number;
+  lastTurn: number;
+  entryCount: number;
+  /** Entries in the group carrying at least one numeric usage field. */
+  entriesWithUsage: number;
+  /** Timestamp of the first entry, in file order, that has one. */
+  timestamp: string | null;
+  /** First non-empty `message.model` in the group. */
+  model: string | null;
+  /** Field-wise max over the group's entries; null when no entry carried that field. */
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheCreate: number | null;
+};
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+function numericUsage(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function maxOrNull(current: number | null, next: number | null): number | null {
+  if (next === null) return current;
+  return current === null ? next : Math.max(current, next);
+}
+
+/**
+ * Group a transcript's assistant entries into model requests.
+ * Claude Code may write several entries per request, each repeating input/cache usage
+ * and (on older versions) a running output count, so summing entries over-counts.
+ *
+ * Grouping key: `message.id`, else `requestId`, else the entry itself. `message.id` wins because a
+ * `requestId` can map to a real message plus a `<synthetic>` zero-usage error entry with a
+ * different `message.id`; those must stay separate. Grouping spans the whole transcript, so a
+ * request's entries need not be adjacent (a user `tool_result` entry can sit between them).
+ * The key is never derived from usage values, so identical usage in different requests counts separately.
+ *
+ * Usage is the field-wise max over a group's entries. Older versions write a running output count
+ * (the first entry is a streaming placeholder), newer versions repeat the final usage; max agrees
+ * with "last entry" on every observed group and, unlike last-entry, does not depend on file order
+ * (replays and backwards timestamps exist).
+ *
+ * Known limit: a request mixing entries that have `message.id` with entries that have only
+ * `requestId` would split into a `msg:` and a `req:` group and count twice. Not observed in the
+ * corpus (every assistant entry carries `message.id`).
+ */
+export function requestUsages(entries: SessionEntry[]): RequestUsage[] {
+  const groups = new Map<string, RequestUsage>();
+  userAssistantEntries(entries).forEach((entry, index) => {
+    if (entry.type !== 'assistant') return;
+    const turn = index + 1;
+    const key = nonEmptyString(entry.message?.id) !== null
+      ? `msg:${entry.message!.id}`
+      : nonEmptyString(entry.requestId) !== null
+        ? `req:${entry.requestId}`
+        : `turn:${turn}`;
+
+    const usage = entry.message?.usage;
+    const input = numericUsage(usage?.input_tokens);
+    const output = numericUsage(usage?.output_tokens);
+    const cacheRead = numericUsage(usage?.cache_read_input_tokens);
+    const cacheCreate = numericUsage(usage?.cache_creation_input_tokens);
+    const hasUsage = input !== null || output !== null || cacheRead !== null || cacheCreate !== null;
+
+    let group = groups.get(key);
+    if (!group) {
+      group = {
+        key,
+        firstTurn: turn,
+        lastTurn: turn,
+        entryCount: 0,
+        entriesWithUsage: 0,
+        timestamp: null,
+        model: null,
+        input: null,
+        output: null,
+        cacheRead: null,
+        cacheCreate: null,
+      };
+      groups.set(key, group);
+    }
+    group.lastTurn = turn;
+    group.entryCount += 1;
+    if (hasUsage) group.entriesWithUsage += 1;
+    group.timestamp ??= nonEmptyString(entry.timestamp);
+    group.model ??= nonEmptyString(entry.message?.model);
+    group.input = maxOrNull(group.input, input);
+    group.output = maxOrNull(group.output, output);
+    group.cacheRead = maxOrNull(group.cacheRead, cacheRead);
+    group.cacheCreate = maxOrNull(group.cacheCreate, cacheCreate);
+  });
+  return [...groups.values()];
 }
 
 export function contentBlocksForEntry(entry: SessionEntry): ContentBlock[] {

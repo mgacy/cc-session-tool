@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } fr
 import {
   countNonEmptyLines,
   parseSessionText,
+  requestUsages,
   userAssistantEntries,
   type SessionEntry,
 } from './transcript.ts';
@@ -16,7 +17,7 @@ import {
 } from './project-selection.ts';
 import { buildResultLookup, safeInputSummary } from './tool-log.ts';
 
-export const INDEX_SCHEMA_VERSION = 1;
+export const INDEX_SCHEMA_VERSION = 2;
 
 export const INDEX_DB_ENV_VAR = 'CC_SESSION_TOOL_DB';
 
@@ -69,6 +70,7 @@ export type IndexStatus = {
   db_size_bytes: number | null;
   sessions: number;
   turns: number;
+  requests: number;
   tool_uses: number;
   projects: number;
   scope: IndexFreshness;
@@ -94,6 +96,7 @@ export type TokenStatsRow = {
   agent_id?: string | null;
   turns: number;
   turns_with_usage: number;
+  requests: number;
   input_tokens: TokenCount;
   output_tokens: TokenCount;
   cache_read_input_tokens: TokenCount;
@@ -175,14 +178,29 @@ CREATE TABLE turn (
   ts         TEXT,
   role       TEXT NOT NULL,
   model      TEXT,
+  PRIMARY KEY (project, session_id, agent_id, turn)
+);
+
+-- One row per model request: Claude Code can write several assistant entries per request,
+-- so usage is stored here (merged by requestUsages), never per turn.
+-- No secondary indexes: the PK (led by project) serves every queryTokenStats predicate.
+CREATE TABLE request (
+  project            TEXT NOT NULL,
+  session_id         TEXT NOT NULL,
+  agent_id           TEXT NOT NULL DEFAULT '',
+  request_key        TEXT NOT NULL,
+  first_turn         INTEGER NOT NULL,
+  last_turn          INTEGER NOT NULL,
+  entry_count        INTEGER NOT NULL,
+  entries_with_usage INTEGER NOT NULL,
+  ts                 TEXT,
+  model              TEXT,
   input_tokens                INTEGER,
   output_tokens               INTEGER,
   cache_read_input_tokens     INTEGER,
   cache_creation_input_tokens INTEGER,
-  PRIMARY KEY (project, session_id, agent_id, turn)
+  PRIMARY KEY (project, session_id, agent_id, request_key)
 );
-CREATE INDEX turn_by_ts    ON turn(ts);
-CREATE INDEX turn_by_model ON turn(model, ts);
 
 CREATE TABLE tool_use (
   project       TEXT NOT NULL,
@@ -204,7 +222,9 @@ CREATE INDEX tool_by_logical_path ON tool_use(logical_path);
 CREATE INDEX tool_by_name         ON tool_use(tool, operation);
 `;
 
-const INDEX_TABLES = ['tool_use', 'turn', 'session', 'schema_version'];
+/** Tables holding per-transcript rows, replaced as a unit when a transcript is re-indexed. */
+const TRANSCRIPT_TABLES = ['session', 'turn', 'request', 'tool_use'];
+const INDEX_TABLES = [...TRANSCRIPT_TABLES, 'schema_version'];
 
 function readSchemaVersion(db: Database): number | null {
   try {
@@ -326,7 +346,7 @@ function loadWatermarks(db: Database, projects: string[]): Map<string, Watermark
 }
 
 function deleteTranscriptRows(db: Database, project: string, sessionId: string, agentId: string): void {
-  for (const table of ['session', 'turn', 'tool_use']) {
+  for (const table of TRANSCRIPT_TABLES) {
     db.query(`DELETE FROM ${table} WHERE project = ? AND session_id = ? AND agent_id = ?`)
       .run(project, sessionId, agentId);
   }
@@ -416,10 +436,6 @@ export function indexTranscriptFile(db: Database, target: IndexTarget): void {
     ts: string | null;
     role: string;
     model: string | null;
-    input: TokenCount;
-    output: TokenCount;
-    cacheRead: TokenCount;
-    cacheCreate: TokenCount;
   };
   type ToolUseRow = {
     turn: number;
@@ -438,16 +454,11 @@ export function indexTranscriptFile(db: Database, target: IndexTarget): void {
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i]!;
     const turn = i + 1;
-    const usage = entry.type === 'assistant' ? entry.message?.usage : undefined;
     turnRows.push({
       turn,
       ts: entry.timestamp ?? null,
       role: entry.type,
       model: entry.type === 'assistant' && typeof entry.message?.model === 'string' ? entry.message.model : null,
-      input: usage?.input_tokens ?? null,
-      output: usage?.output_tokens ?? null,
-      cacheRead: usage?.cache_read_input_tokens ?? null,
-      cacheCreate: usage?.cache_creation_input_tokens ?? null,
     });
 
     const content = entry.message?.content;
@@ -472,11 +483,12 @@ export function indexTranscriptFile(db: Database, target: IndexTarget): void {
     }
   }
 
+  const requests = requestUsages(entries);
   const totals = {
-    input: sumOrNull(turnRows.map(row => row.input)),
-    output: sumOrNull(turnRows.map(row => row.output)),
-    cacheRead: sumOrNull(turnRows.map(row => row.cacheRead)),
-    cacheCreate: sumOrNull(turnRows.map(row => row.cacheCreate)),
+    input: sumOrNull(requests.map(row => row.input)),
+    output: sumOrNull(requests.map(row => row.output)),
+    cacheRead: sumOrNull(requests.map(row => row.cacheRead)),
+    cacheCreate: sumOrNull(requests.map(row => row.cacheCreate)),
   };
 
   const insertSession = db.query(`
@@ -491,9 +503,15 @@ export function indexTranscriptFile(db: Database, target: IndexTarget): void {
   `);
   const insertTurn = db.query(`
     INSERT INTO turn (
-      project, session_id, agent_id, turn, ts, role, model,
+      project, session_id, agent_id, turn, ts, role, model
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertRequest = db.query(`
+    INSERT INTO request (
+      project, session_id, agent_id, request_key,
+      first_turn, last_turn, entry_count, entries_with_usage, ts, model,
       input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertToolUse = db.query(`
     INSERT INTO tool_use (
@@ -514,6 +532,12 @@ export function indexTranscriptFile(db: Database, target: IndexTarget): void {
     for (const row of turnRows) {
       insertTurn.run(
         target.project, target.sessionId, target.agentId, row.turn, row.ts, row.role, row.model,
+      );
+    }
+    for (const row of requests) {
+      insertRequest.run(
+        target.project, target.sessionId, target.agentId, row.key,
+        row.firstTurn, row.lastTurn, row.entryCount, row.entriesWithUsage, row.timestamp, row.model,
         row.input, row.output, row.cacheRead, row.cacheCreate,
       );
     }
@@ -640,6 +664,7 @@ export function queryIndexStatus(db: Database, dbPath: string, contexts: SearchP
     db_size_bytes: dbSize,
     sessions: countTable(db, 'session'),
     turns: countTable(db, 'turn'),
+    requests: countTable(db, 'request'),
     tool_uses: countTable(db, 'tool_use'),
     projects: projectsRow.n,
     scope: computeIndexFreshness(db, contexts),
@@ -658,7 +683,7 @@ const DAY_BUCKET_SQL = 'substr(ts, 1, 10)';
 export function queryTokenStats(db: Database, options: TokenStatsOptions): TokenStatsRow[] {
   if (options.projects.length === 0) return [];
   const { clause, params } = projectsPlaceholderClause(options.projects);
-  const where: string[] = [clause, "role = 'assistant'"];
+  const where: string[] = [clause];
   const queryParams: Array<string | number> = [...params];
   if (!options.includeSubagents) {
     where.push("agent_id = ''");
@@ -689,10 +714,11 @@ export function queryTokenStats(db: Database, options: TokenStatsOptions): Token
 
   const select = [
     ...selectCols,
-    'COUNT(*) AS turns',
-    `COUNT(CASE WHEN input_tokens IS NOT NULL OR output_tokens IS NOT NULL
-                  OR cache_read_input_tokens IS NOT NULL OR cache_creation_input_tokens IS NOT NULL
-            THEN 1 END) AS turns_with_usage`,
+    // COALESCE (not TOTAL(), which returns REAL): an ungrouped query returns one row even when nothing
+    // matches, where SUM is NULL.
+    'COALESCE(SUM(entry_count), 0) AS turns',
+    'COALESCE(SUM(entries_with_usage), 0) AS turns_with_usage',
+    'COUNT(*) AS requests',
     'SUM(input_tokens) AS input_tokens',
     'SUM(output_tokens) AS output_tokens',
     'SUM(cache_read_input_tokens) AS cache_read_input_tokens',
@@ -710,13 +736,14 @@ export function queryTokenStats(db: Database, options: TokenStatsOptions): Token
     agent_id?: string;
     turns: number;
     turns_with_usage: number;
+    requests: number;
     input_tokens: TokenCount;
     output_tokens: TokenCount;
     cache_read_input_tokens: TokenCount;
     cache_creation_input_tokens: TokenCount;
   };
   const rows = db.query(
-    `SELECT ${select} FROM turn WHERE ${where.join(' AND ')}${groupBy}${orderBy}`,
+    `SELECT ${select} FROM request WHERE ${where.join(' AND ')}${groupBy}${orderBy}`,
   ).all(...queryParams) as TokenStatsRawRow[];
 
   return rows.map(raw => {
@@ -733,6 +760,7 @@ export function queryTokenStats(db: Database, options: TokenStatsOptions): Token
     const row: TokenStatsRow = {
       turns: raw.turns,
       turns_with_usage: raw.turns_with_usage,
+      requests: raw.requests,
       input_tokens: input,
       output_tokens: raw.output_tokens,
       cache_read_input_tokens: cacheRead,
