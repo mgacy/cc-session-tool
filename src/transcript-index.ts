@@ -17,6 +17,11 @@ import {
 } from './project-selection.ts';
 import { buildResultLookup, safeInputSummary } from './tool-log.ts';
 
+/**
+ * Bump when the table layout or any rule that derives indexed rows changes, including
+ * `requestUsages` in src/transcript.ts. Unchanged transcripts are never re-read, so without a
+ * bump a stale cache keeps serving rows built by the old rule; a mismatch drops and rebuilds it.
+ */
 export const INDEX_SCHEMA_VERSION = 2;
 
 export const INDEX_DB_ENV_VAR = 'CC_SESSION_TOOL_DB';

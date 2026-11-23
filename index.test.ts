@@ -3657,8 +3657,12 @@ const issueFixtureLines = (sessionId: string) => {
 
 describe('tokens integration: one row per model request', () => {
   const ISSUE_SESSION_ID = 'abcdef01-0000-0000-0000-000000000027';
-  const { projectPath } = makeIndexProject('tokens-issue-fixture', {
-    [`${ISSUE_SESSION_ID}.jsonl`]: issueFixtureLines(ISSUE_SESSION_ID),
+  let projectPath: string;
+
+  beforeAll(() => {
+    ({ projectPath } = makeIndexProject('tokens-issue-fixture', {
+      [`${ISSUE_SESSION_ID}.jsonl`]: issueFixtureLines(ISSUE_SESSION_ID),
+    }));
   });
 
   test('counts each request once and reports first and last turn', async () => {
@@ -6631,20 +6635,26 @@ describe('stats integration (one row per model request)', () => {
       usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
     },
   });
-  const issue = makeIndexProject('stats-issue-fixture', {
-    [`${ISSUE_SESSION_ID}.jsonl`]: issueFixtureLines(ISSUE_SESSION_ID),
-  });
-  const boundary = makeIndexProject('stats-boundary-fixture', {
-    [`${BOUNDARY_SESSION_ID}.jsonl`]: [
-      JSON.stringify({ type: 'user', sessionId: BOUNDARY_SESSION_ID, timestamp: '2026-03-02T23:59:00.000Z', gitBranch: 'main', version: '2.1.0', message: { role: 'user', content: 'go' } }),
-      boundaryEntry('2026-03-02T23:59:59.000Z'),
-      boundaryEntry('2026-03-03T00:00:01.000Z'),
-    ].join('\n') + '\n',
+  let issue: ReturnType<typeof makeIndexProject>;
+  let boundary: ReturnType<typeof makeIndexProject>;
+
+  beforeAll(() => {
+    issue = makeIndexProject('stats-issue-fixture', {
+      [`${ISSUE_SESSION_ID}.jsonl`]: issueFixtureLines(ISSUE_SESSION_ID),
+    });
+    boundary = makeIndexProject('stats-boundary-fixture', {
+      [`${BOUNDARY_SESSION_ID}.jsonl`]: [
+        JSON.stringify({ type: 'user', sessionId: BOUNDARY_SESSION_ID, timestamp: '2026-03-02T23:59:00.000Z', gitBranch: 'main', version: '2.1.0', message: { role: 'user', content: 'go' } }),
+        boundaryEntry('2026-03-02T23:59:59.000Z'),
+        boundaryEntry('2026-03-03T00:00:01.000Z'),
+      ].join('\n') + '\n',
+    });
   });
   const dbFor = (label: string) => join(FIXTURE_DIR, 'dbs', `${uniqueTempName(label)}.db`);
 
   test('--by session counts each request once', async () => {
-    const result = parseOutput((await runCli(['stats', 'tokens', '--by', 'session', '--project', issue.projectPath, '--db', dbFor('stats-issue')])).stdout);
+    const dbPath = dbFor('stats-issue');
+    const result = parseOutput((await runCli(['stats', 'tokens', '--by', 'session', '--project', issue.projectPath, '--db', dbPath])).stdout);
     expect(result.ok).toBe(true);
     expect(result.data.length).toBe(1);
     const row = result.data[0];
@@ -6656,6 +6666,16 @@ describe('stats integration (one row per model request)', () => {
     expect(row.turns).toBe(3);
     expect(row.turns_with_usage).toBe(3);
     expect(row.cache_hit_rate).toBe(0.25);
+
+    const db = new Database(dbPath, { readonly: true });
+    const session = db.query('SELECT input_tokens_total, output_tokens_total, cache_read_input_tokens_total, cache_creation_input_tokens_total FROM session WHERE session_id = ?').get(ISSUE_SESSION_ID);
+    db.close();
+    expect(session).toEqual({
+      input_tokens_total: 20,
+      output_tokens_total: 7,
+      cache_read_input_tokens_total: 8,
+      cache_creation_input_tokens_total: 4,
+    });
   });
 
   test('an ungrouped query with no matching requests returns one row of zeros and nulls', async () => {
@@ -6686,6 +6706,13 @@ describe('stats integration (one row per model request)', () => {
     const excluded = parseOutput((await runCli(['stats', 'tokens', '--after', '2026-03-03', '--by', 'session', '--project', boundary.projectPath, '--db', dbPath])).stdout);
     expect(excluded.ok).toBe(true);
     expect(excluded.data).toEqual([]);
+
+    const kept = parseOutput((await runCli(['stats', 'tokens', '--before', '2026-03-02', '--by', 'session', '--project', boundary.projectPath, '--db', dbPath])).stdout);
+    expect(kept.ok).toBe(true);
+    expect(kept.data.length).toBe(1);
+    expect(kept.data[0].turns).toBe(2);
+    expect(kept.data[0].requests).toBe(1);
+    expect(kept.data[0].output_tokens).toBe(4);
 
     const byModel = parseOutput((await runCli(['stats', 'tokens', '--by', 'model', '--project', boundary.projectPath, '--db', dbPath])).stdout);
     expect(byModel.data.length).toBe(1);

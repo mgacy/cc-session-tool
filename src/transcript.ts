@@ -196,6 +196,9 @@ function maxOrNull(current: number | null, next: number | null): number | null {
  * Known limit: a request mixing entries that have `message.id` with entries that have only
  * `requestId` would split into a `msg:` and a `req:` group and count twice. Not observed in the
  * corpus (every assistant entry carries `message.id`).
+ *
+ * The SQLite index stores this function's output, so changing its grouping or merge rule
+ * requires an `INDEX_SCHEMA_VERSION` bump in src/transcript-index.ts.
  */
 export function requestUsages(entries: SessionEntry[]): RequestUsage[] {
   const groups = new Map<string, RequestUsage>();

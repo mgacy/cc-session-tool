@@ -173,7 +173,7 @@ cc-session-tool tokens <session> [--cumulative]
 
 Each row: `n`, `last_n`, `input`, `output`, `cache_read`, `cache_create`. `data.totals` is always non-cumulative even with `--cumulative`. With `--cumulative`, each `turns[i]` field is a running total.
 
-Rows are one per model request (entries sharing a `message.id` are merged), at the turn of its first entry (`n`); `last_n` is the turn of its last. User turns are not listed.
+Rows are one per model request, at the turn of its first entry (`n`); `last_n` is the turn of its last. User turns are not listed.
 
 ---
 
