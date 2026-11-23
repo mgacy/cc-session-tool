@@ -1991,7 +1991,7 @@ describe('Claude project discovery helpers', () => {
 });
 
 // ============================================================================
-// Concurrent mapping helper
+// Write-all primitive
 // ============================================================================
 
 describe('writeAll', () => {
@@ -2106,6 +2106,10 @@ describe('errnoCode', () => {
     expect(errnoCode({ code: 32 })).toBeUndefined();
   });
 });
+
+// ============================================================================
+// Concurrent mapping helper
+// ============================================================================
 
 describe('mapConcurrent', () => {
   test('runs work with a global concurrency ceiling', async () => {
@@ -3963,15 +3967,17 @@ describe('stdout through a real pipe', () => {
 
   test('a late reader gets the complete output, byte-identical to redirect-to-file, and exit 0', async () => {
     const status = pipePath('status');
+    const err = pipePath('err');
     const file = pipePath('file');
 
     // dd blocks until the CLI's first write, then the reader stalls while the CLI fills the pipe.
     const piped = await runPipeScript(
-      '( ' + SLICE + ' ; echo $? > "$STATUS" ) | { dd bs=1 count=1 2>/dev/null; sleep 0.5; cat; }',
-      { STATUS: status },
+      '( ' + SLICE + ' 2> "$ERR"; echo $? > "$STATUS" ) | { dd bs=1 count=1 2>/dev/null; sleep 0.5; cat; }',
+      { STATUS: status, ERR: err },
     );
     await runPipeScript(SLICE + ' > "$FILE"', { FILE: file });
 
+    expect(readFileSync(err, 'utf8')).toBe('');
     const expected = readFileSync(file);
     expect(expected.length).toBeGreaterThan(PIPE_MESSAGE_CHARS);
     const envelope = JSON.parse(piped.stdout.toString('utf8'));
@@ -4007,8 +4013,28 @@ describe('stdout through a real pipe', () => {
     expect(report.error.message).toContain('ENOSPC');
   }, TEST_TIMEOUT_MS);
 
+  test('stdout opened read-only reports OUTPUT_ERROR on stderr and exits 1, on every OS', async () => {
+    const status = pipePath('status');
+    const err = pipePath('err');
+    const readOnly = pipePath('readonly');
+    writeFileSync(readOnly, '');
+
+    // Unlike /dev/full this exists everywhere. A closed stdout (`>&-`) cannot stand in: Bun reopens fd 1 as /dev/null.
+    await runPipeScript(
+      SLICE + ' 1< "$READONLY" 2> "$ERR"; echo $? > "$STATUS"',
+      { STATUS: status, ERR: err, READONLY: readOnly },
+    );
+
+    expect(await readStatusFile(status)).toBe('1');
+    const report = JSON.parse(readFileSync(err, 'utf8'));
+    expect(report.ok).toBe(false);
+    expect(report.error.code).toBe('OUTPUT_ERROR');
+    expect(report.error.message).toContain('EBADF');
+  }, TEST_TIMEOUT_MS);
+
   test('SIGTERM during a stalled write takes the default action and appends no second envelope', async () => {
     const status = pipePath('status');
+    const err = pipePath('err');
     const pidFile = pipePath('pid');
     const ready = pipePath('ready');
 
@@ -4016,9 +4042,9 @@ describe('stdout through a real pipe', () => {
     // stalls, so the CLI is inside its synchronous write (200 KB cannot fit in the pipe) when the signal lands.
     let settled = false;
     const run = runPipeScript(
-      '( ' + SLICE + ' & echo $! > "$PIDFILE.tmp" && mv "$PIDFILE.tmp" "$PIDFILE"; wait $!; echo $? > "$STATUS" )'
+      '( ' + SLICE + ' 2> "$ERR" & echo $! > "$PIDFILE.tmp" && mv "$PIDFILE.tmp" "$PIDFILE"; wait $!; echo $? > "$STATUS" )'
         + ' | { dd bs=1 count=1 2>/dev/null; : > "$READY"; sleep 1.5; cat; }',
-      { STATUS: status, PIDFILE: pidFile, READY: ready },
+      { STATUS: status, ERR: err, PIDFILE: pidFile, READY: ready },
     ).finally(() => {
       settled = true;
     });
@@ -4039,6 +4065,7 @@ describe('stdout through a real pipe', () => {
       }
 
       const piped = await run;
+      expect(readFileSync(err, 'utf8')).toBe('');
       expect(await readStatusFile(status)).toBe('143');
       expect(piped.stdout.toString('utf8')).not.toContain('TERMINATED');
     } finally {
@@ -6997,7 +7024,9 @@ describe('stats integration (signals)', () => {
     const dbPath = join(FIXTURE_DIR, 'dbs', `${uniqueTempName('signal')}.db`);
     const lock = openIndexDb(dbPath);
     lock.exec('BEGIN IMMEDIATE');
-    const proc = Bun.spawn(['bun', 'run', 'index.ts', 'stats', 'tokens', '--project', FAKE_PROJECT, '--db', dbPath], {
+    // process.execPath, not `bun` from PATH: a version-manager shim that does not exec would take the signal instead.
+    const entry = join(import.meta.dir, 'index.ts');
+    const proc = Bun.spawn([process.execPath, entry, 'stats', 'tokens', '--project', FAKE_PROJECT, '--db', dbPath], {
       cwd: import.meta.dir,
       env: { ...process.env, HOME: FIXTURE_HOME },
       stdout: 'pipe',

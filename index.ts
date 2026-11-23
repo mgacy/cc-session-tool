@@ -609,8 +609,8 @@ const SIGNAL_LISTENERS = {
 for (const [signal, listener] of Object.entries(SIGNAL_LISTENERS)) process.on(signal, listener);
 
 /**
- * Detaches the signal listeners so a signal takes its default action. Idempotent. The index-backed commands call it
- * on entry: their work is synchronous end to end, so a listener could only defer the signal until output() dropped it.
+ * Detaches the signal listeners so a signal takes its default action. Idempotent. Call it before work that runs
+ * synchronously to the end: no listener can run there, so it would only defer the signal until output() dropped it.
  */
 function releaseSignalListeners(): void {
   for (const [signal, listener] of Object.entries(SIGNAL_LISTENERS)) process.off(signal, listener);
