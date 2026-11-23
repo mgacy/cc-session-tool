@@ -1,6 +1,6 @@
 ---
 name: review-verification-techniques
-description: False-positive traps when probing cc-session-tool CLI output during review — piped reads cut off at ~128 KB, and scoped searches include the live session's own transcripts
+description: Review verification traps and techniques — piped reads cut off at ~128 KB, scoped searches include the live session, and mutation-checking tests in a scratch copy (symlink main-repo node_modules)
 metadata:
   type: project
 ---
@@ -14,3 +14,7 @@ metadata:
 **Scoped searches see the live session.** A `--project <main repo>` search includes the associated worktrees, so it also searches the transcripts of the session doing the review. One result was the live orchestrating parent session on `issue/15`, through one of its subagents. Two identical `--tool Bash --failed` runs gave 9 sessions, then 10. A never-match needle (`--output-match=zzzz_never_zzzz`) matched 1 session, probably because an earlier command of the reviewer's own printed the needle. Neither cause was confirmed by comparing session lists.
 
 **How to apply:** use needles that never appear in your own commands or their output. Before treating a count difference as a regression, check which session IDs changed and exclude the live session.
+
+**Mutation-checking a test in a scratch copy: link the main checkout's `node_modules`.** Reviewers may not edit sources, so to confirm a test fails without the fix, copy `index.ts`, `index.test.ts`, `src/`, `package.json` and `tsconfig.json` into the scratchpad, edit the copy, and run `bun test index.test.ts -t "<name>"` there. Worktrees have no `node_modules` of their own; the main checkout does. In the issue #27 review, symlinking the worktree's `node_modules` path made a dangling link, and the run failed with `Cannot find package 'citty'`. Symlinking `<main checkout>/node_modules` worked.
+
+**How to apply:** symlink the main checkout's `node_modules` into the copy (find the checkout with `dirname "$(git rev-parse --path-format=absolute --git-common-dir)"`). Never stash or edit the worktree for this.

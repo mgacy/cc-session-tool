@@ -38,6 +38,8 @@ import {
   parseSessionLines as parseTranscriptSessionLines,
   parseSessionText as parseTranscriptSessionText,
   normalizedBlocks,
+  requestUsages,
+  type SessionEntry as TranscriptSessionEntry,
   resolveByIdOrSlug as resolveTranscriptByIdOrSlug,
   resolveSessionFile as resolveTranscriptSessionFile,
   resolveSessionWithText,
@@ -3613,6 +3615,77 @@ describe('tools integration', () => {
   });
 });
 
+// Isolated project dir with its own Claude project dir under the fixture root.
+const makeIndexProject = (label: string, files: Record<string, string>) => {
+  const projectPath = join(FIXTURE_DIR, uniqueTempName(label));
+  const claudeDir = join(FIXTURE_CLAUDE_PROJECTS_ROOT, mangleProjectPath(projectPath));
+  mkdirSync(projectPath, { recursive: true });
+  mkdirSync(claudeDir, { recursive: true });
+  for (const [name, content] of Object.entries(files)) {
+    writeFileSync(join(claudeDir, name), content);
+  }
+  const selection = selectProjectContexts({
+    mode: 'scoped',
+    projectPath,
+    claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT,
+  });
+  return { projectPath, claudeDir, selection };
+};
+
+// The issue fixture: one user prompt, then three assistant entries; rows 1 and 2 share a
+// request/message id (running output count 3 -> 5), row 3 is a separate request.
+const issueFixtureLines = (sessionId: string) => {
+  const row = (ts: string, id: string, output: number) => JSON.stringify({
+    type: 'assistant',
+    requestId: `req-${id}`,
+    timestamp: ts,
+    message: {
+      id: `msg-${id}`,
+      role: 'assistant',
+      model: 'claude-test',
+      content: [{ type: 'text', text: `response ${id}` }],
+      usage: { input_tokens: 10, output_tokens: output, cache_read_input_tokens: 4, cache_creation_input_tokens: 2 },
+    },
+  });
+  return [
+    JSON.stringify({ type: 'user', sessionId, timestamp: '2026-03-02T10:00:00.000Z', gitBranch: 'main', version: '2.1.0', message: { role: 'user', content: 'Issue fixture' } }),
+    row('2026-03-02T10:01:00.000Z', 'a', 3),
+    row('2026-03-02T10:01:01.000Z', 'a', 5),
+    row('2026-03-02T10:02:00.000Z', 'b', 2),
+  ].join('\n') + '\n';
+};
+
+describe('tokens integration: one row per model request', () => {
+  const ISSUE_SESSION_ID = 'abcdef01-0000-0000-0000-000000000027';
+  let projectPath: string;
+
+  beforeAll(() => {
+    ({ projectPath } = makeIndexProject('tokens-issue-fixture', {
+      [`${ISSUE_SESSION_ID}.jsonl`]: issueFixtureLines(ISSUE_SESSION_ID),
+    }));
+  });
+
+  test('counts each request once and reports first and last turn', async () => {
+    const result = parseOutput((await runCli(['tokens', ISSUE_SESSION_ID, '--project', projectPath])).stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.totals).toEqual({ input: 20, output: 7, cache_read: 8, cache_create: 4 });
+    expect(result.data.turns).toEqual([
+      { n: 2, last_n: 3, input: 10, output: 5, cache_read: 4, cache_create: 2 },
+      { n: 4, last_n: 4, input: 10, output: 2, cache_read: 4, cache_create: 2 },
+    ]);
+    expect(result._meta.total).toBe(2);
+  });
+
+  test('--cumulative final row equals totals and keeps last_n', async () => {
+    const result = parseOutput((await runCli(['tokens', ISSUE_SESSION_ID, '--project', projectPath, '--cumulative'])).stdout);
+    expect(result.data.turns).toEqual([
+      { n: 2, last_n: 3, input: 10, output: 5, cache_read: 4, cache_create: 2 },
+      { n: 4, last_n: 4, input: 20, output: 7, cache_read: 8, cache_create: 4 },
+    ]);
+    expect(result.data.totals).toEqual({ input: 20, output: 7, cache_read: 8, cache_create: 4 });
+  });
+});
+
 describe('tokens integration', () => {
   test('returns per-turn tokens', async () => {
     const { stdout } = await runCli(['tokens', SESSION_ID, '--project', FAKE_PROJECT]);
@@ -3621,6 +3694,7 @@ describe('tokens integration', () => {
     expect(result.data.agent_id).toBeNull();
     expect(result.data.turns.length).toBe(3);
     expect(result.data.turns[0].n).toBe(2);
+    expect(result.data.turns.every((t: any) => t.last_n === t.n)).toBe(true);
     expect(result.data.turns[0].input).toBe(100);
     expect(result.data.totals.input).toBe(600);
     expect(result.data.totals.output).toBe(100);
@@ -6368,9 +6442,9 @@ describe('transcript index module', () => {
     refreshIndexForContexts(db, selection.contexts);
 
     // SESSION_ID_13's assistant turn has no usage data at all.
-    const turn = db.query("SELECT input_tokens, output_tokens FROM turn WHERE session_id = ? AND role = 'assistant'").get(SESSION_ID_13) as { input_tokens: number | null; output_tokens: number | null };
-    expect(turn.input_tokens).toBeNull();
-    expect(turn.output_tokens).toBeNull();
+    const request = db.query('SELECT input_tokens, output_tokens FROM request WHERE session_id = ?').get(SESSION_ID_13) as { input_tokens: number | null; output_tokens: number | null };
+    expect(request.input_tokens).toBeNull();
+    expect(request.output_tokens).toBeNull();
     const session = db.query('SELECT input_tokens_total, output_tokens_total FROM session WHERE session_id = ?').get(SESSION_ID_13) as { input_tokens_total: number | null; output_tokens_total: number | null };
     expect(session.input_tokens_total).toBeNull();
     expect(session.output_tokens_total).toBeNull();
@@ -6384,6 +6458,7 @@ describe('transcript index module', () => {
     expect(statRow).toBeDefined();
     expect(statRow!.input_tokens).toBeNull();
     expect(statRow!.turns).toBe(1);
+    expect(statRow!.requests).toBe(1);
     expect(statRow!.turns_with_usage).toBe(0);
     expect(statRow!.cache_hit_rate).toBeNull();
     db.close();
@@ -6481,7 +6556,7 @@ describe('stats integration (token oracle)', () => {
     expect(row.output_tokens ?? 0).toBe(tokens.data.totals.output);
     expect(row.cache_read_input_tokens ?? 0).toBe(tokens.data.totals.cache_read);
     expect(row.cache_creation_input_tokens ?? 0).toBe(tokens.data.totals.cache_create);
-    expect(row.turns).toBe(tokens.data.turns.length);
+    expect(row.requests).toBe(tokens.data.turns.length);
   });
 
   test('subagent totals from the index match tokens on the subagent transcript', async () => {
@@ -6506,7 +6581,7 @@ describe('stats integration (token oracle)', () => {
     expect(stats.data.every((r: any) => r.agent_id === null)).toBe(true);
   });
 
-  test('bucketed rollup by model uses day buckets and per-turn models', async () => {
+  test('bucketed rollup by model uses day buckets and per-request models', async () => {
     const statsRun = await runCli(['stats', 'tokens', '--bucket', 'day', '--by', 'model', '--project', FAKE_PROJECT, '--db', ORACLE_DB]);
     const stats = parseOutput(statsRun.stdout);
     expect(stats.ok).toBe(true);
@@ -6542,6 +6617,129 @@ describe('stats integration (token oracle)', () => {
     const badTz = await runCli(['stats', 'tokens', '--before', '2026-03-01T10:00', '--project', FAKE_PROJECT, '--db', dbPath]);
     expect(badTz.exitCode).toBe(2);
     expect(parseOutput(badTz.stdout).error.code).toBe('INVALID_ARGS');
+  });
+});
+
+describe('stats integration (one row per model request)', () => {
+  const ISSUE_SESSION_ID = 'abcdef02-0000-0000-0000-000000000027';
+  const BOUNDARY_SESSION_ID = 'abcdef03-0000-0000-0000-000000000027';
+  const boundaryEntry = (ts: string) => JSON.stringify({
+    type: 'assistant',
+    requestId: 'req-boundary',
+    timestamp: ts,
+    message: {
+      id: 'msg-boundary',
+      role: 'assistant',
+      model: 'claude-boundary',
+      content: [{ type: 'text', text: 'straddles midnight' }],
+      usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    },
+  });
+  let issue: ReturnType<typeof makeIndexProject>;
+  let boundary: ReturnType<typeof makeIndexProject>;
+
+  beforeAll(() => {
+    issue = makeIndexProject('stats-issue-fixture', {
+      [`${ISSUE_SESSION_ID}.jsonl`]: issueFixtureLines(ISSUE_SESSION_ID),
+    });
+    boundary = makeIndexProject('stats-boundary-fixture', {
+      [`${BOUNDARY_SESSION_ID}.jsonl`]: [
+        JSON.stringify({ type: 'user', sessionId: BOUNDARY_SESSION_ID, timestamp: '2026-03-02T23:59:00.000Z', gitBranch: 'main', version: '2.1.0', message: { role: 'user', content: 'go' } }),
+        boundaryEntry('2026-03-02T23:59:59.000Z'),
+        boundaryEntry('2026-03-03T00:00:01.000Z'),
+      ].join('\n') + '\n',
+    });
+  });
+  const dbFor = (label: string) => join(FIXTURE_DIR, 'dbs', `${uniqueTempName(label)}.db`);
+
+  test('--by session counts each request once', async () => {
+    const dbPath = dbFor('stats-issue');
+    const result = parseOutput((await runCli(['stats', 'tokens', '--by', 'session', '--project', issue.projectPath, '--db', dbPath])).stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data.length).toBe(1);
+    const row = result.data[0];
+    expect(row.input_tokens).toBe(20);
+    expect(row.output_tokens).toBe(7);
+    expect(row.cache_read_input_tokens).toBe(8);
+    expect(row.cache_creation_input_tokens).toBe(4);
+    expect(row.requests).toBe(2);
+    expect(row.turns).toBe(3);
+    expect(row.turns_with_usage).toBe(3);
+    expect(row.cache_hit_rate).toBe(0.25);
+
+    const db = new Database(dbPath, { readonly: true });
+    const session = db.query('SELECT input_tokens_total, output_tokens_total, cache_read_input_tokens_total, cache_creation_input_tokens_total FROM session WHERE session_id = ?').get(ISSUE_SESSION_ID);
+    db.close();
+    expect(session).toEqual({
+      input_tokens_total: 20,
+      output_tokens_total: 7,
+      cache_read_input_tokens_total: 8,
+      cache_creation_input_tokens_total: 4,
+    });
+  });
+
+  test('an ungrouped query with no matching requests returns one row of zeros and nulls', async () => {
+    const result = parseOutput((await runCli(['stats', 'tokens', '--after', '2999-01-01', '--project', issue.projectPath, '--db', dbFor('stats-empty')])).stdout);
+    expect(result.ok).toBe(true);
+    expect(result.data).toEqual([{
+      turns: 0,
+      turns_with_usage: 0,
+      requests: 0,
+      input_tokens: null,
+      output_tokens: null,
+      cache_read_input_tokens: null,
+      cache_creation_input_tokens: null,
+      cache_hit_rate: null,
+    }]);
+  });
+
+  test('a request spanning a UTC day boundary is attributed to its first entry', async () => {
+    const dbPath = dbFor('stats-boundary');
+    const bucketed = parseOutput((await runCli(['stats', 'tokens', '--bucket', 'day', '--by', 'session', '--project', boundary.projectPath, '--db', dbPath])).stdout);
+    expect(bucketed.ok).toBe(true);
+    expect(bucketed.data.length).toBe(1);
+    expect(bucketed.data[0].bucket).toBe('2026-03-02');
+    expect(bucketed.data[0].turns).toBe(2);
+    expect(bucketed.data[0].requests).toBe(1);
+    expect(bucketed.data[0].output_tokens).toBe(4);
+
+    const excluded = parseOutput((await runCli(['stats', 'tokens', '--after', '2026-03-03', '--by', 'session', '--project', boundary.projectPath, '--db', dbPath])).stdout);
+    expect(excluded.ok).toBe(true);
+    expect(excluded.data).toEqual([]);
+
+    const kept = parseOutput((await runCli(['stats', 'tokens', '--before', '2026-03-02', '--by', 'session', '--project', boundary.projectPath, '--db', dbPath])).stdout);
+    expect(kept.ok).toBe(true);
+    expect(kept.data.length).toBe(1);
+    expect(kept.data[0].turns).toBe(2);
+    expect(kept.data[0].requests).toBe(1);
+    expect(kept.data[0].output_tokens).toBe(4);
+
+    const byModel = parseOutput((await runCli(['stats', 'tokens', '--by', 'model', '--project', boundary.projectPath, '--db', dbPath])).stdout);
+    expect(byModel.data.length).toBe(1);
+    expect(byModel.data[0].model).toBe('claude-boundary');
+    expect(byModel.data[0].requests).toBe(1);
+  });
+
+  test('a cache written by an older schema version is rebuilt, not served stale', async () => {
+    const dbPath = dbFor('stats-stale');
+    const args = ['stats', 'tokens', '--by', 'session', '--project', issue.projectPath, '--db', dbPath];
+    const first = parseOutput((await runCli(args)).stdout);
+    expect(first.data[0].input_tokens).toBe(20);
+
+    const db = new Database(dbPath);
+    db.exec('UPDATE request SET input_tokens = 999');
+    // Pin the literal 1: the schema version that preceded per-request storage.
+    db.exec('UPDATE schema_version SET version = 1');
+    db.close();
+
+    const second = parseOutput((await runCli(args)).stdout);
+    expect(second.ok).toBe(true);
+    const row = second.data[0];
+    expect(row.input_tokens).toBe(20);
+    expect(row.output_tokens).toBe(7);
+    expect(row.cache_read_input_tokens).toBe(8);
+    expect(row.cache_creation_input_tokens).toBe(4);
+    expect(second._meta.index.refresh.indexed).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -6662,22 +6860,6 @@ describe('stats integration (incremental refresh)', () => {
 });
 
 describe('transcript index refresh edge cases', () => {
-  const makeIndexProject = (label: string, files: Record<string, string>) => {
-    const projectPath = join(FIXTURE_DIR, uniqueTempName(label));
-    const claudeDir = join(FIXTURE_CLAUDE_PROJECTS_ROOT, mangleProjectPath(projectPath));
-    mkdirSync(projectPath, { recursive: true });
-    mkdirSync(claudeDir, { recursive: true });
-    for (const [name, content] of Object.entries(files)) {
-      writeFileSync(join(claudeDir, name), content);
-    }
-    const selection = selectProjectContexts({
-      mode: 'scoped',
-      projectPath,
-      claudeProjectsRoot: FIXTURE_CLAUDE_PROJECTS_ROOT,
-    });
-    return { projectPath, claudeDir, selection };
-  };
-
   const validSession = (id: string) => [
     JSON.stringify({ type: 'user', sessionId: id, timestamp: '2026-03-02T10:00:00.000Z', gitBranch: 'main', version: '2.1.0', message: { role: 'user', content: 'hi' } }),
     JSON.stringify({ type: 'assistant', timestamp: '2026-03-02T10:01:00.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 10, output_tokens: 5 } } }),
@@ -6736,6 +6918,7 @@ describe('index command integration', () => {
     expect(result.data.schema_version).toBe(INDEX_SCHEMA_VERSION);
     expect(result.data.sessions).toBeGreaterThan(0);
     expect(result.data.turns).toBeGreaterThan(0);
+    expect(result.data.requests).toBeGreaterThan(0);
     expect(result.data.tool_uses).toBeGreaterThan(0);
     expect(result.data.scope.stale).toBe(0);
     // Unparseable fixture files written by earlier parse tests stay not_indexed.
@@ -7902,5 +8085,208 @@ describe('tools outcome integration', () => {
     );
     expect(exitCode).toBe(2);
     expect(parseOutput(stdout).error.code).toBe('INVALID_ARGS');
+  });
+});
+
+describe('requestUsages', () => {
+  type UsageFields = { input_tokens?: unknown; output_tokens?: unknown; cache_read_input_tokens?: unknown; cache_creation_input_tokens?: unknown };
+  const assistant = (
+    ids: { requestId?: string; messageId?: string },
+    usage: UsageFields | undefined,
+    extra: { timestamp?: string; model?: string } = {},
+  ): TranscriptSessionEntry => ({
+    type: 'assistant',
+    requestId: ids.requestId,
+    timestamp: extra.timestamp,
+    message: {
+      id: ids.messageId,
+      role: 'assistant',
+      content: 'ok',
+      model: extra.model,
+      usage: usage as never,
+    },
+  });
+  const user = (content: string | { type: string; tool_use_id: string; content: string }[] = 'hi'): TranscriptSessionEntry => ({
+    type: 'user',
+    message: { role: 'user', content: content as never },
+  });
+  const usage = (input: number, output: number, cacheRead: number, cacheCreate: number): UsageFields => ({
+    input_tokens: input,
+    output_tokens: output,
+    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheCreate,
+  });
+  const sum = (rs: ReturnType<typeof requestUsages>) => ({
+    input: rs.reduce((a, r) => a + (r.input ?? 0), 0),
+    output: rs.reduce((a, r) => a + (r.output ?? 0), 0),
+    cacheRead: rs.reduce((a, r) => a + (r.cacheRead ?? 0), 0),
+    cacheCreate: rs.reduce((a, r) => a + (r.cacheCreate ?? 0), 0),
+  });
+
+  const issueEntries = (outputA1: number, outputA2: number): TranscriptSessionEntry[] => [
+    user('go'),
+    assistant({ requestId: 'req-a', messageId: 'msg-a' }, usage(10, outputA1, 4, 2)),
+    assistant({ requestId: 'req-a', messageId: 'msg-a' }, usage(10, outputA2, 4, 2)),
+    assistant({ requestId: 'req-b', messageId: 'msg-b' }, usage(10, 2, 4, 2)),
+  ];
+
+  test('issue fixture merges the two entries of request A', () => {
+    const rs = requestUsages(issueEntries(3, 5));
+    expect(rs).toHaveLength(2);
+    expect(rs[0]).toMatchObject({ key: 'msg:msg-a', firstTurn: 2, lastTurn: 3, entryCount: 2, input: 10, output: 5, cacheRead: 4, cacheCreate: 2 });
+    expect(rs[1]).toMatchObject({ key: 'msg:msg-b', firstTurn: 4, lastTurn: 4, entryCount: 1, input: 10, output: 2, cacheRead: 4, cacheCreate: 2 });
+    expect(sum(rs)).toEqual({ input: 20, output: 7, cacheRead: 8, cacheCreate: 4 });
+  });
+
+  test('identical usage under different message ids is not merged', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({ messageId: 'm1' }, usage(10, 2, 4, 2)),
+      assistant({ messageId: 'm2' }, usage(10, 2, 4, 2)),
+    ]);
+    expect(rs).toHaveLength(2);
+    expect(sum(rs).input).toBe(20);
+  });
+
+  test('same requestId with different message ids stays separate (synthetic error entry)', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({ requestId: 'r', messageId: 'real' }, usage(10, 5, 4, 2)),
+      assistant({ requestId: 'r', messageId: 'synthetic' }, usage(0, 0, 0, 0)),
+    ]);
+    expect(rs.map(r => r.key)).toEqual(['msg:real', 'msg:synthetic']);
+    expect(sum(rs)).toEqual({ input: 10, output: 5, cacheRead: 4, cacheCreate: 2 });
+  });
+
+  test('entries carrying only a shared requestId merge', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({ requestId: 'r' }, usage(10, 3, 4, 2)),
+      assistant({ requestId: 'r' }, usage(10, 5, 4, 2)),
+    ]);
+    expect(rs).toHaveLength(1);
+    expect(rs[0]).toMatchObject({ key: 'req:r', entryCount: 2, input: 10, output: 5 });
+  });
+
+  test('entries with neither id are each their own request, even with identical usage', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({}, usage(10, 2, 4, 2)),
+      assistant({}, usage(10, 2, 4, 2)),
+    ]);
+    expect(rs.map(r => r.key)).toEqual(['turn:2', 'turn:3']);
+    expect(sum(rs).input).toBe(20);
+  });
+
+  test('message.id and requestId namespaces do not collide', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({ messageId: 'x' }, usage(1, 1, 1, 1)),
+      assistant({ requestId: 'x' }, usage(1, 1, 1, 1)),
+    ]);
+    expect(rs.map(r => r.key)).toEqual(['msg:x', 'req:x']);
+  });
+
+  test('non-contiguous group across a tool_result user entry merges', () => {
+    const rs = requestUsages([
+      user('go'),
+      assistant({ messageId: 'a' }, usage(10, 3, 4, 2)),
+      user([{ type: 'tool_result', tool_use_id: 't1', content: 'done' }]),
+      assistant({ messageId: 'a' }, usage(10, 5, 4, 2)),
+    ]);
+    expect(rs).toHaveLength(1);
+    expect(rs[0]).toMatchObject({ firstTurn: 2, lastTurn: 4, entryCount: 2, output: 5 });
+  });
+
+  test('a replayed id after a different id merges into the original group', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({ messageId: 'a' }, usage(10, 3, 4, 2)),
+      assistant({ messageId: 'b' }, usage(10, 2, 4, 2)),
+      assistant({ messageId: 'a' }, usage(10, 5, 4, 2)),
+    ]);
+    expect(rs.map(r => [r.key, r.firstTurn, r.lastTurn, r.output])).toEqual([
+      ['msg:a', 2, 4, 5],
+      ['msg:b', 3, 3, 2],
+    ]);
+  });
+
+  test('max is order-independent', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({ messageId: 'a' }, usage(10, 5, 4, 2)),
+      assistant({ messageId: 'a' }, usage(10, 3, 4, 2)),
+    ]);
+    expect(rs[0]!.output).toBe(5);
+  });
+
+  test('NULL semantics: no usage gives null fields and zero entriesWithUsage', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({ messageId: 'a' }, undefined),
+      assistant({ messageId: 'a' }, undefined),
+    ]);
+    expect(rs[0]).toMatchObject({ entryCount: 2, entriesWithUsage: 0, input: null, output: null, cacheRead: null, cacheCreate: null });
+  });
+
+  test('NULL semantics: a field present on only some entries takes the max of those', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({ messageId: 'a' }, { output_tokens: 3 }),
+      assistant({ messageId: 'a' }, undefined),
+      assistant({ messageId: 'a' }, { output_tokens: 5, input_tokens: 10 }),
+    ]);
+    expect(rs[0]).toMatchObject({ entryCount: 3, entriesWithUsage: 2, input: 10, output: 5, cacheRead: null, cacheCreate: null });
+  });
+
+  test('non-numeric and non-finite usage values are treated as absent', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({ messageId: 'a' }, { input_tokens: '10', output_tokens: Number.NaN, cache_read_input_tokens: Infinity, cache_creation_input_tokens: null }),
+    ]);
+    expect(rs[0]).toMatchObject({ entriesWithUsage: 0, input: null, output: null, cacheRead: null, cacheCreate: null });
+  });
+
+  test('turn numbering ignores system and summary entries', () => {
+    const rs = requestUsages([
+      { type: 'summary' },
+      { type: 'system' },
+      user(),
+      { type: 'system' },
+      assistant({ messageId: 'a' }, usage(1, 1, 1, 1)),
+    ]);
+    expect(rs[0]).toMatchObject({ firstTurn: 2, lastTurn: 2 });
+    // Idempotent on an already-filtered list.
+    expect(requestUsages(userAssistantEntries([{ type: 'system' }, user(), assistant({ messageId: 'a' }, usage(1, 1, 1, 1))]))[0]!.firstTurn).toBe(2);
+  });
+
+  test('timestamp and model come from the first entry that has one', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({ messageId: 'a' }, usage(1, 1, 1, 1)),
+      assistant({ messageId: 'a' }, usage(1, 2, 1, 1), { timestamp: '2026-01-01T00:00:02Z', model: 'claude-x' }),
+      assistant({ messageId: 'a' }, usage(1, 3, 1, 1), { timestamp: '2025-12-31T00:00:00Z', model: 'claude-y' }),
+    ]);
+    expect(rs[0]).toMatchObject({ timestamp: '2026-01-01T00:00:02Z', model: 'claude-x' });
+  });
+
+  test('empty-string model counts as absent', () => {
+    const rs = requestUsages([
+      user(),
+      assistant({ messageId: 'a' }, usage(1, 1, 1, 1), { model: '' }),
+    ]);
+    expect(rs[0]!.model).toBeNull();
+    const rs2 = requestUsages([
+      user(),
+      assistant({ messageId: 'a' }, usage(1, 1, 1, 1), { model: '' }),
+      assistant({ messageId: 'a' }, usage(1, 1, 1, 1), { model: 'claude-x' }),
+    ]);
+    expect(rs2[0]!.model).toBe('claude-x');
+  });
+
+  test('newer-version shape (every entry repeats the final usage) gives the same totals', () => {
+    const rs = requestUsages(issueEntries(5, 5));
+    expect(rs).toHaveLength(2);
+    expect(sum(rs)).toEqual({ input: 20, output: 7, cacheRead: 8, cacheCreate: 4 });
   });
 });

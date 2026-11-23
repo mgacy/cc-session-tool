@@ -373,7 +373,7 @@ cc-session-tool files <session> [--project <path> | --claude-project <project>] 
 
 ### `tokens <session>`
 
-Per-turn token usage from assistant entries.
+Token usage per model request. Claude Code can write several assistant entries for one model response, each repeating the input and cache usage (and, on older versions, a running output count), so summing entries would over-count.
 
 ```bash
 cc-session-tool tokens <session> [--project <path> | --claude-project <project>] [--cumulative]
@@ -390,6 +390,7 @@ cc-session-tool tokens <session> [--project <path> | --claude-project <project>]
     "turns": [
       {
         "n": 2,
+        "last_n": 2,
         "input": 20170,
         "output": 11,
         "cache_read": 0,
@@ -397,6 +398,7 @@ cc-session-tool tokens <session> [--project <path> | --claude-project <project>]
       },
       {
         "n": 4,
+        "last_n": 4,
         "input": 5995,
         "output": 380,
         "cache_read": 20170,
@@ -416,7 +418,9 @@ cc-session-tool tokens <session> [--project <path> | --claude-project <project>]
 
 **Notes:**
 
-- Only assistant entries appear in `turns` (they carry `message.usage`). User turns are counted but not listed.
+- `turns` has one row per model request, not per assistant entry. Entries that share a `message.id` (else a `requestId`) are one request and their usage is merged by field-wise max; entries with neither id each count as their own request. Grouping spans the whole transcript, so a request's entries need not be adjacent. User turns are counted but not listed.
+- `n` is the turn of the request's first entry. `last_n` is the turn of its last entry, and equals `n` for a request written as one entry; turns in between may belong to other requests.
+- `_meta.total` counts requests.
 - `totals` is always non-cumulative, even with `--cumulative`.
 - With `--cumulative`, each field in `turns` is a running total.
 
@@ -777,7 +781,7 @@ cc-session-tool subagents <session> [--project <path> | --claude-project <projec
 
 ### `stats`
 
-Corpus-wide aggregates served from a SQLite index over the transcripts (`session` / `turn` / `tool_use` tables). The index is built and refreshed lazily on use: each invocation stats every `.jsonl` in scope and re-parses only files whose mtime+size watermark changed. The JSONL transcripts remain the source of truth -- if the cache database is corrupt or unusable, the command transparently falls back to rebuilding it (or to a throwaway in-memory index) and still answers.
+Corpus-wide aggregates served from a SQLite index over the transcripts (`session` / `turn` / `request` / `tool_use` tables). The index is built and refreshed lazily on use: each invocation stats every `.jsonl` in scope and re-parses only files whose mtime+size watermark changed. The JSONL transcripts remain the source of truth -- if the cache database is corrupt or unusable, the command transparently falls back to rebuilding it (or to a throwaway in-memory index) and still answers.
 
 The database lives at `~/Library/Caches/cc-session-tool/index.db` on macOS (`~/.cache/cc-session-tool/index.db` elsewhere), overridable with `--db <path>` or the `CC_SESSION_TOOL_DB` env var. `_meta.index` on every response reports the database path, `mode` (`cache` or `memory`), and `refresh` counts. `refresh.failures` lists any transcripts that could not be parsed (with `file_path` and `reason`), so a wholly-unparseable file is identifiable rather than silently dropped from the rollup. Like every project-selecting command, `stats` always returns `_meta.projects_scanned` / `_meta.projects_skipped`; see [Project coverage metadata](#project-coverage-metadata).
 
@@ -792,12 +796,12 @@ cc-session-tool stats tokens [--project <path> | --all-projects] [--bucket day|w
 | Option | Default | Description |
 | ------ | ------- | ----------- |
 | `--bucket` | none | Bucket rows by `day` or `week` (Monday-anchored, matching `search --bucket`). |
-| `--by` | none | Group rows by per-turn `model` or by `session` (one row per transcript, subagents separate). |
-| `--after` / `--before` / `--since` | — | Bound by turn timestamp, **inclusive**. `--after`/`--before` take zero-padded ISO 8601: a bare date (`2026-01-09`) covers the whole UTC day (`--after` from `00:00:00.000Z`, `--before` through `23:59:59.999Z`), and a value carrying a time must include a timezone (`2026-01-09T14:30:00Z` or an offset). `--since` and `--after` are mutually exclusive. |
+| `--by` | none | Group rows by the request's `model` or by `session` (one row per transcript, subagents separate). |
+| `--after` / `--before` / `--since` | — | Bound by the request's timestamp (its first entry's), **inclusive**; a request is kept or dropped whole. `--after`/`--before` take zero-padded ISO 8601: a bare date (`2026-01-09`) covers the whole UTC day (`--after` from `00:00:00.000Z`, `--before` through `23:59:59.999Z`), and a value carrying a time must include a timezone (`2026-01-09T14:30:00Z` or an offset). `--since` and `--after` are mutually exclusive. |
 | `--no-subagents` | include | Exclude subagent transcripts from the rollup. |
 | `--include-project-lists` | false | Add the full `_meta.included_projects` / `_meta.skipped_projects` arrays (default: only the `projects_scanned` / `projects_skipped` counts). See [Project coverage metadata](#project-coverage-metadata). |
 
-Each row reports `turns` (assistant turns), `turns_with_usage`, the four token sums, and `cache_hit_rate` (`cache_read / (input + cache_read + cache_creation)`). Token sums are `null` -- never `0` -- when no turn in the group carried `message.usage`, so "no data" is distinguishable from "zero tokens".
+Each row reports `turns` (assistant transcript entries), `turns_with_usage` (entries carrying `message.usage`), `requests` (model requests), the four token sums, and `cache_hit_rate` (`cache_read / (input + cache_read + cache_creation)`). Each model request's usage is counted once (entries sharing a `message.id`, else a `requestId`, are merged by field-wise max, as in `tokens`). A request is attributed to its first entry's timestamp for `--after` / `--before` / `--since` and `--bucket`, so all its entries count in `turns` on that side of the bound. Token sums are `null` -- never `0` -- when no entry in the group carried `message.usage`, so "no data" is distinguishable from "zero tokens".
 
 ```bash
 # Daily spend per model across the whole corpus

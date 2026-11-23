@@ -62,7 +62,10 @@ import {
   extractSessionIntent,
   normalizedBlocks,
   parseSessionText as parseTranscriptSessionText,
+  requestUsages,
   truncateContent,
+  type ContentBlock,
+  type SessionEntry,
   type SessionSummaryResult,
 } from './src/transcript.ts';
 import {
@@ -116,42 +119,7 @@ export type ResponseMeta = {
   hasMore: boolean;
 };
 
-/** A parsed JSONL entry from a Claude session transcript. */
-export type SessionEntry = {
-  type: 'user' | 'assistant' | 'system' | 'summary' | (string & {});
-  sessionId?: string;
-  timestamp?: string;
-  gitBranch?: string;
-  version?: string;
-  cwd?: string;
-  model?: string;
-  message?: {
-    role?: string;
-    content?: string | ContentBlock[];
-    usage?: TokenUsage;
-    model?: string;
-  };
-  slug?: string;
-};
-
-export type ContentBlock = {
-  type: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'image' | 'document' | (string & {});
-  text?: string;
-  thinking?: string;
-  name?: string;
-  id?: string;
-  input?: Record<string, unknown>;
-  tool_use_id?: string;
-  is_error?: boolean;
-  content?: string | ContentBlock[];
-};
-
-export type TokenUsage = {
-  input_tokens?: number;
-  output_tokens?: number;
-  cache_read_input_tokens?: number;
-  cache_creation_input_tokens?: number;
-};
+export type { SessionEntry, ContentBlock, TokenUsage } from './src/transcript.ts';
 
 export type ListSession = {
   session_id: string;
@@ -224,7 +192,10 @@ type ToolCallWithRawInput = ToolCall & {
 };
 
 export type TokenTurn = {
+  /** Turn of the request's first transcript entry. */
   n: number;
+  /** Turn of the request's last transcript entry; equals `n` when the request was written as one entry. */
+  last_n: number;
   input: number;
   output: number;
   cache_read: number;
@@ -1360,21 +1331,14 @@ const tokensCommand = defineCommand({
     try {
       const { sessionId, agentId, entries } = await resolveSession(args);
 
-      const turns: TokenTurn[] = [];
-      let turnNum = 0;
-      for (const entry of entries) {
-        turnNum++;
-        if (entry.type === 'assistant') {
-          const usage = entry.message?.usage;
-          turns.push({
-            n: turnNum,
-            input: usage?.input_tokens ?? 0,
-            output: usage?.output_tokens ?? 0,
-            cache_read: usage?.cache_read_input_tokens ?? 0,
-            cache_create: usage?.cache_creation_input_tokens ?? 0,
-          });
-        }
-      }
+      const turns: TokenTurn[] = requestUsages(entries).map(r => ({
+        n: r.firstTurn,
+        last_n: r.lastTurn,
+        input: r.input ?? 0,
+        output: r.output ?? 0,
+        cache_read: r.cacheRead ?? 0,
+        cache_create: r.cacheCreate ?? 0,
+      }));
 
       const totals = {
         input: turns.reduce((s, t) => s + t.input, 0),
@@ -1391,7 +1355,7 @@ const tokensCommand = defineCommand({
           accOut += t.output;
           accCr += t.cache_read;
           accCc += t.cache_create;
-          return { n: t.n, input: accIn, output: accOut, cache_read: accCr, cache_create: accCc };
+          return { ...t, input: accIn, output: accOut, cache_read: accCr, cache_create: accCc };
         });
       }
 
@@ -2858,9 +2822,9 @@ const statsTokensCommand = defineCommand({
     ...INDEX_SCOPE_ARGS,
     bucket: { type: 'string', description: 'Bucket rows by: day, week (Monday-anchored)' },
     by: { type: 'string', description: 'Group rows by: model, session' },
-    after: { type: 'string', description: 'Turns at or after DATE, inclusive (ISO 8601; a bare date covers the whole UTC day, a time requires a timezone)' },
-    before: { type: 'string', description: 'Turns at or before DATE, inclusive (ISO 8601; a bare date covers the whole UTC day, a time requires a timezone)' },
-    since: { type: 'string', description: 'Turns from the last duration (e.g. 1d, 2h, 1w)' },
+    after: { type: 'string', description: 'Requests whose first entry is at or after DATE, inclusive (ISO 8601; a bare date covers the whole UTC day, a time requires a timezone)' },
+    before: { type: 'string', description: 'Requests whose first entry is at or before DATE, inclusive (ISO 8601; a bare date covers the whole UTC day, a time requires a timezone)' },
+    since: { type: 'string', description: 'Requests whose first entry is within the last duration (e.g. 1d, 2h, 1w)' },
     subagents: { type: 'boolean', description: 'Include subagent transcripts; use --no-subagents to exclude', default: true },
   },
   async run({ args }) {
