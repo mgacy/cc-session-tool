@@ -964,8 +964,8 @@ Errors:
 }
 ```
 
-- If stdout can't be written in full, the CLI exits 1 and stdout may hold a partial document. A reader that closes early (for example `| head`) gets nothing else; any other write error also writes an `OUTPUT_ERROR` envelope to stderr.
-- SIGTERM/SIGINT while the command is still reading transcripts yields a `TERMINATED` envelope and exit 1. Once output has started, the signal takes its default action (exit 143/130).
+- If stdout can't be written in full, the CLI exits 1 and stdout may hold a partial document. When the reader closes early (for example `| head`), nothing is written to stderr; any other write error also writes an `OUTPUT_ERROR` envelope to stderr.
+- SIGTERM/SIGINT while a command is still reading transcripts yields a `TERMINATED` envelope and exit 1. During a `stats` or `index` run, and once any command's output has started, the signal takes its default action instead (exit 143/130).
 
 ### Project coverage metadata
 

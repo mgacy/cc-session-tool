@@ -3923,15 +3923,25 @@ describe('stdout through a real pipe', () => {
       },
       stdout: 'pipe',
       stderr: 'ignore',
+      // sh leads its own process group so a hung pipeline can be killed whole: killing only sh leaves the other
+      // members holding its stdout open, and the read below never finishes.
+      detached: true,
     });
-    const killer = setTimeout(() => proc.kill(), TEST_TIMEOUT_MS - 5_000);
+    const killGroup = () => {
+      try {
+        process.kill(-proc.pid, 'SIGKILL');
+      } catch {
+        // The group is already gone.
+      }
+    };
+    const killer = setTimeout(killGroup, TEST_TIMEOUT_MS - 5_000);
     try {
       const stdout = Buffer.from(await new Response(proc.stdout).arrayBuffer());
       const exitCode = await proc.exited;
       return { stdout, exitCode };
     } finally {
       clearTimeout(killer);
-      proc.kill();
+      if (proc.exitCode === null && proc.signalCode === null) killGroup();
     }
   }
 
@@ -4004,11 +4014,14 @@ describe('stdout through a real pipe', () => {
 
     // The CLI runs in the background so `$!` is its own PID. The reader signals READY after the first byte, then
     // stalls, so the CLI is inside its synchronous write (200 KB cannot fit in the pipe) when the signal lands.
+    let settled = false;
     const run = runPipeScript(
       '( ' + SLICE + ' & echo $! > "$PIDFILE.tmp" && mv "$PIDFILE.tmp" "$PIDFILE"; wait $!; echo $? > "$STATUS" )'
         + ' | { dd bs=1 count=1 2>/dev/null; : > "$READY"; sleep 1.5; cat; }',
       { STATUS: status, PIDFILE: pidFile, READY: ready },
-    );
+    ).finally(() => {
+      settled = true;
+    });
 
     let cliPid = 0;
     try {
@@ -4029,7 +4042,8 @@ describe('stdout through a real pipe', () => {
       expect(await readStatusFile(status)).toBe('143');
       expect(piped.stdout.toString('utf8')).not.toContain('TERMINATED');
     } finally {
-      if (cliPid > 1) {
+      // Once `run` settles, sh has reaped the CLI and its PID may belong to an unrelated process.
+      if (!settled && cliPid > 1) {
         try {
           process.kill(cliPid, 'SIGKILL');
         } catch {
@@ -6974,6 +6988,34 @@ describe('stats integration (incremental refresh)', () => {
     expect(sessionCount.n).toBe(1);
     expect(turnCount.n).toBe(3); // user + 2 assistant turns
   });
+});
+
+describe('stats integration (signals)', () => {
+  test('a signal during the synchronous index refresh takes its default action at once', async () => {
+    // Holding the write lock parks the CLI's refresh in SQLite's busy wait (busy_timeout 5000 ms). JS listeners cannot
+    // run there, so a kept listener would only defer the signal until the run finished and exited 0.
+    const dbPath = join(FIXTURE_DIR, 'dbs', `${uniqueTempName('signal')}.db`);
+    const lock = openIndexDb(dbPath);
+    lock.exec('BEGIN IMMEDIATE');
+    const proc = Bun.spawn(['bun', 'run', 'index.ts', 'stats', 'tokens', '--project', FAKE_PROJECT, '--db', dbPath], {
+      cwd: import.meta.dir,
+      env: { ...process.env, HOME: FIXTURE_HOME },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    try {
+      await Bun.sleep(1_000);
+      proc.kill('SIGTERM');
+      const stdout = await new Response(proc.stdout).text();
+      await proc.exited;
+      expect(proc.signalCode).toBe('SIGTERM');
+      expect(stdout).toBe('');
+    } finally {
+      if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
+      lock.exec('ROLLBACK');
+      lock.close();
+    }
+  }, 15_000);
 });
 
 describe('transcript index refresh edge cases', () => {

@@ -608,7 +608,10 @@ const SIGNAL_LISTENERS = {
 
 for (const [signal, listener] of Object.entries(SIGNAL_LISTENERS)) process.on(signal, listener);
 
-/** Detaches the signal listeners so a signal during or after the stdout write takes its default action. Idempotent. */
+/**
+ * Detaches the signal listeners so a signal takes its default action. Idempotent. The index-backed commands call it
+ * on entry: their work is synchronous end to end, so a listener could only defer the signal until output() dropped it.
+ */
 function releaseSignalListeners(): void {
   for (const [signal, listener] of Object.entries(SIGNAL_LISTENERS)) process.off(signal, listener);
 }
@@ -2853,6 +2856,7 @@ const indexStatusCommand = defineCommand({
   meta: { name: 'status', description: 'Report index database location, row counts, and freshness for the selected scope' },
   args: { ...INDEX_SCOPE_ARGS },
   async run({ args }) {
+    releaseSignalListeners();
     try {
       const selection = selectIndexScope(args);
       const handle = acquireIndexForContexts(args.db, selection.contexts);
@@ -2872,6 +2876,7 @@ const indexRebuildCommand = defineCommand({
   meta: { name: 'rebuild', description: 'Drop and rebuild the index database, re-indexing the selected scope (default: all projects)' },
   args: { ...INDEX_SCOPE_ARGS },
   async run({ args }) {
+    releaseSignalListeners();
     try {
       const allProjects = args.project ? Boolean(args['all-projects']) : true;
       const selection = selectProjectContexts({
@@ -2913,6 +2918,7 @@ const statsTokensCommand = defineCommand({
     subagents: { type: 'boolean', description: 'Include subagent transcripts; use --no-subagents to exclude', default: true },
   },
   async run({ args }) {
+    releaseSignalListeners();
     try {
       const bucket = (args.bucket ?? null) as 'day' | 'week' | null;
       if (bucket !== null && bucket !== 'day' && bucket !== 'week') {
@@ -2962,6 +2968,7 @@ const statsTrajectoriesCommand = defineCommand({
     subagents: { type: 'boolean', description: 'Include subagent transcripts; use --no-subagents to exclude', default: true },
   },
   async run({ args }) {
+    releaseSignalListeners();
     try {
       if (args.operation && !SEARCH_OPERATIONS.includes(args.operation as SearchOperation)) {
         throw cliError('INVALID_ARGS', '--operation must be one of: read, edit, write, grep, glob');
