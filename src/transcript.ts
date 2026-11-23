@@ -414,9 +414,21 @@ export async function resolveSessionWithText(args: {
   };
 }
 
+/** The marker every truncation uses; `fullLength` is the original text length. */
+function truncationMarker(fullLength: number): string {
+  return `...[truncated, ${fullLength} chars]`;
+}
+
+/** Truncate text with "...[truncated, N chars]" suffix. */
 export function truncateContent(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
-  return text.slice(0, maxLen) + `...[truncated, ${text.length} chars]`;
+  return text.slice(0, maxLen) + truncationMarker(text.length);
+}
+
+/** Keep the first `head` and last `tail` chars (both positive), joined by "...[truncated, N chars]...". */
+export function truncateMiddle(text: string, head: number, tail: number): string {
+  if (text.length <= head + tail) return text;
+  return `${text.slice(0, head)}${truncationMarker(text.length)}...${text.slice(text.length - tail)}`;
 }
 
 export function maxCharsForTruncationKind(policy: TruncationPolicy, kind: TruncationKind): number | null {

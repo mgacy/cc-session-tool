@@ -178,6 +178,7 @@ cc-session-tool search --tool Bash \
 - **Don't pass `--operation` without `--file`** — the filter only binds when there's a matching file access to bind to.
 - **`--origin` is transcript evidence, not VCS history.** It tells you the earliest _recorded write in a transcript_, not when the file was first committed.
 - **`--all-projects` plus `--project` does not narrow the scan.** In all-projects mode, `--project` is only a file-identity anchor for absolute paths; the scan still covers every project.
+- **Group failures by `outcome_hash`, not `outcome`.** `outcome` truncates error text, so different errors can show the same string.
 - **`slice` without `--turn` is required to fail** — always pass a range.
 - **Validate inputs.** Session IDs accept `[a-zA-Z0-9-]`; agent IDs additionally allow `_`; `--claude-project` is a basename only (no path traversal).
 

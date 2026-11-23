@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, realpathSync, rmSync, symlinkSyn
 import { Database } from 'bun:sqlite';
 import { basename, join } from 'path';
 import { tmpdir } from 'os';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import {
   ERROR_CODES, success, failure, CliError, isCliError,
   parseTurnRange, truncateContent, inputSummary, determineOutcome, parseIntArg,
@@ -24,9 +24,12 @@ import {
   buildToolResultLocations,
   isFailedOutcome,
   isFailedResult,
+  outcomeHash,
+  safeInputSummary,
 } from './src/tool-log.ts';
 import {
   applyTruncationPolicy,
+  truncateMiddle,
   buildSessionSummary,
   contentBlocksForEntry,
   countNonEmptyLines,
@@ -439,6 +442,21 @@ describe('truncateContent', () => {
   });
 });
 
+describe('truncateMiddle', () => {
+  test('returns text at and below head + tail unchanged', () => {
+    expect(truncateMiddle('abcd', 2, 2)).toBe('abcd');
+    expect(truncateMiddle('abc', 2, 2)).toBe('abc');
+  });
+
+  test('keeps exact head, marker with full length, then exact tail', () => {
+    expect(truncateMiddle('0123456789', 3, 2)).toBe('012...[truncated, 10 chars]...89');
+  });
+
+  test('one char over the threshold is elided', () => {
+    expect(truncateMiddle('abcde', 2, 2)).toBe('ab...[truncated, 5 chars]...de');
+  });
+});
+
 // ============================================================================
 // inputSummary
 // ============================================================================
@@ -468,9 +486,41 @@ describe('inputSummary', () => {
     expect(inputSummary('Write', { file_path: '/x/y.txt', content: 'hello' })).toBe("file='y.txt' (5 chars)");
   });
 
-  test('Bash truncates to 80 chars', () => {
-    const cmd = 'x'.repeat(100);
-    expect(inputSummary('Bash', { command: cmd })).toBe('x'.repeat(80));
+  test('Bash keeps the first 40 and last 40 chars of a long command', () => {
+    const cmd = `${'a'.repeat(40)}${'m'.repeat(20)}${'z'.repeat(40)}`;
+    expect(inputSummary('Bash', { command: cmd })).toBe(`${'a'.repeat(40)}...[truncated, 100 chars]...${'z'.repeat(40)}`);
+  });
+
+  test('Bash commands sharing an 80-char prefix get distinct summaries', () => {
+    const prefix = 'p'.repeat(80);
+    const a = inputSummary('Bash', { command: `${prefix}${'q'.repeat(30)} first-ending-path.txt` });
+    const b = inputSummary('Bash', { command: `${prefix}${'q'.repeat(30)} second-ending-path.txt` });
+    expect(a).not.toBe(b);
+    expect(a.endsWith('first-ending-path.txt')).toBe(true);
+    expect(b.endsWith('second-ending-path.txt')).toBe(true);
+  });
+
+  test('Bash commands at or under 80 chars are unchanged', () => {
+    const cmd = 'c'.repeat(80);
+    expect(inputSummary('Bash', { command: cmd })).toBe(cmd);
+    expect(inputSummary('Bash', { command: 'ls -la' })).toBe('ls -la');
+  });
+
+  test('Agent prompt over 80 chars gets the suffix marker inside the quotes', () => {
+    const prompt = `${'p'.repeat(80)}tail-not-shown`;
+    expect(inputSummary('Agent', { prompt })).toBe(`prompt='${'p'.repeat(80)}...[truncated, ${prompt.length} chars]'`);
+    expect(inputSummary('Task', { description: prompt })).toBe(`prompt='${'p'.repeat(80)}...[truncated, ${prompt.length} chars]'`);
+  });
+
+  test('default JSON form over 80 chars gets the suffix marker', () => {
+    const input = { todos: [{ status: 'pending', content: 'z'.repeat(100) }] };
+    const json = JSON.stringify(input);
+    expect(inputSummary('TodoWrite', input)).toBe(`${json.slice(0, 80)}...[truncated, ${json.length} chars]`);
+  });
+
+  test('short default JSON and Agent inputs are unchanged', () => {
+    expect(inputSummary('TodoWrite', { a: 1 })).toBe('{"a":1}');
+    expect(inputSummary('Agent', { prompt: 'short' })).toBe("prompt='short'");
   });
 
   test('Glob with pattern and path', () => {
@@ -492,6 +542,35 @@ describe('inputSummary', () => {
   test('unknown tool uses JSON.stringify', () => {
     const result = inputSummary('Custom', { foo: 'bar' });
     expect(result).toContain('foo');
+  });
+});
+
+describe('safeInputSummary', () => {
+  test('matches inputSummary for well-formed input', () => {
+    expect(safeInputSummary('Bash', { command: 'ls -la' })).toBe('ls -la');
+  });
+
+  test('falls back to marker-suffixed stable JSON when inputSummary throws', () => {
+    const input = { command: 123, zzz: 'z'.repeat(100), aaa: 1 };
+    expect(() => inputSummary('Bash', input)).toThrow();
+    const json = stableJsonStringify(input);
+    expect(safeInputSummary('Bash', input)).toBe(`${json.slice(0, 80)}...[truncated, ${json.length} chars]`);
+  });
+
+  test('short malformed input falls back to unmarked stable JSON', () => {
+    expect(safeInputSummary('Bash', { command: 123 })).toBe('{"command":123}');
+  });
+
+  test('array-valued Bash command falls back to stable JSON instead of leaking a non-string', () => {
+    const input = { command: ['ls', '-la'] };
+    expect(() => inputSummary('Bash', input)).toThrow();
+    const summary = safeInputSummary('Bash', input);
+    expect(typeof summary).toBe('string');
+    expect(summary).toBe('{"command":["ls","-la"]}');
+  });
+
+  test('missing Bash command still summarizes as an empty string', () => {
+    expect(safeInputSummary('Bash', {})).toBe('');
   });
 });
 
@@ -546,6 +625,112 @@ describe('determineOutcome', () => {
   test('success with array content blocks', () => {
     expect(determineOutcome({ content: [{ type: 'text', text: 'a\nb' }] })).toBe('success (2 lines)');
   });
+
+  test('long error is truncated to 60 chars with a marker carrying the full length', () => {
+    const text = 'E'.repeat(60) + 'tail-beyond-budget';
+    expect(determineOutcome({ is_error: true, content: text })).toBe(
+      `error: ${'E'.repeat(60)}...[truncated, ${text.length} chars]`,
+    );
+  });
+
+  test('error of exactly 60 chars is unchanged', () => {
+    const text = 'x'.repeat(60);
+    expect(determineOutcome({ is_error: true, content: text })).toBe(`error: ${text}`);
+  });
+
+  test('maxErrorChars is a literal budget, including 0', () => {
+    const text = 'abcdefghij';
+    expect(determineOutcome({ is_error: true, content: text }, { maxErrorChars: 4 })).toBe('error: abcd...[truncated, 10 chars]');
+    expect(determineOutcome({ is_error: true, content: text }, { maxErrorChars: 0 })).toBe('error: ...[truncated, 10 chars]');
+    expect(determineOutcome({ is_error: true, content: text }, { maxErrorChars: 10 })).toBe('error: abcdefghij');
+    expect(determineOutcome({ is_error: true, content: text }, { maxErrorChars: 500 })).toBe('error: abcdefghij');
+  });
+
+  test('non-error branches ignore the budget', () => {
+    const opts = { maxErrorChars: 0 };
+    expect(determineOutcome({ content: 'ok' }, opts)).toBe('success');
+    expect(determineOutcome({ content: 'a\nb\nc' }, opts)).toBe('success (3 lines)');
+    expect(determineOutcome({ content: '' }, opts)).toBe('empty');
+    expect(determineOutcome(null, opts)).toBe('no_result');
+  });
+
+  test('undefined returns no_result like null', () => {
+    expect(determineOutcome(undefined)).toBe('no_result');
+  });
+
+  test('isFailedOutcome stays true for truncated errors', () => {
+    expect(isFailedOutcome(determineOutcome({ is_error: true, content: 'z'.repeat(500) }))).toBe(true);
+    expect(isFailedOutcome(determineOutcome({ is_error: true, content: 'z'.repeat(500) }, { maxErrorChars: 0 }))).toBe(true);
+  });
+
+  test('works inside Array.map with one argument', () => {
+    const results = [{ is_error: true, content: 'q'.repeat(100) }, { content: 'ok' }];
+    expect(results.map(r => determineOutcome(r))).toEqual([
+      `error: ${'q'.repeat(60)}...[truncated, 100 chars]`,
+      'success',
+    ]);
+  });
+});
+
+describe('outcomeHash', () => {
+  const sha12 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 12);
+
+  test('returns null for missing, success and empty non-error results', () => {
+    expect(outcomeHash(null)).toBeNull();
+    expect(outcomeHash(undefined)).toBeNull();
+    expect(outcomeHash({ content: 'ok' })).toBeNull();
+    expect(outcomeHash({ content: 'a\nb' })).toBeNull();
+    expect(outcomeHash({ content: '' })).toBeNull();
+    expect(outcomeHash({ content: [] })).toBeNull();
+    expect(outcomeHash({ is_error: false, content: 'boom' })).toBeNull();
+  });
+
+  test('known vectors', () => {
+    expect(outcomeHash({ is_error: true, content: '' })).toBe('e3b0c44298fc');
+    expect(outcomeHash({ is_error: true, content: '\u00e9' })).toBe('4a99557e4033');
+  });
+
+  test('"no text" error results hash the empty string', () => {
+    expect(outcomeHash({ is_error: true })).toBe('e3b0c44298fc');
+    expect(outcomeHash({ is_error: true, content: [{ type: 'image' }] as any })).toBe('e3b0c44298fc');
+    expect(outcomeHash({ is_error: true, content: [null] as any })).toBe('e3b0c44298fc');
+  });
+
+  test('is 12 lowercase hex chars matching an independent SHA-256', () => {
+    const text = 'something went wrong in /some/path/file.ts:42';
+    const hash = outcomeHash({ is_error: true, content: text });
+    expect(hash).toMatch(/^[0-9a-f]{12}$/);
+    expect(hash).toBe(sha12(text));
+  });
+
+  test('string and array text-block content hash equal; blocks are joined', () => {
+    const asString = outcomeHash({ is_error: true, content: 'part one part two' });
+    const asArray = outcomeHash({
+      is_error: true,
+      content: [{ type: 'text', text: 'part one ' }, { type: 'text', text: 'part two' }] as any,
+    });
+    expect(asArray).toBe(asString);
+  });
+
+  test('same-length errors sharing a long prefix: identical outcomes, different hashes', () => {
+    const prefix = 'This session is isolated in the worktree /some/long/path/to/worktree, but this command ';
+    expect(prefix.length).toBeGreaterThan(60);
+    const a = `${prefix}touches /repo/src/alpha.ts which is outside it.`;
+    const b = `${prefix}touches /repo/src/bravo.ts which is outside it.`;
+    expect(a.length).toBe(b.length);
+    const ra = { is_error: true, content: a };
+    const rb = { is_error: true, content: b };
+    expect(determineOutcome(ra)).toBe(determineOutcome(rb));
+    expect(outcomeHash(ra)).not.toBe(outcomeHash(rb));
+    expect(outcomeHash(ra)).toBe(sha12(a));
+    expect(outcomeHash(rb)).toBe(sha12(b));
+  });
+
+  test('does not depend on the display budget', () => {
+    const r = { is_error: true, content: 'w'.repeat(200) };
+    expect(determineOutcome(r, { maxErrorChars: 0 })).not.toBe(determineOutcome(r, { maxErrorChars: 500 }));
+    expect(outcomeHash(r)).toBe(sha12('w'.repeat(200)));
+  });
 });
 
 describe('isFailedOutcome', () => {
@@ -590,6 +775,15 @@ describe('isFailedResult parity with isFailedOutcome(determineOutcome(r))', () =
   test('missing result is not a failure', () => {
     expect(isFailedResult(undefined)).toBe(false);
     expect(isFailedResult(null)).toBe(false);
+  });
+
+  describe('outcomeHash invariant: non-null iff determineOutcome starts with "error:"', () => {
+    for (const { name, result } of cases) {
+      test(name, () => {
+        const hashed = outcomeHash(result as any) !== null;
+        expect(hashed).toBe(determineOutcome(result as any).startsWith('error:'));
+      });
+    }
   });
 });
 
@@ -1904,6 +2098,7 @@ const SESSION_ID_10 = 'ffffffdd-1111-2222-3333-444444444444';
 const SESSION_ID_11 = 'ffffff11-1111-2222-3333-444444444444';
 const SESSION_ID_12 = 'ffffff22-1111-2222-3333-444444444444';
 const SESSION_ID_13 = 'ffffff33-1111-2222-3333-444444444444';
+const BASH_MARKER_COMMAND = `npm install express ${'x'.repeat(30)} raw-bash-marker-in-elided-middle ${'y'.repeat(50)} tail-end-of-command`;
 const CROSS_PROJECT_FILE = 'cross-project-fixture-target.ts';
 const RELATED_PROJECT_FILE = 'related-origin-warning.ts';
 const RELATED_MISSING_CWD_FILE = 'related-missing-cwd.ts';
@@ -2166,7 +2361,7 @@ beforeAll(() => {
       message: {
         role: 'assistant',
         content: [
-          { type: 'tool_use', name: 'Bash', id: 'tool_bash_1', input: { command: `npm install express ${'x'.repeat(90)} raw-bash-marker-after-summary` } },
+          { type: 'tool_use', name: 'Bash', id: 'tool_bash_1', input: { command: BASH_MARKER_COMMAND } },
           { type: 'tool_use', name: 'Read', id: 'tool_read_1', input: { file_path: '/workspace/hello.ts' } },
           { type: 'tool_use', name: 'Read', id: 'tool_cross_read_1', input: { file_path: `/workspace/${CROSS_PROJECT_FILE}` } },
           { type: 'tool_use', name: 'Write', id: 'tool_write_1', input: { file_path: '/workspace/other.ts', content: 'export const other = true; // raw write content marker' } },
@@ -3212,6 +3407,8 @@ describe('help contract integration', () => {
     const toolsHelp = toolsProcess.stdout + toolsProcess.stderr;
     expect(toolsHelp).toContain('raw structured inputs');
     expect(toolsHelp).toContain('input_summary');
+    expect(toolsHelp).toContain('--max-outcome');
+    expect(toolsHelp).toContain('outcome_hash');
 
     const projectsProcess = await runCliHelp(['projects', '--help']);
     const projectsHelp = projectsProcess.stdout + projectsProcess.stderr;
@@ -3362,14 +3559,18 @@ describe('tools integration', () => {
   });
 
   test('filters by raw --input-match beyond input_summary', async () => {
-    const { stdout } = await runCli(['tools', SESSION_ID_4, '--project', FAKE_PROJECT, '--name', 'Bash', '--input-match', 'raw-bash-marker-after-summary']);
+    const { stdout } = await runCli(['tools', SESSION_ID_4, '--project', FAKE_PROJECT, '--name', 'Bash', '--input-match', 'raw-bash-marker-in-elided-middle']);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
     expect(result.data.tool_calls).toHaveLength(1);
+    // Read before toMatchObject: Bun's asymmetric matchers can overwrite the received property.
+    const summary: string = result.data.tool_calls[0].input_summary;
     expect(result.data.tool_calls[0]).toMatchObject({
       tool: 'Bash',
-      input_summary: expect.not.stringContaining('raw-bash-marker-after-summary'),
+      input_summary: expect.not.stringContaining('raw-bash-marker-in-elided-middle'),
     });
+    expect(summary).toContain(`...[truncated, ${BASH_MARKER_COMMAND.length} chars]...`);
+    expect(summary.endsWith(BASH_MARKER_COMMAND.slice(-40))).toBe(true);
     expect(result.data.tool_calls[0]).not.toHaveProperty('raw_input');
   });
 
@@ -5035,7 +5236,7 @@ describe('search integration', () => {
   });
 
   test('--input-match searches raw Bash commands beyond input summary truncation', async () => {
-    const { exitCode, stdout } = await runCli(['search', '--tool', 'Bash', '--input-match', 'raw-bash-marker-after-summary', '--project', FAKE_PROJECT]);
+    const { exitCode, stdout } = await runCli(['search', '--tool', 'Bash', '--input-match', 'raw-bash-marker-in-elided-middle', '--project', FAKE_PROJECT]);
     expect(exitCode).toBe(0);
     const result = parseOutput(stdout);
     expect(result.ok).toBe(true);
@@ -5043,11 +5244,14 @@ describe('search integration', () => {
     const match = result.data.find((s: any) => s.session_id === SESSION_ID_4);
     expect(match.matches.tools).toEqual(['Bash']);
     expect(match.matches).not.toHaveProperty('tool_inputs');
+    const bashSummary: string = match.matches.evidence.find((e: any) => e.kind === 'tool_input').input_summary;
+    expect(bashSummary).toContain(`...[truncated, ${BASH_MARKER_COMMAND.length} chars]...`);
+    expect(bashSummary.endsWith(BASH_MARKER_COMMAND.slice(-40))).toBe(true);
     expect(match.matches.evidence.filter((e: any) => e.kind === 'tool_input')).toMatchObject([{
       kind: 'tool_input',
       tool: 'Bash',
-      input_summary: expect.not.stringContaining('raw-bash-marker-after-summary'),
-      snippet: expect.stringContaining('raw-bash-marker-after-summary'),
+      input_summary: expect.not.stringContaining('raw-bash-marker-in-elided-middle'),
+      snippet: expect.stringContaining('raw-bash-marker-in-elided-middle'),
       turn: 2,
       block_index: 0,
       timestamp: '2026-03-04T10:01:00.000Z',
@@ -7381,5 +7585,322 @@ describe('strict argument dispatch integration', () => {
       expect(withEquals.data).toEqual(withNo.data);
       expect(withEquals.data.find((s: any) => s.session_id === SESSION_ID)).toBeUndefined();
     });
+  });
+});
+
+// ============================================================================
+// tools outcome fixture: outcome_hash, handles, malformed-input tolerance
+// ============================================================================
+
+describe('tools outcome integration', () => {
+  const TOOLS_ROOT = join(SHORT_TMP_ROOT, uniqueTempName('cc-session-tools-outcome-fixture'));
+  const TOOLS_HOME = join(TOOLS_ROOT, 'home');
+  const TOOLS_PROJECT = join(TOOLS_ROOT, 'outcome-project');
+  const TOOLS_CLAUDE_DIR = join(claudeProjectsRoot(TOOLS_HOME), mangleProjectPath(TOOLS_PROJECT));
+  const TOOLS_SESSION = 'e0e0e0e0-0000-4000-8000-0000000000e0';
+  const NULL_SESSION = 'e0e0e0e0-0000-4000-8000-0000000000e1';
+  const SUB_ID = 'outcome_sub';
+  const KEY_ORDER = ['turn', 'tool', 'input_summary', 'outcome', 'outcome_hash', 'duration_ms', 'tool_use_id', 'result_turn'];
+
+  // A, B and C share a >60-char prefix; A and B have the same total length and diverge later; C equals A.
+  const SHARED_PREFIX = 'This session is isolated in the worktree /work/trees/issue-16-long-name, but this command ';
+  const ERR_A = `${SHARED_PREFIX}writes to /alpha/path.ts (blocked)`;
+  const ERR_B = `${SHARED_PREFIX}writes to /bravo/path.ts (blocked)`;
+  const ERR_C = ERR_A;
+  const ERR_D = `${SHARED_PREFIX}reads /charlie/other/longer/path.ts (blocked, retry inside the isolated worktree)`;
+  const SUB_ERR = 'Subagent build failed because the toolchain was not found on this machine PATH';
+  const LONG_OK = `${'success line one '.repeat(20)}\nsecond line`;
+  const NULL_ERR = `${SHARED_PREFIX}is refused in a turn that also holds a null content block`;
+
+  const sha12 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 12);
+  const MARKER_RE = /\.\.\.\[truncated, (\d+) chars\]$/;
+  const minute = (n: number) => `2026-05-01T10:${String(n).padStart(2, '0')}:00.000Z`;
+  const user = (turn: number, content: unknown) => JSON.stringify({
+    type: 'user', sessionId: TOOLS_SESSION, timestamp: minute(turn), cwd: TOOLS_PROJECT, message: { role: 'user', content },
+  });
+  const assistant = (turn: number, content: unknown[]) => JSON.stringify({
+    type: 'assistant', timestamp: minute(turn), cwd: TOOLS_PROJECT, message: { role: 'assistant', content },
+  });
+  const use = (name: string, id: string | undefined, input: unknown) => ({ type: 'tool_use', name, ...(id === undefined ? {} : { id }), input });
+  const toolResult = (id: string, content: unknown, is_error?: boolean) => ({
+    type: 'tool_result', tool_use_id: id, content, ...(is_error ? { is_error: true } : {}),
+  });
+
+  const tools = async (args: string[] = [], session: string = TOOLS_SESSION) => {
+    const { exitCode, stdout } = await runCli(['tools', session, '--project', TOOLS_PROJECT, ...args], { HOME: TOOLS_HOME });
+    return { exitCode, result: parseOutput(stdout) };
+  };
+  const rowsOf = (result: any): any[] => result.data.tool_calls;
+  const rowById = (rows: any[], id: string) => rows.find(r => r.tool_use_id === id);
+
+  beforeAll(() => {
+    mkdirSync(TOOLS_CLAUDE_DIR, { recursive: true });
+    writeFileSync(join(TOOLS_CLAUDE_DIR, `${TOOLS_SESSION}.jsonl`), [
+      user(1, 'Investigate the worktree refusals'),
+      // A tool_result written before its tool_use (result_turn < turn).
+      user(2, [toolResult('early_bash', 'early ok')]),
+      assistant(3, [
+        null,
+        use('Bash', 'err_a', { command: 'echo a' }),
+        use('Bash', 'err_b', { command: 'echo b' }),
+        use('Bash', 'err_c', { command: 'echo c' }),
+        use('Bash', 'err_d', { command: 'echo d' }),
+        use('Bash', 'img_err', { command: 'echo image' }),
+        use('Bash', 'no_result', { command: 'echo pending' }),
+        use('Bash', undefined, { command: 'echo no id' }),
+        use('Bash', 'malformed', { command: 123 }),
+        use('Bash', 'early_bash', { command: 'echo early' }),
+        use('Bash', 'long_ok', { command: 'echo long' }),
+      ]),
+      user(4, [
+        toolResult('err_a', ERR_A, true),
+        toolResult('err_b', ERR_B, true),
+        toolResult('err_c', [{ type: 'text', text: ERR_C }], true),
+        toolResult('err_d', ERR_D, true),
+        toolResult('img_err', [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } }], true),
+        toolResult('malformed', 'ok'),
+        toolResult('long_ok', LONG_OK),
+      ]),
+    ].join('\n') + '\n');
+
+    const subDir = join(TOOLS_CLAUDE_DIR, TOOLS_SESSION, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    writeFileSync(join(subDir, `agent-${SUB_ID}.jsonl`), [
+      user(1, 'Build it'),
+      assistant(2, [use('Bash', 'sub_bash', { command: 'swift build' })]),
+      user(3, [toolResult('sub_bash', SUB_ERR, true)]),
+    ].join('\n') + '\n');
+    writeFileSync(join(subDir, `agent-${SUB_ID}.meta.json`), JSON.stringify({ agentType: 'builder', description: 'Build subagent' }));
+
+    // A null block beside the tool_result in the result turn: the documented follow-ups must still work.
+    writeFileSync(join(TOOLS_CLAUDE_DIR, `${NULL_SESSION}.jsonl`), [
+      user(1, 'Run it'),
+      assistant(2, [use('Bash', 'null_err', { command: 'echo null' })]),
+      user(3, [null, toolResult('null_err', NULL_ERR, true)]),
+    ].join('\n') + '\n');
+  });
+
+  afterAll(() => {
+    rmSync(TOOLS_ROOT, { recursive: true, force: true });
+  });
+
+  test('tolerates malformed inputs and null blocks, and keeps the documented key order', async () => {
+    const { exitCode, result } = await tools();
+    expect(exitCode).toBe(0);
+    expect(result.ok).toBe(true);
+    const rows = rowsOf(result);
+    expect(rows.length).toBe(10);
+    for (const row of rows) expect(Object.keys(row)).toEqual(KEY_ORDER);
+    expect(rows.every((r: any) => !('raw_input' in r))).toBe(true);
+    const malformed = rowById(rows, 'malformed');
+    expect(malformed.input_summary).toBe('{"command":123}');
+    expect(malformed.outcome).toBe('success');
+  });
+
+  test('distinct errors sharing a prefix get identical outcomes but different hashes', async () => {
+    const rows = rowsOf((await tools()).result);
+    const [a, b, c, d] = ['err_a', 'err_b', 'err_c', 'err_d'].map(id => rowById(rows, id));
+    expect(ERR_A.length).toBe(ERR_B.length);
+    expect(a.outcome).toBe(b.outcome);
+    expect(a.outcome).toBe(`error: ${ERR_A.slice(0, 60)}...[truncated, ${ERR_A.length} chars]`);
+    for (const row of [a, b, c, d]) {
+      expect(row.outcome.startsWith(`error: ${ERR_A.slice(0, 60)}`)).toBe(true);
+      expect(row.outcome).toMatch(MARKER_RE);
+    }
+    expect(d.outcome).toBe(`error: ${ERR_D.slice(0, 60)}...[truncated, ${ERR_D.length} chars]`);
+    expect(a.outcome_hash).toBe(sha12(ERR_A));
+    expect(b.outcome_hash).toBe(sha12(ERR_B));
+    expect(c.outcome_hash).toBe(sha12(ERR_C));
+    expect(d.outcome_hash).toBe(sha12(ERR_D));
+    expect(a.outcome_hash).not.toBe(b.outcome_hash);
+    expect(a.outcome_hash).toBe(c.outcome_hash);
+    expect(new Set([a, b, c, d].map(r => r.outcome_hash)).size).toBe(3);
+  });
+
+  test('an error with no text hashes the empty string', async () => {
+    const row = rowById(rowsOf((await tools()).result), 'img_err');
+    expect(row.outcome).toBe('error: ');
+    expect(row.outcome_hash).toBe('e3b0c44298fc');
+  });
+
+  test('handles point at the tool_result turn, including results written before their tool_use', async () => {
+    const rows = rowsOf((await tools()).result);
+    for (const id of ['err_a', 'err_b', 'err_c', 'err_d', 'img_err', 'malformed', 'long_ok']) {
+      const row = rowById(rows, id);
+      expect(row.tool_use_id).toBe(id);
+      expect(row.turn).toBe(3);
+      expect(row.result_turn).toBe(4);
+    }
+    const early = rowById(rows, 'early_bash');
+    expect(early.turn).toBe(3);
+    expect(early.result_turn).toBe(2);
+    expect(early.result_turn).toBeLessThan(early.turn);
+    expect(early.duration_ms).toBeNull();
+    expect(early.outcome).toBe('success');
+  });
+
+  test('rows without a result or an id carry null handles and a null hash', async () => {
+    const rows = rowsOf((await tools()).result);
+    const pending = rowById(rows, 'no_result');
+    expect(pending).toMatchObject({ outcome: 'no_result', outcome_hash: null, result_turn: null, tool_use_id: 'no_result' });
+    const idless = rows.find(r => r.tool_use_id === null);
+    expect(idless).toBeDefined();
+    expect(idless.input_summary).toBe('echo no id');
+    expect(idless.outcome).toBe('no_result');
+    expect(idless.outcome_hash).toBeNull();
+    expect(idless.result_turn).toBeNull();
+    expect(rowById(rows, 'long_ok').outcome_hash).toBeNull();
+  });
+
+  test('outcome_hash is non-null exactly for error outcomes', async () => {
+    for (const row of rowsOf((await tools()).result)) {
+      expect(row.outcome_hash !== null).toBe(row.outcome.startsWith('error:'));
+    }
+  });
+
+  test('--failed returns exactly the error rows', async () => {
+    const rows = rowsOf((await tools(['--failed'])).result);
+    expect(rows.map(r => r.tool_use_id)).toEqual(['err_a', 'err_b', 'err_c', 'err_d', 'img_err']);
+  });
+
+  test('messages round trip with the marker budget returns the full text that hashes to outcome_hash', async () => {
+    const rows = rowsOf((await tools()).result);
+    for (const id of ['err_a', 'err_b', 'err_d']) {
+      const row = rowById(rows, id);
+      const budget = Number(row.outcome.match(MARKER_RE)![1]);
+      const { stdout } = await runCli([
+        'messages', TOOLS_SESSION, '--project', TOOLS_PROJECT,
+        '--turn', String(row.result_turn), '--type', 'tool_result', '--max-tool-result', String(budget),
+      ], { HOME: TOOLS_HOME });
+      const messages = parseOutput(stdout);
+      expect(messages.ok).toBe(true);
+      const block = messages.data.messages[0].content.find((b: any) => b.tool_use_id === row.tool_use_id);
+      expect(block).toBeDefined();
+      expect(block.content).not.toMatch(/\[truncated/);
+      expect(sha12(block.content)).toBe(row.outcome_hash);
+    }
+  });
+
+  test('subagent round trip reuses the exact selector', async () => {
+    const selector = `${TOOLS_SESSION}:${SUB_ID}`;
+    const { exitCode, result } = await tools([], selector);
+    expect(exitCode).toBe(0);
+    expect(result.data.agent_id).toBe(SUB_ID);
+    const rows = rowsOf(result);
+    expect(rows.length).toBe(1);
+    const row = rows[0];
+    expect(Object.keys(row)).toEqual(KEY_ORDER);
+    expect(row.tool_use_id).toBe('sub_bash');
+    expect(row.turn).toBe(2);
+    expect(row.result_turn).toBe(3);
+    expect(row.outcome).toBe(`error: ${SUB_ERR.slice(0, 60)}...[truncated, ${SUB_ERR.length} chars]`);
+    const budget = Number(row.outcome.match(MARKER_RE)![1]);
+    const { stdout } = await runCli([
+      'messages', selector, '--project', TOOLS_PROJECT,
+      '--turn', String(row.result_turn), '--type', 'tool_result', '--max-tool-result', String(budget),
+    ], { HOME: TOOLS_HOME });
+    const messages = parseOutput(stdout);
+    expect(messages.data.agent_id).toBe(SUB_ID);
+    const block = messages.data.messages[0].content.find((b: any) => b.tool_use_id === row.tool_use_id);
+    expect(block.content).toBe(SUB_ERR);
+    expect(sha12(block.content)).toBe(row.outcome_hash);
+  });
+
+  test('messages and slice --max-content follow-ups tolerate a null block in the result turn', async () => {
+    const { exitCode, result } = await tools([], NULL_SESSION);
+    expect(exitCode).toBe(0);
+    const row = rowById(rowsOf(result), 'null_err');
+    expect(row.result_turn).toBe(3);
+    const budget = Number(row.outcome.match(MARKER_RE)![1]);
+
+    const typed = await runCli([
+      'messages', NULL_SESSION, '--project', TOOLS_PROJECT,
+      '--turn', String(row.result_turn), '--type', 'tool_result', '--max-tool-result', String(budget),
+    ], { HOME: TOOLS_HOME });
+    expect(typed.exitCode).toBe(0);
+    const block = parseOutput(typed.stdout).data.messages[0].content.find((b: any) => b.tool_use_id === 'null_err');
+    expect(block.content).toBe(NULL_ERR);
+    expect(sha12(block.content)).toBe(row.outcome_hash);
+
+    const untyped = await runCli([
+      'messages', NULL_SESSION, '--project', TOOLS_PROJECT, '--turn', String(row.result_turn),
+    ], { HOME: TOOLS_HOME });
+    expect(untyped.exitCode).toBe(0);
+    expect(parseOutput(untyped.stdout).data.messages[0].content.map((b: any) => b.type)).toEqual(['unknown', 'tool_result']);
+
+    const sliced = await runCli([
+      'slice', NULL_SESSION, '--project', TOOLS_PROJECT, '--turn', String(row.result_turn), '--max-content', '10',
+    ], { HOME: TOOLS_HOME });
+    expect(sliced.exitCode).toBe(0);
+    const content = parseOutput(sliced.stdout).data.entries[0].message.content;
+    expect(content[0]).toBeNull();
+    expect(content[1].content).toBe(`${NULL_ERR.slice(0, 10)}...[truncated, ${NULL_ERR.length} chars]`);
+  });
+
+  test('slice fallback returns the untruncated result for a row without a marker', async () => {
+    const row = rowById(rowsOf((await tools()).result), 'long_ok');
+    expect(row.outcome).toBe('success (2 lines)');
+    expect(row.outcome).not.toMatch(MARKER_RE);
+    expect(LONG_OK.length).toBeGreaterThan(200);
+    const { stdout } = await runCli([
+      'slice', TOOLS_SESSION, '--project', TOOLS_PROJECT, '--turn', String(row.result_turn),
+    ], { HOME: TOOLS_HOME });
+    const sliced = parseOutput(stdout);
+    expect(sliced.ok).toBe(true);
+    const block = sliced.data.entries[0].message.content.find((b: any) => b.tool_use_id === row.tool_use_id);
+    expect(block).toBeDefined();
+    expect(block.content).toBe(LONG_OK);
+  });
+
+  test('--max-outcome 300 reveals the distinguishing clauses without changing outcome_hash', async () => {
+    const defaults = rowsOf((await tools()).result);
+    const { exitCode, result } = await tools(['--max-outcome', '300']);
+    expect(exitCode).toBe(0);
+    const rows = rowsOf(result);
+    for (const [id, text] of [['err_a', ERR_A], ['err_b', ERR_B], ['err_c', ERR_C], ['err_d', ERR_D]] as const) {
+      const row = rowById(rows, id);
+      expect(row.outcome).toBe(`error: ${text}`);
+      expect(row.outcome_hash).toBe(rowById(defaults, id).outcome_hash);
+      expect(row.outcome_hash).toBe(sha12(text));
+    }
+    expect(rowById(rows, 'err_a').outcome).not.toBe(rowById(rows, 'err_b').outcome);
+    expect(rowById(rows, 'long_ok').outcome).toBe('success (2 lines)');
+  });
+
+  test('--max-outcome 0 keeps only the error prefix and the marker', async () => {
+    const { result } = await tools(['--max-outcome', '0']);
+    const row = rowById(rowsOf(result), 'err_a');
+    expect(row.outcome).toBe(`error: ...[truncated, ${ERR_A.length} chars]`);
+    expect(row.outcome_hash).toBe(sha12(ERR_A));
+    expect(rowById(rowsOf(result), 'img_err').outcome).toBe('error: ');
+    const failed = rowsOf((await tools(['--max-outcome', '0', '--failed'])).result);
+    expect(failed.map(r => r.tool_use_id)).toEqual(['err_a', 'err_b', 'err_c', 'err_d', 'img_err']);
+  });
+
+  test('--max-outcome at or above the text length leaves the outcome without a marker', async () => {
+    const { result } = await tools([`--max-outcome=${ERR_A.length}`]);
+    expect(rowById(rowsOf(result), 'err_a').outcome).toBe(`error: ${ERR_A}`);
+  });
+
+  test.each([
+    ['abc', ['--max-outcome', 'abc']],
+    ['-1', ['--max-outcome', '-1']],
+    ['=-1', ['--max-outcome=-1']],
+  ])('--max-outcome %s is rejected with INVALID_ARGS', async (_label, flagArgs) => {
+    const { exitCode, stdout } = await runCli(['tools', TOOLS_SESSION, '--project', TOOLS_PROJECT, ...flagArgs], { HOME: TOOLS_HOME });
+    expect(exitCode).toBe(2);
+    const result = parseOutput(stdout);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('INVALID_ARGS');
+    expect(result.error.message).toContain('--max-outcome');
+  });
+
+  test('--max-outcome is validated before the session is resolved', async () => {
+    const { exitCode, stdout } = await runCli(
+      ['tools', 'no-such-session', '--project', TOOLS_PROJECT, '--max-outcome', 'abc'],
+      { HOME: TOOLS_HOME },
+    );
+    expect(exitCode).toBe(2);
+    expect(parseOutput(stdout).error.code).toBe('INVALID_ARGS');
   });
 });

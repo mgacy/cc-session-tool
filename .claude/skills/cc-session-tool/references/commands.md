@@ -109,8 +109,9 @@ cc-session-tool tools <session> [flags]
 | `--input-regex <regex>` | Regex equivalent. Mutually exclusive with `--input-match`. |
 | `--failed` | Only failed calls. |
 | `--turn <N\|N-M>` | Single turn or range. |
+| `--max-outcome <n>` | Chars of error text shown in `outcome` (default 60). |
 
-Each entry: `turn`, `tool`, `input_summary`, `outcome`, `duration_ms`.
+Each entry: `turn`, `tool`, `input_summary`, `outcome`, `outcome_hash`, `duration_ms`, `tool_use_id`, `result_turn`.
 
 **Input summary format by tool:**
 
@@ -120,7 +121,7 @@ Each entry: `turn`, `tool`, `input_summary`, `outcome`, `duration_ms`.
 | `Read` | `file='<basename>' offset=N limit=N` |
 | `Edit` | `file='<basename>' old=(N chars) new=(N chars)` |
 | `Write` | `file='<basename>' (N chars)` |
-| `Bash` | First 80 chars of command |
+| `Bash` | First 40 + last 40 chars of command |
 | `Glob` | `pattern='...' path='...'` |
 | `Agent`/`Task` | `prompt='...'` (first 80 chars) |
 | `WebFetch` | `url='...'` |
@@ -130,6 +131,16 @@ Each entry: `turn`, `tool`, `input_summary`, `outcome`, `duration_ms`.
 **Outcome:** `success`, `success (N lines)`, `empty`, `error: <message>`, or `no_result` (interrupted session).
 
 `duration_ms` is the gap between the assistant entry and its matching tool_result; `null` if timestamps are missing.
+
+`outcome_hash` is a hash of the full error text; `null` for non-errors.
+
+**Reading a full result.** Use the same selector and project flag you gave `tools`. For a subagent that includes `:<agent-id>`; without it, `result_turn` silently points into the parent transcript.
+
+```bash
+cc-session-tool messages <session>[:<agent-id>] [--project <path> | --claude-project <project>] --turn <result_turn> --type tool_result --max-tool-result <N>
+```
+
+Take `N` (the full length) from the outcome's `...[truncated, N chars]` marker, and pick the block whose `tool_use_id` matches.
 
 ---
 

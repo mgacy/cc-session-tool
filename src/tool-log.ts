@@ -1,5 +1,5 @@
 import { basename } from 'path';
-import { userAssistantEntries, type ContentBlock, type SessionEntry } from './transcript.ts';
+import { truncateContent, truncateMiddle, userAssistantEntries, type ContentBlock, type SessionEntry } from './transcript.ts';
 
 /** Result info for a tool_use_id, extracted from tool_result blocks. */
 export type ToolResultInfo = {
@@ -7,6 +7,12 @@ export type ToolResultInfo = {
   content: string | ContentBlock[] | undefined;
   result_ts: string | undefined;
 };
+
+/** Visible-character budget for length-truncated input summaries. */
+export const INPUT_SUMMARY_MAX_CHARS = 80;
+/** Bash commands vary at the end (paths, args, heredoc bodies), so split the budget between both ends. */
+export const BASH_SUMMARY_HEAD_CHARS = INPUT_SUMMARY_MAX_CHARS / 2;
+export const BASH_SUMMARY_TAIL_CHARS = INPUT_SUMMARY_MAX_CHARS - BASH_SUMMARY_HEAD_CHARS;
 
 /** Condensed tool input summary per tool type. */
 export function inputSummary(name: string, input: Record<string, unknown>): string {
@@ -20,19 +26,23 @@ export function inputSummary(name: string, input: Record<string, unknown>): stri
       return `file='${basename(inp.file_path ?? '')}' old=(${(inp.old_string ?? '').length} chars) new=(${(inp.new_string ?? '').length} chars)`;
     case 'Write':
       return `file='${basename(inp.file_path ?? '')}' (${(inp.content ?? '').length} chars)`;
-    case 'Bash':
-      return (inp.command ?? '').slice(0, 80);
+    case 'Bash': {
+      const command = inp.command ?? '';
+      // Non-string commands are malformed; throwing sends safeInputSummary to its stable-JSON fallback.
+      if (typeof command !== 'string') throw new TypeError('Bash command is not a string');
+      return truncateMiddle(command, BASH_SUMMARY_HEAD_CHARS, BASH_SUMMARY_TAIL_CHARS);
+    }
     case 'Glob':
       return `pattern='${inp.pattern ?? ''}' ${inp.path ? `path='${inp.path}'` : ''}`.trim();
     case 'Agent':
     case 'Task':
-      return `prompt='${(inp.prompt ?? inp.description ?? '').slice(0, 80)}'`;
+      return `prompt='${truncateContent(inp.prompt ?? inp.description ?? '', INPUT_SUMMARY_MAX_CHARS)}'`;
     case 'WebFetch':
       return `url='${inp.url ?? ''}'`;
     case 'WebSearch':
       return `query='${inp.query ?? ''}'`;
     default:
-      return JSON.stringify(inp).slice(0, 80);
+      return truncateContent(JSON.stringify(inp), INPUT_SUMMARY_MAX_CHARS);
   }
 }
 
@@ -52,7 +62,7 @@ export function safeInputSummary(tool: string, input: Record<string, unknown>): 
   try {
     return inputSummary(tool, input);
   } catch {
-    return stableJsonStringify(input).slice(0, 80);
+    return truncateContent(stableJsonStringify(input), INPUT_SUMMARY_MAX_CHARS);
   }
 }
 
@@ -116,11 +126,27 @@ export function extractContentText(content: string | ContentBlock[] | undefined)
   return '';
 }
 
-/** Determine outcome from a tool_result. */
-export function determineOutcome(resultInfo: { is_error?: boolean; content?: string | ContentBlock[] } | null): string {
+/** Default visible-character budget for the text after `error: ` in an outcome. */
+export const DEFAULT_OUTCOME_ERROR_CHARS = 60;
+/** Hex chars kept from the SHA-256 digest in `outcome_hash`. */
+export const OUTCOME_HASH_HEX_CHARS = 12;
+
+type ToolResultLike = { is_error?: boolean; content?: string | ContentBlock[] } | null | undefined;
+
+/** Full extracted error text of an error result; null for non-error and missing results. */
+function errorResultText(resultInfo: ToolResultLike): string | null {
+  return resultInfo?.is_error ? extractContentText(resultInfo.content) : null;
+}
+
+/** Determine outcome from a tool_result. Error text longer than `maxErrorChars` gets the "...[truncated, N chars]" suffix. */
+export function determineOutcome(
+  resultInfo: ToolResultLike,
+  options: { maxErrorChars?: number } = {},
+): string {
   if (resultInfo == null) return 'no_result';
-  if (resultInfo.is_error) {
-    return 'error: ' + extractContentText(resultInfo.content).slice(0, 60);
+  const errText = errorResultText(resultInfo);
+  if (errText != null) {
+    return 'error: ' + truncateContent(errText, options.maxErrorChars ?? DEFAULT_OUTCOME_ERROR_CHARS);
   }
   if (resultInfo.content === '' || resultInfo.content == null || (Array.isArray(resultInfo.content) && resultInfo.content.length === 0)) {
     return 'empty';
@@ -133,6 +159,15 @@ export function determineOutcome(resultInfo: { is_error?: boolean; content?: str
   return 'success';
 }
 
+/**
+ * Stable discriminator for an error result: the first OUTCOME_HASH_HEX_CHARS hex chars of SHA-256 over the
+ * full extracted error text (UTF-8). Null exactly when determineOutcome does not return an `error:` outcome.
+ */
+export function outcomeHash(resultInfo: ToolResultLike): string | null {
+  const errText = errorResultText(resultInfo);
+  return errText == null ? null : Bun.CryptoHasher.hash('sha256', errText, 'hex').slice(0, OUTCOME_HASH_HEX_CHARS);
+}
+
 /** Outcome-string predicate used by `tools --failed`. */
 export function isFailedOutcome(outcome: string): boolean {
   return outcome === 'empty' || outcome.startsWith('error:');
@@ -142,9 +177,7 @@ export function isFailedOutcome(outcome: string): boolean {
  * Result predicate used by `search --failed`; must agree with isFailedOutcome(determineOutcome(r)).
  * Skips the line counting determineOutcome does for successful outputs.
  */
-export function isFailedResult(
-  result: { is_error?: boolean; content?: string | ContentBlock[] } | null | undefined,
-): boolean {
+export function isFailedResult(result: ToolResultLike): boolean {
   if (!result) return false;
   if (result.is_error) return true;
   const content = result.content;

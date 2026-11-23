@@ -213,10 +213,10 @@ The result combines the common first-pass fields agents previously gathered from
 Tool call log with condensed input summaries and outcome detection.
 
 ```bash
-cc-session-tool tools <session> [--project <path> | --claude-project <project>] [--name <tool>|--name-match <text>] [--input-match <text>|--input-regex <regex>] [--failed] [--turn <N|N-M>]
+cc-session-tool tools <session> [--project <path> | --claude-project <project>] [--name <tool>|--name-match <text>] [--input-match <text>|--input-regex <regex>] [--failed] [--turn <N|N-M>] [--max-outcome <n>]
 ```
 
-`--input-match` and `--input-regex` search the raw structured tool input, including values omitted or truncated in `input_summary`. `--name` and `--name-match` are mutually exclusive, as are the two input filters.
+`--input-match` and `--input-regex` search the raw structured tool input, including values omitted or truncated in `input_summary`. `--name` and `--name-match` are mutually exclusive, as are the two input filters. `--max-outcome <n>` sets how many characters of error text `outcome` shows (default 60).
 
 **Output:**
 
@@ -232,18 +232,34 @@ cc-session-tool tools <session> [--project <path> | --claude-project <project>] 
         "tool": "Grep",
         "input_summary": "pattern='AuthReducer' path='Sources/'",
         "outcome": "empty",
-        "duration_ms": 450
+        "outcome_hash": null,
+        "duration_ms": 450,
+        "tool_use_id": "toolu_01A...",
+        "result_turn": 4
       },
       {
         "turn": 7,
         "tool": "Read",
         "input_summary": "file='AuthReducer.swift'",
         "outcome": "success (245 lines)",
-        "duration_ms": 120
+        "outcome_hash": null,
+        "duration_ms": 120,
+        "tool_use_id": "toolu_01B...",
+        "result_turn": 8
+      },
+      {
+        "turn": 9,
+        "tool": "Bash",
+        "input_summary": "git worktree add ../wt-a -b feature-a &&...[truncated, 207 chars]...&& bun test --bail tests/auth/session.ts",
+        "outcome": "error: This session is isolated in the worktree /work/app/.claude/w...[truncated, 241 chars]",
+        "outcome_hash": "9f2c41ab07de",
+        "duration_ms": 80,
+        "tool_use_id": "toolu_01C...",
+        "result_turn": 10
       }
     ]
   },
-  "_meta": { "total": 2, "returned": 2, "hasMore": false }
+  "_meta": { "total": 3, "returned": 3, "hasMore": false }
 }
 ```
 
@@ -255,7 +271,7 @@ cc-session-tool tools <session> [--project <path> | --claude-project <project>] 
 | `Read`         | `file='<basename>' offset=N limit=N`            |
 | `Edit`         | `file='<basename>' old=(N chars) new=(N chars)` |
 | `Write`        | `file='<basename>' (N chars)`                   |
-| `Bash`         | First 80 chars of command                       |
+| `Bash`         | First 40 + last 40 chars of command             |
 | `Glob`         | `pattern='...' path='...'`                      |
 | `Agent`/`Task` | `prompt='...'` (first 80 chars)                 |
 | `WebFetch`     | `url='...'`                                     |
@@ -273,6 +289,16 @@ cc-session-tool tools <session> [--project <path> | --claude-project <project>] 
 | `no_result`         | No matching `tool_result` found (interrupted session) |
 
 **`duration_ms`:** Milliseconds between assistant entry and corresponding tool_result. `null` if timestamps are missing.
+
+**`outcome_hash`:** A hash of the full error text, so errors whose truncated `outcome` strings match still differ here; `null` for non-errors.
+
+To read a call's full result, use the same selector and project flag you gave `tools`. For a subagent that includes `:<agent-id>`; without it, `result_turn` silently points into the parent transcript.
+
+```bash
+cc-session-tool messages <session>[:<agent-id>] [--project <path> | --claude-project <project>] --turn <result_turn> --type tool_result --max-tool-result <N>
+```
+
+Take `N` (the full length) from the outcome's `...[truncated, N chars]` marker, and pick the block whose `tool_use_id` matches.
 
 ---
 
