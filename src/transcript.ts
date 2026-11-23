@@ -205,11 +205,9 @@ export function requestUsages(entries: SessionEntry[]): RequestUsage[] {
   userAssistantEntries(entries).forEach((entry, index) => {
     if (entry.type !== 'assistant') return;
     const turn = index + 1;
-    const key = nonEmptyString(entry.message?.id) !== null
-      ? `msg:${entry.message!.id}`
-      : nonEmptyString(entry.requestId) !== null
-        ? `req:${entry.requestId}`
-        : `turn:${turn}`;
+    const messageId = nonEmptyString(entry.message?.id);
+    const requestId = nonEmptyString(entry.requestId);
+    const key = messageId !== null ? `msg:${messageId}` : requestId !== null ? `req:${requestId}` : `turn:${turn}`;
 
     const usage = entry.message?.usage;
     const input = numericUsage(usage?.input_tokens);

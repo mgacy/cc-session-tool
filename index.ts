@@ -67,7 +67,6 @@ import {
   type ContentBlock,
   type SessionEntry,
   type SessionSummaryResult,
-  type TokenUsage,
 } from './src/transcript.ts';
 import {
   buildResultLookup as toolLogBuildResultLookup,

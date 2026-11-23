@@ -188,7 +188,8 @@ CREATE TABLE turn (
 
 -- One row per model request: Claude Code can write several assistant entries per request,
 -- so usage is stored here (merged by requestUsages), never per turn.
--- No secondary indexes: the PK (led by project) serves every queryTokenStats predicate.
+-- No secondary indexes: every queryTokenStats query filters on project IN (...), which leads the PK;
+-- ts and agent_id are row filters. Add an index only when EXPLAIN QUERY PLAN shows a query uses it.
 CREATE TABLE request (
   project            TEXT NOT NULL,
   session_id         TEXT NOT NULL,
