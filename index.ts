@@ -95,7 +95,7 @@ import {
 import type { Database } from 'bun:sqlite';
 import { isCliArgsError, parseCommandArgs, resolveCliCommand } from './src/cli-args.ts';
 
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 // ============================================================================
 // Types
